@@ -52,7 +52,7 @@ Options:
   --skip-deps                Skip apt dependency install (assumes deps already present).
   --configure-runtime        Configure scoped NOPASSWD sudoers for SmolVM runtime.
   --remove-runtime-config    Remove generated runtime sudoers config.
-  --runtime-user <user>      Target user for runtime sudoers (default: SUDO_USER).
+  --runtime-user <user>      Target user for runtime sudoers/docker group (default: invoking user).
   -h, --help                 Show this help.
 EOF_USAGE
 }
@@ -107,7 +107,62 @@ resolve_runtime_user() {
         return
     fi
 
+    if [[ -n "${USER:-}" && "${USER}" != "root" ]]; then
+        echo "${USER}"
+        return
+    fi
+
+    if command -v logname >/dev/null 2>&1; then
+        local login_user
+        login_user="$(logname 2>/dev/null || true)"
+        if [[ -n "${login_user}" && "${login_user}" != "root" ]]; then
+            echo "${login_user}"
+            return
+        fi
+    fi
+
     echo ""
+}
+
+ensure_group_membership() {
+    local group_name="$1"
+    local hint_cmd="$2"
+    local target_user
+    target_user="$(resolve_runtime_user)"
+
+    if [[ -z "${target_user}" ]]; then
+        echo "⚠️  Could not determine target user for '${group_name}' group setup."
+        echo "    Re-run with --runtime-user <user>, then run: ${hint_cmd}"
+        return 0
+    fi
+
+    if ! id "${target_user}" >/dev/null 2>&1; then
+        echo "⚠️  User '${target_user}' not found; skipping ${group_name} group setup."
+        return 0
+    fi
+
+    if ! getent group "${group_name}" >/dev/null 2>&1; then
+        echo "Creating ${group_name} group..."
+        groupadd "${group_name}"
+    fi
+
+    if id -nG "${target_user}" | tr ' ' '\n' | grep -qx "${group_name}"; then
+        echo "✅ User '${target_user}' is already in the ${group_name} group"
+        return 0
+    fi
+
+    echo "Adding user '${target_user}' to ${group_name} group..."
+    usermod -aG "${group_name}" "${target_user}"
+    echo "✅ Added '${target_user}' to ${group_name} group"
+    echo "   Run '${hint_cmd}' (or log out/in) before using ${group_name}-gated features."
+}
+
+ensure_docker_group_membership() {
+    ensure_group_membership "docker" "newgrp docker"
+}
+
+ensure_kvm_group_membership() {
+    ensure_group_membership "kvm" "newgrp kvm"
 }
 
 run_runtime_config() {
@@ -227,6 +282,7 @@ if [[ ! -e /dev/kvm ]]; then
     echo "❌ /dev/kvm not found. Enable KVM or nested virtualization."
     exit 1
 fi
+ensure_kvm_group_membership
 
 if [[ "${SKIP_DEPS}" == "true" ]]; then
     echo "Skipping dependency installation (--skip-deps)"
@@ -295,12 +351,9 @@ if [[ "${WITH_DOCKER}" == "true" ]]; then
             echo "❌ Docker install failed (docker command not found)."
             exit 1
         fi
-        if [[ -n "${SUDO_USER:-}" ]]; then
-            echo "NOTE: Add your user to the docker group: sudo usermod -aG docker ${SUDO_USER}"
-        else
-            echo "NOTE: Add your user to the docker group: sudo usermod -aG docker <user>"
-        fi
     fi
+
+    ensure_docker_group_membership
 fi
 
 if [[ "${CONFIGURE_RUNTIME}" == "true" ]]; then
