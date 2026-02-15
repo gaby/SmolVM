@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Install OpenClaw inside a Debian-based SmolVM guest (4GB rootfs)."""
+"""Install OpenClaw inside a Debian-based SmolVM guest (4GB rootfs).
+
+If ``OPENAI_API_KEY`` is set on the host, it is injected into the guest
+environment automatically.
+"""
 
 from __future__ import annotations
 
+import os
 import sys
 
 from smolvm import SSH_BOOT_ARGS, VM, ImageBuilder, VMConfig
@@ -19,16 +24,21 @@ def _run_or_exit(vm: VM, command: str, timeout: int = 300) -> None:
     """Run a guest command, print output, and exit on failure."""
     print(f"\n$ {command}")
     result = vm.run(command, timeout=timeout)
-    if result.stdout:
-        print(result.stdout.strip())
+    if result.output:
+        print(result.output)
     if result.stderr:
         print(result.stderr.strip(), file=sys.stderr)
-    if result.exit_code != 0:
-        print(
-            f"Command failed (exit {result.exit_code}): {command}",
-            file=sys.stderr,
-        )
+    if not result.ok:
+        print(f"Command failed (exit {result.exit_code}): {command}", file=sys.stderr)
         raise SystemExit(result.exit_code)
+
+
+def _host_env_vars() -> dict[str, str]:
+    """Collect optional environment variables from the host."""
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_api_key:
+        return {}
+    return {"OPENAI_API_KEY": openai_api_key}
 
 
 def _ensure_node_runtime(vm: VM) -> None:
@@ -113,6 +123,12 @@ def _install_openclaw(vm: VM) -> None:
 
 
 def main() -> int:
+    env_vars = _host_env_vars()
+    if env_vars:
+        print("Using OPENAI_API_KEY from host environment.")
+    else:
+        print("OPENAI_API_KEY not set; continuing without it.")
+
     private_key, public_key = ensure_ssh_key()
     kernel, rootfs = ImageBuilder().build_debian_ssh_key(
         ssh_public_key=public_key,
@@ -121,18 +137,17 @@ def main() -> int:
     )
 
     config = VMConfig(
-        vm_id="openclaw-install",
         vcpu_count=1,
         # OpenClaw npm install is memory-heavy; 512 MiB can drop SSH mid-command.
         mem_size_mib=VM_MEMORY_MIB,
         kernel_path=kernel,
         rootfs_path=rootfs,
         boot_args=SSH_BOOT_ARGS,
+        env_vars=env_vars,
     )
 
     with VM(config, ssh_key_path=str(private_key)) as vm:
-        guest_ip = vm.get_ip()
-        print(f"VM running at {guest_ip}")
+        print(f"VM running: {vm.vm_id} ({vm.get_ip()})")
         _run_or_exit(vm, "df -h /", timeout=60)
 
         _ensure_node_runtime(vm)
