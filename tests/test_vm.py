@@ -1,11 +1,11 @@
 # Copyright 2026 Celesto AI
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,6 +14,7 @@
 
 """Tests for SmolVM main SDK class."""
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -226,6 +227,25 @@ class TestSmolVMDelete:
         """Test that deleting nonexistent VM raises error."""
         with pytest.raises(VMNotFoundError):
             smol_vm.delete("nonexistent")
+
+    @patch("smolvm.vm.NetworkManager")
+    def test_delete_cleans_local_forward_rules(
+        self,
+        mock_network_class: MagicMock,
+        smol_vm: SmolVM,
+        sample_config: VMConfig,
+    ) -> None:
+        """Delete should clean local-forward iptables rules by vm_id."""
+        mock_network = MagicMock()
+        mock_network.host_ip = "172.16.0.1"
+        mock_network.generate_mac.return_value = "AA:FC:00:00:00:01"
+        mock_network_class.return_value = mock_network
+        smol_vm.network = mock_network
+
+        smol_vm.create(sample_config)
+        smol_vm.delete("vm001")
+
+        mock_network.cleanup_all_local_port_forwards.assert_called_once_with("vm001")
 
 
 class TestIPBasedTAPNaming:
@@ -554,6 +574,9 @@ class TestFirecrackerLaunchAndSocketCleanup:
 
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["/usr/bin/firecracker", "--api-sock", str(socket_path)]
+        kwargs = mock_popen.call_args.kwargs
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["start_new_session"] is True
 
     @patch("smolvm.vm.subprocess.run")
     @patch("pathlib.Path.unlink")

@@ -1,11 +1,11 @@
 # Copyright 2026 Celesto AI
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,6 +20,7 @@ Requires root/sudo privileges for network operations.
 
 import logging
 import os
+import shlex
 from contextlib import suppress
 
 from smolvm.exceptions import NetworkError, SmolVMError
@@ -153,11 +154,11 @@ class NetworkManager:
 
     def add_route(self, ip_address: str, device: str) -> None:
         """Add a static route for a specific IP via a device.
-        
+
         Args:
             ip_address: Target IP (e.g. "172.16.0.2").
             device: Output device name.
-            
+
         Raises:
             NetworkError: If route addition fails.
         """
@@ -165,7 +166,7 @@ class NetworkManager:
             raise ValueError("ip_address cannot be empty")
         if not device:
             raise ValueError("device cannot be empty")
-            
+
         logger.info("Adding route: %s via %s", ip_address, device)
         try:
             run_command(["ip", "route", "add", f"{ip_address}/32", "dev", device])
@@ -466,6 +467,199 @@ class NetworkManager:
                     target,
                 ]
             )
+
+    def setup_local_port_forward(
+        self,
+        vm_id: str,
+        guest_ip: str,
+        host_port: int,
+        guest_port: int,
+    ) -> None:
+        """Set up localhost-only TCP forwarding from host to guest.
+
+        Creates rules to forward:
+        - 127.0.0.1:<host_port> -> guest_ip:<guest_port>
+
+        This does not add a PREROUTING rule, so the service is not exposed on
+        external host interfaces.
+        """
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+        if not guest_ip:
+            raise ValueError("guest_ip cannot be empty")
+        if host_port < 1 or host_port > 65535:
+            raise ValueError("host_port must be 1-65535")
+        if guest_port < 1 or guest_port > 65535:
+            raise ValueError("guest_port must be 1-65535")
+
+        self.enable_ip_forwarding()
+        target = f"{guest_ip}:{guest_port}"
+        comment = f"smolvm:{vm_id}:local:{host_port}:{guest_port}"
+
+        output = [
+            "-d",
+            "127.0.0.1/32",
+            "-p",
+            "tcp",
+            "--dport",
+            str(host_port),
+            "-m",
+            "comment",
+            "--comment",
+            comment,
+            "-j",
+            "DNAT",
+            "--to-destination",
+            target,
+        ]
+        if not self._rule_exists("nat", "OUTPUT", output):
+            run_command(["iptables", "-t", "nat", "-A", "OUTPUT", *output])
+
+        forward = [
+            "-p",
+            "tcp",
+            "-d",
+            guest_ip,
+            "--dport",
+            str(guest_port),
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "NEW,ESTABLISHED,RELATED",
+            "-m",
+            "comment",
+            "--comment",
+            comment,
+            "-j",
+            "ACCEPT",
+        ]
+        if not self._rule_exists("filter", "FORWARD", forward):
+            run_command(["iptables", "-A", "FORWARD", *forward])
+
+    def cleanup_local_port_forward(
+        self,
+        vm_id: str,
+        guest_ip: str,
+        host_port: int,
+        guest_port: int,
+    ) -> None:
+        """Remove localhost-only TCP forwarding rules for a VM."""
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+        if not guest_ip:
+            raise ValueError("guest_ip cannot be empty")
+        if host_port < 1 or host_port > 65535:
+            raise ValueError("host_port must be 1-65535")
+        if guest_port < 1 or guest_port > 65535:
+            raise ValueError("guest_port must be 1-65535")
+
+        target = f"{guest_ip}:{guest_port}"
+        comment = f"smolvm:{vm_id}:local:{host_port}:{guest_port}"
+
+        with suppress(NetworkError, SmolVMError):
+            run_command(
+                [
+                    "iptables",
+                    "-D",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "-d",
+                    guest_ip,
+                    "--dport",
+                    str(guest_port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW,ESTABLISHED,RELATED",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    comment,
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
+
+        with suppress(NetworkError, SmolVMError):
+            run_command(
+                [
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-D",
+                    "OUTPUT",
+                    "-d",
+                    "127.0.0.1/32",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    str(host_port),
+                    "-m",
+                    "comment",
+                    "--comment",
+                    comment,
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    target,
+                ]
+            )
+
+    def cleanup_all_local_port_forwards(self, vm_id: str) -> None:
+        """Best-effort removal of all localhost-only forwarding rules for a VM."""
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+
+        comment_prefix = f"smolvm:{vm_id}:local:"
+
+        for table, chain in (("nat", "OUTPUT"), ("filter", "FORWARD")):
+            for rule_tokens in self._list_chain_rules(table, chain):
+                comment = self._extract_comment(rule_tokens)
+                if comment is None or not comment.startswith(comment_prefix):
+                    continue
+
+                delete_tokens = list(rule_tokens)
+                if not delete_tokens or delete_tokens[0] != "-A":
+                    continue
+                delete_tokens[0] = "-D"
+
+                cmd = ["iptables"]
+                if table != "filter":
+                    cmd.extend(["-t", table])
+                cmd.extend(delete_tokens)
+
+                with suppress(NetworkError, SmolVMError):
+                    run_command(cmd)
+
+    def _list_chain_rules(self, table: str, chain: str) -> list[list[str]]:
+        """Return parsed `iptables -S <chain>` rules for a table."""
+        cmd = ["iptables"]
+        if table != "filter":
+            cmd.extend(["-t", table])
+        cmd.extend(["-S", chain])
+
+        result = run_command(cmd)
+        rules: list[list[str]] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("-A "):
+                continue
+            try:
+                tokens = shlex.split(stripped)
+            except ValueError:
+                continue
+            if len(tokens) >= 2 and tokens[0] == "-A" and tokens[1] == chain:
+                rules.append(tokens)
+        return rules
+
+    @staticmethod
+    def _extract_comment(rule_tokens: list[str]) -> str | None:
+        """Extract `--comment` value from parsed iptables tokens."""
+        for i, token in enumerate(rule_tokens):
+            if token == "--comment" and i + 1 < len(rule_tokens):
+                return rule_tokens[i + 1]
+        return None
 
     def _rule_exists(self, table: str, chain: str, rule_parts: list[str]) -> bool:
         """Check if an iptables rule already exists.
