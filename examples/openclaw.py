@@ -131,7 +131,8 @@ def main() -> int:
     )
 
     with VM(config, ssh_key_path=str(private_key)) as vm:
-        print(f"VM running at {vm.get_ip()}")
+        guest_ip = vm.get_ip()
+        print(f"VM running at {guest_ip}")
         _run_or_exit(vm, "df -h /", timeout=60)
 
         _ensure_node_runtime(vm)
@@ -166,6 +167,11 @@ def main() -> int:
             host_port=HOST_DASHBOARD_PORT,
         )
         print(f"\nDashboard ready: http://127.0.0.1:{host_port}/ (localhost only)")
+        if host_port != HOST_DASHBOARD_PORT:
+            print(
+                f"Preferred localhost port {HOST_DASHBOARD_PORT} was unavailable; "
+                f"using {host_port} instead."
+            )
         print(f"Gateway token: {GATEWAY_TOKEN}")
 
         # Helpful in headless mode: prints dashboard URL if browser open is unavailable.

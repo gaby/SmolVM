@@ -35,7 +35,7 @@ vm.stop()
 
 Run with a context manager to automatically clean up the microVM after use:
 
-```
+```python
 from smolvm import VM
 
 with VM() as vm:
@@ -55,10 +55,13 @@ with VM() as vm:
     print(f"Open http://127.0.0.1:{host_port}")
 ```
 
+`vm.expose_local(...)` prefers host-local iptables forwarding and automatically
+falls back to an SSH tunnel when needed.
+
 Example script:
 
 ```bash
-uv run python examples/install_openclaw.py
+uv run python examples/openclaw.py
 ```
 
 
