@@ -76,7 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat warnings as failures.",
     )
 
-    def _add_dashboard_start_args(command_parser: argparse.ArgumentParser) -> None:
+    # ── ui subcommand ─────────────────────────────────────────────────
+    def _add_ui_args(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument(
             "--host",
             default="127.0.0.1",
@@ -94,25 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
             help="Allow dashboard UI downloads from prerelease/beta tags.",
         )
 
-    # ── dashboard command (preferred) ─────────────────────────────────
-    dashboard = subparsers.add_parser(
-        "dashboard",
-        help="Start the SmolVM dashboard API server",
+    ui = subparsers.add_parser(
+        "ui",
+        help="Start the SmolVM dashboard UI server",
     )
-    _add_dashboard_start_args(dashboard)
-
-    # ── start subcommand group (backward-compatible) ─────────────────
-    start = subparsers.add_parser(
-        "start",
-        help="Start long-running SmolVM services",
-    )
-    start_sub = start.add_subparsers(dest="start_target")
-
-    start_dashboard = start_sub.add_parser(
-        "dashboard",
-        help="Start the SmolVM dashboard API server",
-    )
-    _add_dashboard_start_args(start_dashboard)
+    _add_ui_args(ui)
 
     # ── env subcommand group ──────────────────────────────────────────
     env_parser = subparsers.add_parser(
@@ -279,8 +266,8 @@ def _run_env(args: argparse.Namespace) -> int:
             vm.close()
 
 
-def _run_dashboard(host: str, port: int, allow_beta: bool) -> int:
-    """Start the dashboard API server with optional beta asset allowance."""
+def _run_ui(host: str, port: int, allow_beta: bool) -> int:
+    """Start the dashboard UI server with optional beta asset allowance."""
     try:
         uvicorn = importlib.import_module("uvicorn")
     except ImportError:
@@ -304,7 +291,7 @@ def _run_dashboard(host: str, port: int, allow_beta: bool) -> int:
         os.environ[DASHBOARD_ALLOW_BETA_ENV] = "1"
     os.environ[DASHBOARD_URL_ENV] = dashboard_url
 
-    print(f"Starting SmolVM Dashboard on http://{host}:{port} ...")
+    print(f"Starting SmolVM UI on http://{host}:{port} ...")
     print(f"Once started, open {dashboard_url} in your browser.")
     if allow_beta:
         print("Using prerelease dashboard UI assets (--allow-beta enabled).")
@@ -315,7 +302,7 @@ def _run_dashboard(host: str, port: int, allow_beta: bool) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as e:
-        print(f"Error: failed to start dashboard: {e}")
+        print(f"Error: failed to start UI: {e}")
         return 1
     finally:
         if allow_beta:
@@ -328,19 +315,6 @@ def _run_dashboard(host: str, port: int, allow_beta: bool) -> int:
             os.environ.pop(DASHBOARD_URL_ENV, None)
         else:
             os.environ[DASHBOARD_URL_ENV] = previous_dashboard_url
-
-
-def _run_start(args: argparse.Namespace) -> int:
-    """Handle ``smolvm start ...`` commands."""
-    if args.start_target is None:
-        print("Usage: smolvm start dashboard [--host HOST] [--port PORT] [--allow-beta]")
-        return 2
-
-    if args.start_target != "dashboard":
-        print(f"Error: unsupported start target: {args.start_target}")
-        return 2
-
-    return _run_dashboard(host=args.host, port=args.port, allow_beta=args.allow_beta)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -358,11 +332,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             strict=args.strict,
         )
 
-    if args.command == "dashboard":
-        return _run_dashboard(host=args.host, port=args.port, allow_beta=args.allow_beta)
-
-    if args.command == "start":
-        return _run_start(args)
+    if args.command == "ui":
+        return _run_ui(host=args.host, port=args.port, allow_beta=args.allow_beta)
 
     if args.command == "env":
         return _run_env(args)

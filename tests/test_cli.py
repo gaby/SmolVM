@@ -214,16 +214,16 @@ class TestCliDoctor:
         )
 
 
-class TestCliDashboard:
-    """Tests for `smolvm dashboard`."""
+class TestCliUi:
+    """Tests for `smolvm ui`."""
 
     @patch("smolvm.cli.importlib.import_module")
-    def test_dashboard_defaults(self, mock_import: MagicMock) -> None:
-        """`smolvm dashboard` should launch uvicorn with defaults."""
+    def test_ui_defaults(self, mock_import: MagicMock) -> None:
+        """`smolvm ui` should launch uvicorn with defaults."""
         mock_uvicorn = MagicMock()
         mock_import.return_value = mock_uvicorn
 
-        ret = main(["dashboard"])
+        ret = main(["ui"])
 
         assert ret == 0
         mock_import.assert_called_once_with("uvicorn")
@@ -234,12 +234,12 @@ class TestCliDashboard:
         )
 
     @patch("smolvm.cli.importlib.import_module")
-    def test_dashboard_custom_port(self, mock_import: MagicMock) -> None:
+    def test_ui_custom_port(self, mock_import: MagicMock) -> None:
         """Custom host/port should be forwarded to uvicorn."""
         mock_uvicorn = MagicMock()
         mock_import.return_value = mock_uvicorn
 
-        ret = main(["dashboard", "--host", "0.0.0.0", "--port", "9090"])
+        ret = main(["ui", "--host", "0.0.0.0", "--port", "9090"])
 
         assert ret == 0
         mock_uvicorn.run.assert_called_once_with(
@@ -249,22 +249,7 @@ class TestCliDashboard:
         )
 
     @patch("smolvm.cli.importlib.import_module")
-    def test_dashboard_command_alias(self, mock_import: MagicMock) -> None:
-        """Top-level `smolvm dashboard` should behave like `start dashboard`."""
-        mock_uvicorn = MagicMock()
-        mock_import.return_value = mock_uvicorn
-
-        ret = main(["dashboard", "--port", "8181"])
-
-        assert ret == 0
-        mock_uvicorn.run.assert_called_once_with(
-            "smolvm.dashboard.server:app",
-            host="127.0.0.1",
-            port=8181,
-        )
-
-    @patch("smolvm.cli.importlib.import_module")
-    def test_start_dashboard_allow_beta_sets_env(self, mock_import: MagicMock) -> None:
+    def test_ui_allow_beta_sets_env(self, mock_import: MagicMock) -> None:
         """--allow-beta should set env flag while uvicorn starts."""
         mock_uvicorn = MagicMock()
 
@@ -275,25 +260,25 @@ class TestCliDashboard:
         mock_import.return_value = mock_uvicorn
 
         os.environ.pop(DASHBOARD_ALLOW_BETA_ENV, None)
-        ret = main(["start", "dashboard", "--allow-beta"])
+        ret = main(["ui", "--allow-beta"])
 
         assert ret == 0
         assert DASHBOARD_ALLOW_BETA_ENV not in os.environ
 
     @patch("smolvm.cli.importlib.import_module", side_effect=ImportError)
-    def test_dashboard_missing_dependency(
+    def test_ui_missing_dependency(
         self,
         _: MagicMock,
         capsys: pytest.CaptureFixture,
     ) -> None:
         """Missing dashboard extras should return an actionable error."""
-        ret = main(["dashboard"])
+        ret = main(["ui"])
 
         assert ret == 1
         assert "smolvm[dashboard]" in capsys.readouterr().out
 
     @patch("smolvm.cli.importlib.import_module")
-    def test_dashboard_invalid_port(
+    def test_ui_invalid_port(
         self,
         mock_import: MagicMock,
         capsys: pytest.CaptureFixture,
@@ -301,7 +286,7 @@ class TestCliDashboard:
         """Out-of-range ports should fail fast with usage error code."""
         mock_import.return_value = MagicMock()
 
-        ret = main(["dashboard", "--port", "70000"])
+        ret = main(["ui", "--port", "70000"])
 
         assert ret == 2
         assert "invalid port" in capsys.readouterr().out
