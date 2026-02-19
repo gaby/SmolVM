@@ -50,10 +50,12 @@ from smolvm.vm import SmolVMManager, resolve_data_dir
 
 logger = logging.getLogger(__name__)
 
-LATEST_RELEASE_URL = "https://api.github.com/repos/CelestoAI/SmolVM/releases/latest"
+RELEASES_URL = "https://api.github.com/repos/CelestoAI/SmolVM/releases"
 DASHBOARD_ASSET_PREFIX = "smolvm-dashboard-ui-"
 DASHBOARD_ASSET_SUFFIX = ".tar.gz"
 UI_DIST_ENV = "SMOLVM_DASHBOARD_UI_DIST"
+ALLOW_BETA_ENV = "SMOLVM_DASHBOARD_ALLOW_BETA"
+DASHBOARD_URL_ENV = "SMOLVM_DASHBOARD_URL"
 
 
 def _resolve_ui_dist_path() -> Path:
@@ -83,58 +85,130 @@ def _github_headers() -> dict[str, str]:
     return headers
 
 
-def _latest_dashboard_release_asset() -> tuple[str, str]:
-    """Return latest release tag and dashboard dist asset download URL."""
-    response = requests.get(LATEST_RELEASE_URL, headers=_github_headers(), timeout=15)
+def _allow_beta_releases() -> bool:
+    """Return whether prerelease dashboard assets are allowed."""
+    value = os.environ.get(ALLOW_BETA_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _latest_dashboard_release_asset(*, allow_prerelease: bool = False) -> tuple[str, str]:
+    """Return newest release tag and dashboard dist asset download URL.
+
+    Scans recent releases and picks the first release that has a dashboard UI
+    asset. Prereleases are ignored by default unless ``allow_prerelease`` is true.
+    """
+    response = requests.get(
+        RELEASES_URL,
+        headers=_github_headers(),
+        params={"per_page": 30},
+        timeout=15,
+    )
     response.raise_for_status()
     payload = response.json()
 
-    tag_name = payload.get("tag_name")
-    if not isinstance(tag_name, str) or not tag_name:
-        raise RuntimeError("Latest release payload missing tag_name")
+    if not isinstance(payload, list):
+        raise RuntimeError("Releases payload is not a list")
 
-    assets = payload.get("assets")
-    if not isinstance(assets, list):
-        raise RuntimeError("Latest release payload missing assets list")
-
-    expected_name = f"{DASHBOARD_ASSET_PREFIX}{tag_name}{DASHBOARD_ASSET_SUFFIX}"
-    fallback_url: str | None = None
-
-    for asset in assets:
-        if not isinstance(asset, dict):
+    for release in payload:
+        if not isinstance(release, dict):
             continue
-        name = asset.get("name")
-        url = asset.get("browser_download_url")
-        if not isinstance(name, str) or not isinstance(url, str):
+        if release.get("draft") is True:
+            continue
+        if release.get("prerelease") is True and not allow_prerelease:
             continue
 
-        if name == expected_name:
-            return tag_name, url
+        tag_name = release.get("tag_name")
+        assets = release.get("assets")
+        if not isinstance(tag_name, str) or not tag_name or not isinstance(assets, list):
+            continue
 
-        if (
-            fallback_url is None
-            and name.startswith(DASHBOARD_ASSET_PREFIX)
-            and name.endswith(DASHBOARD_ASSET_SUFFIX)
-        ):
-            fallback_url = url
+        expected_name = f"{DASHBOARD_ASSET_PREFIX}{tag_name}{DASHBOARD_ASSET_SUFFIX}"
+        fallback_url: str | None = None
 
-    if fallback_url is not None:
-        return tag_name, fallback_url
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = asset.get("name")
+            url = asset.get("browser_download_url")
+            if not isinstance(name, str) or not isinstance(url, str):
+                continue
 
+            if name == expected_name:
+                return tag_name, url
+
+            if (
+                fallback_url is None
+                and name.startswith(DASHBOARD_ASSET_PREFIX)
+                and name.endswith(DASHBOARD_ASSET_SUFFIX)
+            ):
+                fallback_url = url
+
+        if fallback_url is not None:
+            return tag_name, fallback_url
+
+    release_scope = "stable/prerelease" if allow_prerelease else "stable"
     raise RuntimeError(
-        "Latest release does not include dashboard UI asset "
+        f"No {release_scope} release includes a dashboard UI asset "
         f"({DASHBOARD_ASSET_PREFIX}*{DASHBOARD_ASSET_SUFFIX})"
     )
 
 
+def _format_bytes(size: int) -> str:
+    """Format bytes as a compact human-readable string."""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 def _download_asset(url: str, destination: Path) -> None:
-    """Download a release asset to disk."""
+    """Download a release asset to disk with progress logging."""
+    logger.info("Downloading dashboard UI bundle from: %s", url)
     with requests.get(url, headers=_github_headers(), stream=True, timeout=60) as response:
         response.raise_for_status()
+
+        total_bytes: int | None = None
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdigit():
+            total_bytes = int(content_length)
+            logger.info("Dashboard UI bundle size: %s", _format_bytes(total_bytes))
+
+        downloaded = 0
+        next_progress_log = 5 * 1024 * 1024
+
         with destination.open("wb") as out:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    out.write(chunk)
+                if not chunk:
+                    continue
+
+                out.write(chunk)
+                downloaded += len(chunk)
+
+                if downloaded >= next_progress_log:
+                    if total_bytes:
+                        percent = min(100.0, (downloaded / total_bytes) * 100.0)
+                        logger.info(
+                            "Dashboard UI download progress: %s / %s (%.0f%%)",
+                            _format_bytes(downloaded),
+                            _format_bytes(total_bytes),
+                            percent,
+                        )
+                    else:
+                        logger.info(
+                            "Dashboard UI download progress: %s",
+                            _format_bytes(downloaded),
+                        )
+                    next_progress_log += 5 * 1024 * 1024
+
+    if total_bytes:
+        logger.info(
+            "Dashboard UI download complete: %s / %s",
+            _format_bytes(downloaded),
+            _format_bytes(total_bytes),
+        )
+    else:
+        logger.info("Dashboard UI download complete: %s", _format_bytes(downloaded))
 
 
 def _extract_dashboard_dist(archive_path: Path, extract_dir: Path) -> Path:
@@ -161,13 +235,15 @@ def _extract_dashboard_dist(archive_path: Path, extract_dir: Path) -> Path:
     raise RuntimeError("Dashboard archive did not contain dist/index.html")
 
 
-def _ensure_latest_dashboard_ui_dist(target_dist: Path) -> bool:
+def _ensure_latest_dashboard_ui_dist(target_dist: Path, *, allow_prerelease: bool = False) -> bool:
     """Download latest dashboard dist release asset and place it at target_dist."""
     target_root = target_dist.parent
     tag_file = target_root / ".dashboard-ui-tag"
 
     try:
-        latest_tag, asset_url = _latest_dashboard_release_asset()
+        latest_tag, asset_url = _latest_dashboard_release_asset(
+            allow_prerelease=allow_prerelease
+        )
     except Exception:
         logger.warning("Failed to discover latest dashboard UI release asset", exc_info=True)
         return False
@@ -175,12 +251,14 @@ def _ensure_latest_dashboard_ui_dist(target_dist: Path) -> bool:
     if target_dist.is_dir() and (target_dist / "index.html").is_file() and tag_file.is_file():
         try:
             if tag_file.read_text(encoding="utf-8").strip() == latest_tag:
+                logger.info("Dashboard UI already up to date (tag=%s)", latest_tag)
                 return True
         except OSError as exc:
             # If we cannot read the tag file, treat it as a cache miss and re-download.
             logger.debug("Failed to read dashboard UI tag file %s: %s", tag_file, exc)
 
     try:
+        logger.info("Preparing dashboard UI bundle (target tag=%s)", latest_tag)
         target_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="smolvm-ui-", dir=str(target_root)) as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -200,6 +278,7 @@ def _ensure_latest_dashboard_ui_dist(target_dist: Path) -> bool:
                 else:
                     target_dist.unlink()
             shutil.move(str(staged_dist), str(target_dist))
+            logger.info("Dashboard UI bundle extracted to: %s", target_dist)
 
         try:
             tag_file.write_text(f"{latest_tag}\n", encoding="utf-8")
@@ -245,12 +324,29 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     data_dir = resolve_data_dir()
     db_path = data_dir / "smolvm.db"
 
-    if await asyncio.to_thread(_ensure_latest_dashboard_ui_dist, _ui_dist):
-        logger.info("Dashboard UI dist ready at: %s", _ui_dist)
+    allow_beta = _allow_beta_releases()
+    if await asyncio.to_thread(
+        _ensure_latest_dashboard_ui_dist,
+        _ui_dist,
+        allow_prerelease=allow_beta,
+    ):
+        logger.info(
+            "Dashboard UI dist ready at: %s (allow_beta=%s)",
+            _ui_dist,
+            allow_beta,
+        )
     elif _ui_dist.is_dir():
-        logger.warning("Using existing dashboard UI dist at: %s", _ui_dist)
+        logger.warning(
+            "Using existing dashboard UI dist at: %s (allow_beta=%s)",
+            _ui_dist,
+            allow_beta,
+        )
     else:
-        logger.warning("Dashboard UI dist unavailable at startup: %s", _ui_dist)
+        logger.warning(
+            "Dashboard UI dist unavailable at startup: %s (allow_beta=%s)",
+            _ui_dist,
+            allow_beta,
+        )
 
     app.state.state_manager = StateManager(db_path)
     app.state.sdk = SmolVMManager(data_dir=data_dir)
@@ -267,6 +363,9 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     )
 
     logger.info("Nebula Dashboard started. Data dir: %s", data_dir)
+    dashboard_url = os.environ.get(DASHBOARD_URL_ENV)
+    if dashboard_url:
+        logger.info("Open %s to view the dashboard", dashboard_url)
     yield
 
     # Shutdown
