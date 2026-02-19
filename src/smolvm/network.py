@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Network management for SmolVM.
+"""Networking utilities for Linux Firecracker VMs.
 
-Handles TAP device creation, NAT rules, and cleanup.
-Requires root/sudo privileges for network operations.
+This module manages TAP devices (iproute2) and firewall/NAT rules (nftables).
+All public methods are idempotent and safe to call repeatedly.
 """
+
+from __future__ import annotations
 
 import logging
 import os
-import shlex
-from contextlib import suppress
+import re
+from pathlib import Path
 
 from smolvm.exceptions import NetworkError, SmolVMError
 from smolvm.utils import run_command
@@ -32,47 +34,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST_IP = "172.16.0.1"
 DEFAULT_NETMASK = "24"
 
+# SmolVM-managed nftables objects
+_NFT_NAT_FAMILY = "ip"
+_NFT_NAT_TABLE = "smolvm_nat"
+_NFT_FILTER_FAMILY = "inet"
+_NFT_FILTER_TABLE = "smolvm_filter"
+
+_NFT_CHAIN_RE = re.compile(r"^chain\s+(?P<chain>[^\s{]+)\s*\{")
+_NFT_RULE_COMMENT_RE = re.compile(r'comment "(?P<comment>[^"]+)"')
+_NFT_RULE_HANDLE_RE = re.compile(r'comment "(?P<comment>[^"]+)".*# handle (?P<handle>\d+)')
+
 
 class NetworkManager:
-    """Manages network resources for VMs.
-
-    Handles TAP devices and iptables NAT rules.
-    """
+    """Manage host networking resources for VM connectivity."""
 
     def __init__(self, host_ip: str = DEFAULT_HOST_IP) -> None:
-        """Initialize the network manager.
-
-        Args:
-            host_ip: IP address for the host side of TAP devices.
-        """
         if not host_ip:
             raise ValueError("host_ip cannot be empty")
 
         self.host_ip = host_ip
         self._outbound_interface: str | None = None
+        self._nft_base_ready = False
+        self._ip_forwarding_enabled = False
 
     @property
     def outbound_interface(self) -> str:
-        """Get the default outbound network interface."""
+        """Return the host's default outbound interface."""
         if self._outbound_interface is None:
             self._outbound_interface = self._detect_outbound_interface()
         return self._outbound_interface
 
     def _detect_outbound_interface(self) -> str:
-        """Detect the default outbound network interface.
-
-        Returns:
-            Interface name (e.g., "eth0", "ens4").
-
-        Raises:
-            NetworkError: If no default route found.
-        """
+        """Detect outbound interface from default route."""
         try:
-            result = run_command(
-                ["ip", "route", "show", "default"],
-                use_sudo=False,
-            )
-            # Parse: "default via X.X.X.X dev eth0 ..."
+            result = run_command(["ip", "route", "show", "default"], use_sudo=False)
             parts = result.stdout.strip().split()
             if "dev" in parts:
                 idx = parts.index("dev")
@@ -85,16 +80,12 @@ class NetworkManager:
 
         raise NetworkError("Could not detect default outbound network interface")
 
+    # ------------------------------------------------------------------
+    # TAP / routing
+    # ------------------------------------------------------------------
+
     def create_tap(self, tap_name: str, user: str | None = None) -> None:
-        """Create a TAP device.
-
-        Args:
-            tap_name: Name of the TAP device (e.g., "tap1").
-            user: Owner user (defaults to current user).
-
-        Raises:
-            NetworkError: If creation fails.
-        """
+        """Create TAP device if missing."""
         if not tap_name:
             raise ValueError("tap_name cannot be empty")
 
@@ -103,11 +94,8 @@ class NetworkManager:
 
         logger.info("Creating TAP device: %s (user: %s)", tap_name, user)
 
-        # Create TAP device (ignore if exists)
         try:
-            run_command(
-                ["ip", "tuntap", "add", tap_name, "mode", "tap", "user", user],
-            )
+            run_command(["ip", "tuntap", "add", tap_name, "mode", "tap", "user", user])
         except SmolVMError as e:
             if "File exists" in str(e) or "EEXIST" in str(e):
                 logger.debug("TAP device %s already exists", tap_name)
@@ -120,16 +108,7 @@ class NetworkManager:
         host_ip: str | None = None,
         netmask: str = DEFAULT_NETMASK,
     ) -> None:
-        """Configure a TAP device with IP and bring it up.
-
-        Args:
-            tap_name: Name of the TAP device.
-            host_ip: IP address to assign (defaults to self.host_ip).
-            netmask: Network mask in CIDR notation.
-
-        Raises:
-            NetworkError: If configuration fails.
-        """
+        """Assign host IP and bring TAP link up."""
         if not tap_name:
             raise ValueError("tap_name cannot be empty")
 
@@ -138,39 +117,24 @@ class NetworkManager:
 
         logger.info("Configuring TAP %s with IP %s/%s", tap_name, host_ip, netmask)
 
-        # Flush existing addresses
-        with suppress(NetworkError):
-            run_command(["ip", "addr", "flush", "dev", tap_name])
+        batch = [
+            f"addr flush dev {tap_name}",
+            f"addr add {host_ip}/{netmask} dev {tap_name}",
+            f"link set {tap_name} up",
+        ]
 
-        # Add IP address
         try:
-            run_command(["ip", "addr", "add", f"{host_ip}/{netmask}", "dev", tap_name])
-        except NetworkError as e:
-            if "EEXIST" not in str(e):
+            self._run_ip_batch(batch)
+        except SmolVMError as e:
+            # Can happen in rare races; safe to ignore for idempotency.
+            if "RTNETLINK answers: File exists" not in str(e):
                 raise
 
-        # Bring interface up
-        run_command(["ip", "link", "set", tap_name, "up"])
-
-        # Enable route_localnet to allow localhost forwarding
-        try:
-            run_command(
-                ["sysctl", "-w", f"net.ipv4.conf.{tap_name}.route_localnet=1"],
-                use_sudo=True,
-            )
-        except Exception as e:
-            logger.warning("Failed to enable route_localnet on %s: %s", tap_name, e)
+        # Allow localhost DNAT to guest addresses.
+        self._write_sysctl(f"net/ipv4/conf/{tap_name}/route_localnet", "1")
 
     def add_route(self, ip_address: str, device: str) -> None:
-        """Add a static route for a specific IP via a device.
-
-        Args:
-            ip_address: Target IP (e.g. "172.16.0.2").
-            device: Output device name.
-
-        Raises:
-            NetworkError: If route addition fails.
-        """
+        """Add host route for one guest IP through a TAP device."""
         if not ip_address:
             raise ValueError("ip_address cannot be empty")
         if not device:
@@ -179,115 +143,335 @@ class NetworkManager:
         logger.info("Adding route: %s via %s", ip_address, device)
         try:
             run_command(["ip", "route", "add", f"{ip_address}/32", "dev", device])
-        except NetworkError as e:
+        except SmolVMError as e:
             if "File exists" not in str(e):
                 raise
 
-    def enable_ip_forwarding(self) -> None:
-        """Enable IP forwarding on the host."""
-        logger.debug("Enabling IP forwarding")
+    def cleanup_tap(self, tap_name: str) -> None:
+        """Delete TAP device (best effort)."""
+        if not tap_name:
+            raise ValueError("tap_name cannot be empty")
+
+        logger.info("Cleaning up TAP device: %s", tap_name)
         try:
-            with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-                f.write("1")
+            run_command(["ip", "link", "delete", tap_name])
+        except SmolVMError as e:
+            if "Cannot find device" not in str(e):
+                logger.warning("Failed to delete TAP %s: %s", tap_name, e)
+
+    # ------------------------------------------------------------------
+    # sysctl helpers
+    # ------------------------------------------------------------------
+
+    def enable_ip_forwarding(self) -> None:
+        """Enable IPv4 forwarding once per manager instance."""
+        if self._ip_forwarding_enabled:
+            return
+
+        if self._write_sysctl("net/ipv4/ip_forward", "1"):
+            self._ip_forwarding_enabled = True
+
+    def _write_sysctl(self, key_path: str, value: str) -> bool:
+        """Write /proc/sys key, with sudo sysctl fallback."""
+        path = Path(f"/proc/sys/{key_path}")
+
+        try:
+            path.write_text(value)
+            return True
         except (PermissionError, FileNotFoundError):
-            run_command(
-                ["sysctl", "-w", "net.ipv4.ip_forward=1"],
-                use_sudo=True,
+            pass
+
+        key = key_path.replace("/", ".")
+        try:
+            run_command(["sysctl", "-w", f"{key}={value}"], use_sudo=True)
+            return True
+        except Exception as e:
+            logger.warning("Failed to set sysctl %s: %s", key, e)
+            return False
+
+    def _run_ip_batch(self, commands: list[str]) -> None:
+        """Execute batched iproute2 commands."""
+        if not commands:
+            return
+
+        run_command(["ip", "-batch", "-"], input="\n".join(commands), use_sudo=True)
+
+    # ------------------------------------------------------------------
+    # nftables helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quote(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _run_nft_script(self, script: str) -> None:
+        run_command(["nft", "-f", "-"], input=script, use_sudo=True)
+
+    def _nft_table_exists(self, family: str, table: str) -> bool:
+        try:
+            run_command(["nft", "list", "table", family, table], use_sudo=True)
+            return True
+        except SmolVMError:
+            return False
+
+    def _nft_chain_exists(self, family: str, table: str, chain: str) -> bool:
+        try:
+            run_command(["nft", "list", "chain", family, table, chain], use_sudo=True)
+            return True
+        except SmolVMError:
+            return False
+
+    def _ensure_nftables_base(self) -> None:
+        """Create SmolVM nftables tables/chains if missing.
+
+        This is executed once per manager instance and uses a single batched
+        nft script for any missing objects.
+        """
+        if self._nft_base_ready:
+            return
+
+        script_lines: list[str] = []
+
+        nat_exists = self._nft_table_exists(_NFT_NAT_FAMILY, _NFT_NAT_TABLE)
+        if not nat_exists:
+            script_lines.extend(
+                [
+                    f"add table {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE}",
+                    (
+                        f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} prerouting "
+                        "{ type nat hook prerouting priority dstnat; policy accept; }"
+                    ),
+                    (
+                        f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} output "
+                        "{ type nat hook output priority -100; policy accept; }"
+                    ),
+                    (
+                        f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} postrouting "
+                        "{ type nat hook postrouting priority srcnat; policy accept; }"
+                    ),
+                ]
+            )
+        else:
+            if not self._nft_chain_exists(_NFT_NAT_FAMILY, _NFT_NAT_TABLE, "prerouting"):
+                script_lines.append(
+                    f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} prerouting "
+                    "{ type nat hook prerouting priority dstnat; policy accept; }"
+                )
+            if not self._nft_chain_exists(_NFT_NAT_FAMILY, _NFT_NAT_TABLE, "output"):
+                script_lines.append(
+                    f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} output "
+                    "{ type nat hook output priority -100; policy accept; }"
+                )
+            if not self._nft_chain_exists(_NFT_NAT_FAMILY, _NFT_NAT_TABLE, "postrouting"):
+                script_lines.append(
+                    f"add chain {_NFT_NAT_FAMILY} {_NFT_NAT_TABLE} postrouting "
+                    "{ type nat hook postrouting priority srcnat; policy accept; }"
+                )
+
+        filter_exists = self._nft_table_exists(_NFT_FILTER_FAMILY, _NFT_FILTER_TABLE)
+        if not filter_exists:
+            script_lines.extend(
+                [
+                    f"add table {_NFT_FILTER_FAMILY} {_NFT_FILTER_TABLE}",
+                    (
+                        f"add chain {_NFT_FILTER_FAMILY} {_NFT_FILTER_TABLE} forward "
+                        "{ type filter hook forward priority filter; policy accept; }"
+                    ),
+                ]
+            )
+        elif not self._nft_chain_exists(_NFT_FILTER_FAMILY, _NFT_FILTER_TABLE, "forward"):
+            script_lines.append(
+                f"add chain {_NFT_FILTER_FAMILY} {_NFT_FILTER_TABLE} forward "
+                "{ type filter hook forward priority filter; policy accept; }"
             )
 
+        if script_lines:
+            self._run_nft_script("\n".join(script_lines) + "\n")
+
+        self._nft_base_ready = True
+
+    def _nft_list_table(self, family: str, table: str, *, handles: bool) -> str:
+        cmd = ["nft"]
+        if handles:
+            cmd.append("-a")
+        cmd.extend(["list", "table", family, table])
+
+        try:
+            result = run_command(cmd, use_sudo=True)
+            return result.stdout
+        except SmolVMError:
+            return ""
+
+    @staticmethod
+    def _extract_table_comments(output: str) -> set[tuple[str, str]]:
+        """Return existing (chain, comment) pairs for one nft table listing."""
+        comments: set[tuple[str, str]] = set()
+        current_chain: str | None = None
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            chain_match = _NFT_CHAIN_RE.match(stripped)
+            if chain_match is not None:
+                current_chain = chain_match.group("chain")
+                continue
+
+            if stripped == "}":
+                current_chain = None
+                continue
+
+            if current_chain is None:
+                continue
+
+            comment_match = _NFT_RULE_COMMENT_RE.search(stripped)
+            if comment_match is not None:
+                comments.add((current_chain, comment_match.group("comment")))
+
+        return comments
+
+    @staticmethod
+    def _extract_table_rule_handles(output: str) -> list[tuple[str, str, str]]:
+        """Return (chain, comment, handle) tuples from an nft table listing."""
+        handles: list[tuple[str, str, str]] = []
+        current_chain: str | None = None
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            chain_match = _NFT_CHAIN_RE.match(stripped)
+            if chain_match is not None:
+                current_chain = chain_match.group("chain")
+                continue
+
+            if stripped == "}":
+                current_chain = None
+                continue
+
+            if current_chain is None:
+                continue
+
+            handle_match = _NFT_RULE_HANDLE_RE.search(stripped)
+            if handle_match is None:
+                continue
+
+            handles.append(
+                (
+                    current_chain,
+                    handle_match.group("comment"),
+                    handle_match.group("handle"),
+                )
+            )
+
+        return handles
+
+    def _add_nft_rules_if_missing(
+        self,
+        rules: list[tuple[str, str, str, str, str]],
+    ) -> None:
+        """Add rules in one batch, skipping existing (chain, comment) pairs."""
+        table_comments_cache: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        script_lines: list[str] = []
+
+        for family, table, chain, rule_expr, comment in rules:
+            table_key = (family, table)
+            if table_key not in table_comments_cache:
+                table_output = self._nft_list_table(family, table, handles=False)
+                table_comments_cache[table_key] = self._extract_table_comments(table_output)
+
+            comment_key = (chain, comment)
+            if comment_key in table_comments_cache[table_key]:
+                continue
+
+            script_lines.append(
+                f"add rule {family} {table} {chain} {rule_expr} comment {self._quote(comment)}"
+            )
+            table_comments_cache[table_key].add(comment_key)
+
+        if script_lines:
+            self._run_nft_script("\n".join(script_lines) + "\n")
+
+    def _delete_nft_rules(
+        self,
+        family: str,
+        table: str,
+        *,
+        comment: str | None = None,
+        comment_prefix: str | None = None,
+    ) -> None:
+        """Delete matching rules in one batched nft call."""
+        if comment is None and comment_prefix is None:
+            raise ValueError("comment or comment_prefix must be provided")
+
+        table_output = self._nft_list_table(family, table, handles=True)
+        if not table_output:
+            return
+
+        handles = self._extract_table_rule_handles(table_output)
+        delete_lines: list[str] = []
+
+        for chain, rule_comment, handle in handles:
+            if comment is not None and rule_comment != comment:
+                continue
+            if comment_prefix is not None and not rule_comment.startswith(comment_prefix):
+                continue
+            delete_lines.append(f"delete rule {family} {table} {chain} handle {handle}")
+
+        if delete_lines:
+            self._run_nft_script("\n".join(delete_lines) + "\n")
+
+    # ------------------------------------------------------------------
+    # Public firewall/NAT API
+    # ------------------------------------------------------------------
+
     def setup_nat(self, tap_name: str) -> None:
-        """Set up NAT rules for a TAP device.
-
-        Creates:
-        - MASQUERADE rule for outbound traffic
-        - FORWARD rules for traffic flow
-        - Inter-VM isolation rule
-
-        Args:
-            tap_name: Name of the TAP device.
-
-        Raises:
-            NetworkError: If rule creation fails.
-        """
+        """Configure outbound NAT and forwarding for a TAP device."""
         if not tap_name:
             raise ValueError("tap_name cannot be empty")
 
         logger.info("Setting up NAT for TAP: %s", tap_name)
 
+        self.enable_ip_forwarding()
+        self._ensure_nftables_base()
+
         iface = self.outbound_interface
 
-        # Enable IP forwarding
-        self.enable_ip_forwarding()
-
-        # MASQUERADE for outbound (idempotent check)
-        if not self._rule_exists("nat", "POSTROUTING", ["-o", iface, "-j", "MASQUERADE"]):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "POSTROUTING",
-                    "-o",
-                    iface,
-                    "-j",
-                    "MASQUERADE",
-                ]
-            )
-
-        # Allow established/related connections
-        if not self._rule_exists(
-            "filter",
-            "FORWARD",
-            ["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-        ):
-            run_command(
-                [
-                    "iptables",
-                    "-A",
-                    "FORWARD",
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "RELATED,ESTABLISHED",
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
-
-        # Allow TAP to outbound interface
-        if not self._rule_exists(
-            "filter", "FORWARD", ["-i", tap_name, "-o", iface, "-j", "ACCEPT"]
-        ):
-            run_command(
-                [
-                    "iptables",
-                    "-A",
-                    "FORWARD",
-                    "-i",
-                    tap_name,
-                    "-o",
-                    iface,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
-
-        # Block inter-VM traffic (security)
-        if not self._rule_exists("filter", "FORWARD", ["-i", "tap+", "-o", "tap+", "-j", "DROP"]):
-            run_command(
-                [
-                    "iptables",
-                    "-A",
-                    "FORWARD",
-                    "-i",
-                    "tap+",
-                    "-o",
-                    "tap+",
-                    "-j",
-                    "DROP",
-                ]
-            )
+        self._add_nft_rules_if_missing(
+            [
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "postrouting",
+                    f"oifname {self._quote(iface)} counter masquerade",
+                    f"smolvm:global:nat:masquerade:{iface}",
+                ),
+                (
+                    _NFT_FILTER_FAMILY,
+                    _NFT_FILTER_TABLE,
+                    "forward",
+                    "ct state related,established counter accept",
+                    "smolvm:global:forward:established",
+                ),
+                (
+                    _NFT_FILTER_FAMILY,
+                    _NFT_FILTER_TABLE,
+                    "forward",
+                    (
+                        f"iifname {self._quote(tap_name)} "
+                        f"oifname {self._quote(iface)} counter accept"
+                    ),
+                    f"smolvm:nat:tap:{tap_name}:to:{iface}",
+                ),
+                (
+                    _NFT_FILTER_FAMILY,
+                    _NFT_FILTER_TABLE,
+                    "forward",
+                    (
+                        f"iifname {self._quote('tap*')} "
+                        f"oifname {self._quote('tap*')} counter drop"
+                    ),
+                    "smolvm:global:forward:tap-isolation",
+                ),
+            ]
+        )
 
     def setup_ssh_port_forward(
         self,
@@ -296,18 +480,7 @@ class NetworkManager:
         host_port: int,
         guest_port: int = 22,
     ) -> None:
-        """Set up inbound SSH port forwarding for a VM.
-
-        Creates rules to forward:
-        - host:<host_port> on outbound interface -> guest_ip:<guest_port>
-        - localhost:<host_port> -> guest_ip:<guest_port> (host-local access)
-
-        Args:
-            vm_id: VM identifier (used in rule comments).
-            guest_ip: Guest IP address.
-            host_port: Host TCP port exposed for SSH.
-            guest_port: Guest SSH port (default: 22).
-        """
+        """Expose host TCP port to guest SSH port via nftables."""
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
         if not guest_ip:
@@ -318,91 +491,53 @@ class NetworkManager:
             raise ValueError("guest_port must be 1-65535")
 
         self.enable_ip_forwarding()
+        self._ensure_nftables_base()
+
         iface = self.outbound_interface
         target = f"{guest_ip}:{guest_port}"
         comment = f"smolvm:{vm_id}:ssh"
 
-        prerouting = [
-            "-i",
-            iface,
-            "-p",
-            "tcp",
-            "--dport",
-            str(host_port),
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "DNAT",
-            "--to-destination",
-            target,
-        ]
-        if not self._rule_exists("nat", "PREROUTING", prerouting):
-            run_command(["iptables", "-t", "nat", "-A", "PREROUTING", *prerouting])
-
-        output = [
-            "-d",
-            "127.0.0.1/32",
-            "-p",
-            "tcp",
-            "--dport",
-            str(host_port),
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "DNAT",
-            "--to-destination",
-            target,
-        ]
-        if not self._rule_exists("nat", "OUTPUT", output):
-            run_command(["iptables", "-t", "nat", "-A", "OUTPUT", *output])
-
-        # Rewrite localhost source so guest replies route back to host TAP
-        # instead of guest loopback.
-        localhost_snat = [
-            "-s",
-            "127.0.0.0/8",
-            "-d",
-            guest_ip,
-            "-p",
-            "tcp",
-            "--dport",
-            str(guest_port),
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "SNAT",
-            "--to-source",
-            self.host_ip,
-        ]
-        if not self._rule_exists("nat", "POSTROUTING", localhost_snat):
-            run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", *localhost_snat])
-
-        forward = [
-            "-p",
-            "tcp",
-            "-d",
-            guest_ip,
-            "--dport",
-            str(guest_port),
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "NEW,ESTABLISHED,RELATED",
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "ACCEPT",
-        ]
-        if not self._rule_exists("filter", "FORWARD", forward):
-            run_command(["iptables", "-A", "FORWARD", *forward])
+        self._add_nft_rules_if_missing(
+            [
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "prerouting",
+                    (
+                        f"iifname {self._quote(iface)} "
+                        f"tcp dport {host_port} counter dnat to {target}"
+                    ),
+                    comment,
+                ),
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "output",
+                    f"ip daddr 127.0.0.1/32 tcp dport {host_port} counter dnat to {target}",
+                    comment,
+                ),
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "postrouting",
+                    (
+                        f"ip saddr 127.0.0.0/8 ip daddr {guest_ip}/32 "
+                        f"tcp dport {guest_port} counter snat to {self.host_ip}"
+                    ),
+                    comment,
+                ),
+                (
+                    _NFT_FILTER_FAMILY,
+                    _NFT_FILTER_TABLE,
+                    "forward",
+                    (
+                        f"ip daddr {guest_ip}/32 tcp dport {guest_port} "
+                        "ct state new,related,established counter accept"
+                    ),
+                    comment,
+                ),
+            ]
+        )
 
     def cleanup_ssh_port_forward(
         self,
@@ -411,7 +546,7 @@ class NetworkManager:
         host_port: int,
         guest_port: int = 22,
     ) -> None:
-        """Remove inbound SSH port-forwarding rules for a VM."""
+        """Remove SSH forwarding rules for one VM."""
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
         if not guest_ip:
@@ -421,111 +556,10 @@ class NetworkManager:
         if guest_port < 1 or guest_port > 65535:
             raise ValueError("guest_port must be 1-65535")
 
-        iface = self.outbound_interface
-        target = f"{guest_ip}:{guest_port}"
         comment = f"smolvm:{vm_id}:ssh"
 
-        with suppress(NetworkError):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-s",
-                    "127.0.0.0/8",
-                    "-d",
-                    guest_ip,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(guest_port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "SNAT",
-                    "--to-source",
-                    self.host_ip,
-                ]
-            )
-
-        with suppress(NetworkError):
-            run_command(
-                [
-                    "iptables",
-                    "-D",
-                    "FORWARD",
-                    "-p",
-                    "tcp",
-                    "-d",
-                    guest_ip,
-                    "--dport",
-                    str(guest_port),
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "NEW,ESTABLISHED,RELATED",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
-
-        with suppress(NetworkError):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-D",
-                    "OUTPUT",
-                    "-d",
-                    "127.0.0.1/32",
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(host_port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    target,
-                ]
-            )
-
-        with suppress(NetworkError):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-D",
-                    "PREROUTING",
-                    "-i",
-                    iface,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(host_port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    target,
-                ]
-            )
+        self._delete_nft_rules(_NFT_NAT_FAMILY, _NFT_NAT_TABLE, comment=comment)
+        self._delete_nft_rules(_NFT_FILTER_FAMILY, _NFT_FILTER_TABLE, comment=comment)
 
     def setup_local_port_forward(
         self,
@@ -534,14 +568,7 @@ class NetworkManager:
         host_port: int,
         guest_port: int,
     ) -> None:
-        """Set up localhost-only TCP forwarding from host to guest.
-
-        Creates rules to forward:
-        - 127.0.0.1:<host_port> -> guest_ip:<guest_port>
-
-        This does not add a PREROUTING rule, so the service is not exposed on
-        external host interfaces.
-        """
+        """Expose localhost:host_port to guest_ip:guest_port."""
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
         if not guest_ip:
@@ -552,69 +579,42 @@ class NetworkManager:
             raise ValueError("guest_port must be 1-65535")
 
         self.enable_ip_forwarding()
-        target = f"{guest_ip}:{guest_port}"
+        self._ensure_nftables_base()
+
         comment = f"smolvm:{vm_id}:local:{host_port}:{guest_port}"
+        target = f"{guest_ip}:{guest_port}"
 
-        output = [
-            "-d",
-            "127.0.0.1/32",
-            "-p",
-            "tcp",
-            "--dport",
-            str(host_port),
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "DNAT",
-            "--to-destination",
-            target,
-        ]
-        if not self._rule_exists("nat", "OUTPUT", output):
-            run_command(["iptables", "-t", "nat", "-A", "OUTPUT", *output])
-
-        localhost_snat = [
-            "-s",
-            "127.0.0.0/8",
-            "-d",
-            guest_ip,
-            "-p",
-            "tcp",
-            "--dport",
-            str(guest_port),
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "SNAT",
-            "--to-source",
-            self.host_ip,
-        ]
-        if not self._rule_exists("nat", "POSTROUTING", localhost_snat):
-            run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", *localhost_snat])
-
-        forward = [
-            "-p",
-            "tcp",
-            "-d",
-            guest_ip,
-            "--dport",
-            str(guest_port),
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "NEW,ESTABLISHED,RELATED",
-            "-m",
-            "comment",
-            "--comment",
-            comment,
-            "-j",
-            "ACCEPT",
-        ]
-        if not self._rule_exists("filter", "FORWARD", forward):
-            run_command(["iptables", "-A", "FORWARD", *forward])
+        self._add_nft_rules_if_missing(
+            [
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "output",
+                    f"ip daddr 127.0.0.1/32 tcp dport {host_port} counter dnat to {target}",
+                    comment,
+                ),
+                (
+                    _NFT_NAT_FAMILY,
+                    _NFT_NAT_TABLE,
+                    "postrouting",
+                    (
+                        f"ip saddr 127.0.0.0/8 ip daddr {guest_ip}/32 "
+                        f"tcp dport {guest_port} counter snat to {self.host_ip}"
+                    ),
+                    comment,
+                ),
+                (
+                    _NFT_FILTER_FAMILY,
+                    _NFT_FILTER_TABLE,
+                    "forward",
+                    (
+                        f"ip daddr {guest_ip}/32 tcp dport {guest_port} "
+                        "ct state new,related,established counter accept"
+                    ),
+                    comment,
+                ),
+            ]
+        )
 
     def cleanup_local_port_forward(
         self,
@@ -623,7 +623,7 @@ class NetworkManager:
         host_port: int,
         guest_port: int,
     ) -> None:
-        """Remove localhost-only TCP forwarding rules for a VM."""
+        """Remove localhost-only forwarding rules for one mapping."""
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
         if not guest_ip:
@@ -633,260 +633,69 @@ class NetworkManager:
         if guest_port < 1 or guest_port > 65535:
             raise ValueError("guest_port must be 1-65535")
 
-        target = f"{guest_ip}:{guest_port}"
         comment = f"smolvm:{vm_id}:local:{host_port}:{guest_port}"
 
-        with suppress(NetworkError, SmolVMError):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-s",
-                    "127.0.0.0/8",
-                    "-d",
-                    guest_ip,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(guest_port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "SNAT",
-                    "--to-source",
-                    self.host_ip,
-                ]
-            )
-
-        with suppress(NetworkError, SmolVMError):
-            run_command(
-                [
-                    "iptables",
-                    "-D",
-                    "FORWARD",
-                    "-p",
-                    "tcp",
-                    "-d",
-                    guest_ip,
-                    "--dport",
-                    str(guest_port),
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "NEW,ESTABLISHED,RELATED",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
-
-        with suppress(NetworkError, SmolVMError):
-            run_command(
-                [
-                    "iptables",
-                    "-t",
-                    "nat",
-                    "-D",
-                    "OUTPUT",
-                    "-d",
-                    "127.0.0.1/32",
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(host_port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    target,
-                ]
-            )
+        self._delete_nft_rules(_NFT_NAT_FAMILY, _NFT_NAT_TABLE, comment=comment)
+        self._delete_nft_rules(_NFT_FILTER_FAMILY, _NFT_FILTER_TABLE, comment=comment)
 
     def cleanup_all_local_port_forwards(self, vm_id: str) -> None:
-        """Best-effort removal of all localhost-only forwarding rules for a VM."""
+        """Best-effort cleanup for all localhost forwards belonging to vm_id."""
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
 
-        comment_prefix = f"smolvm:{vm_id}:local:"
+        prefix = f"smolvm:{vm_id}:local:"
 
-        for table, chain in (("nat", "OUTPUT"), ("filter", "FORWARD")):
-            for rule_tokens in self._list_chain_rules(table, chain):
-                comment = self._extract_comment(rule_tokens)
-                if comment is None or not comment.startswith(comment_prefix):
-                    continue
-
-                delete_tokens = list(rule_tokens)
-                if not delete_tokens or delete_tokens[0] != "-A":
-                    continue
-                delete_tokens[0] = "-D"
-
-                cmd = ["iptables"]
-                if table != "filter":
-                    cmd.extend(["-t", table])
-                cmd.extend(delete_tokens)
-
-                with suppress(NetworkError, SmolVMError):
-                    run_command(cmd)
-
-    def _list_chain_rules(self, table: str, chain: str) -> list[list[str]]:
-        """Return parsed `iptables -S <chain>` rules for a table."""
-        cmd = ["iptables"]
-        if table != "filter":
-            cmd.extend(["-t", table])
-        cmd.extend(["-S", chain])
-
-        result = run_command(cmd)
-        rules: list[list[str]] = []
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("-A "):
-                continue
-            try:
-                tokens = shlex.split(stripped)
-            except ValueError:
-                continue
-            if len(tokens) >= 2 and tokens[0] == "-A" and tokens[1] == chain:
-                rules.append(tokens)
-        return rules
-
-    @staticmethod
-    def _extract_comment(rule_tokens: list[str]) -> str | None:
-        """Extract `--comment` value from parsed iptables tokens."""
-        for i, token in enumerate(rule_tokens):
-            if token == "--comment" and i + 1 < len(rule_tokens):
-                return rule_tokens[i + 1]
-        return None
-
-    def _rule_exists(self, table: str, chain: str, rule_parts: list[str]) -> bool:
-        """Check if an iptables rule already exists.
-
-        Args:
-            table: Table name (nat, filter).
-            chain: Chain name (POSTROUTING, FORWARD).
-            rule_parts: Rule specification parts.
-
-        Returns:
-            True if rule exists.
-        """
-        try:
-            cmd = ["iptables"]
-            if table != "filter":
-                cmd.extend(["-t", table])
-            cmd.extend(["-C", chain, *rule_parts])
-            run_command(cmd, check=True)
-            return True
-        except SmolVMError:
-            return False
-
-    def cleanup_tap(self, tap_name: str) -> None:
-        """Delete a TAP device.
-
-        Args:
-            tap_name: Name of the TAP device.
-        """
-        if not tap_name:
-            raise ValueError("tap_name cannot be empty")
-
-        logger.info("Cleaning up TAP device: %s", tap_name)
-
-        try:
-            run_command(["ip", "link", "delete", tap_name])
-        except NetworkError as e:
-            if "Cannot find device" not in str(e):
-                logger.warning("Failed to delete TAP %s: %s", tap_name, e)
+        self._delete_nft_rules(
+            _NFT_NAT_FAMILY,
+            _NFT_NAT_TABLE,
+            comment_prefix=prefix,
+        )
+        self._delete_nft_rules(
+            _NFT_FILTER_FAMILY,
+            _NFT_FILTER_TABLE,
+            comment_prefix=prefix,
+        )
 
     def cleanup_nat_rules(self, tap_name: str) -> None:
-        """Remove NAT rules for a specific TAP device.
-
-        Args:
-            tap_name: Name of the TAP device.
-        """
+        """Remove per-TAP forward rule (global NAT rules stay shared)."""
         if not tap_name:
             raise ValueError("tap_name cannot be empty")
 
-        logger.info("Cleaning up NAT rules for TAP: %s", tap_name)
-
         iface = self.outbound_interface
-
-        # Remove TAP-specific forward rule
-        with suppress(NetworkError):
-            run_command(
-                [
-                    "iptables",
-                    "-D",
-                    "FORWARD",
-                    "-i",
-                    tap_name,
-                    "-o",
-                    iface,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
+        comment = f"smolvm:nat:tap:{tap_name}:to:{iface}"
+        self._delete_nft_rules(
+            _NFT_FILTER_FAMILY,
+            _NFT_FILTER_TABLE,
+            comment=comment,
+        )
 
     def generate_mac(self, vm_number: int) -> str:
-        """Generate a MAC address for a VM.
-
-        Args:
-            vm_number: Unique number for the VM.
-
-        Returns:
-            MAC address string (e.g., "AA:FC:00:00:00:01").
-        """
+        """Generate deterministic VM MAC address for vm_number in [0,255]."""
         if vm_number < 0 or vm_number > 255:
             raise ValueError("vm_number must be between 0 and 255")
-
         return f"AA:FC:00:00:00:{vm_number:02X}"
 
 
 def check_network_prerequisites() -> list[str]:
-    """Check if network prerequisites are met.
+    """Validate required host networking binaries and sudo access."""
+    errors: list[str] = []
 
-    Returns:
-        List of error messages (empty if all good).
-    """
-    errors = []
+    for binary in ["ip", "nft"]:
+        try:
+            run_command(["which", binary], use_sudo=False)
+        except SmolVMError:
+            errors.append(f"'{binary}' command not found")
 
-    # Check for ip command
-    try:
-        run_command(["which", "ip"], use_sudo=False)
-    except SmolVMError:
-        errors.append("'ip' command not found (install iproute2)")
-
-    # Check for iptables
-    try:
-        run_command(["which", "iptables"], use_sudo=False)
-    except SmolVMError:
-        errors.append("'iptables' command not found")
-
-    # Check for non-interactive sudo access for required runtime commands.
     if os.geteuid() != 0:
-        privileged_checks: list[tuple[list[str], str]] = [
-            (["ip", "link", "show"], "non-interactive sudo for 'ip' runtime commands"),
-            (["iptables", "-L"], "non-interactive sudo for 'iptables' runtime commands"),
-            (
-                ["sysctl", "net.ipv4.ip_forward"],
-                "non-interactive sudo for 'sysctl' runtime commands",
-            ),
+        checks = [
+            (["ip", "link", "show"], "sudo ip"),
+            (["nft", "list", "tables"], "sudo nft"),
+            (["sysctl", "net.ipv4.ip_forward"], "sudo sysctl"),
         ]
-        for cmd, label in privileged_checks:
+        for cmd, label in checks:
             try:
                 run_command(cmd, use_sudo=True)
             except SmolVMError:
-                errors.append(
-                    f"{label} is not configured "
-                    "(run: sudo ./scripts/system-setup.sh --configure-runtime)"
-                )
+                errors.append(f"{label} missing (run setup script)")
 
     return errors

@@ -115,7 +115,7 @@ config = VMConfig(..., disk_mode="shared")
 
 ### 5. Port Forwarding
 
-Expose a guest application to your local machine securely. `expose_local` prefers host-local iptables forwarding and automatically falls back to an SSH tunnel when needed.
+Expose a guest application to your local machine securely. `expose_local` prefers host-local nftables forwarding and automatically falls back to an SSH tunnel when needed.
 
 ```python
 from smolvm import SmolVM
@@ -148,19 +148,31 @@ smolvm env list <vm_id> --show-values
 smolvm env unset <vm_id> DEBUG
 ```
 
+Diagnostics:
+
+```bash
+# Auto-detect backend (Darwin -> qemu, Linux -> firecracker)
+smolvm doctor
+
+# Force backend checks
+smolvm doctor --backend firecracker
+smolvm doctor --backend qemu
+
+# CI-friendly mode
+smolvm doctor --json --strict
+```
+
 ## ⚡ Performance
 
-SmolVM is optimized for low-latency agent workflows. Typical lifecycle timings on a standard Linux host:
+SmolVM is optimized for low-latency agent workflows. Latest lifecycle timings (p50) on a standard Linux host:
 
 | Phase | Time |
 |---|---|
-| Create + Start | ~580ms |
+| Create + Start | ~572ms |
 | SSH ready | ~2.1s |
 | Command execution | **~43ms** |
-| Stop + Delete | ~750ms |
+| Stop + Delete | ~744ms |
 | **Full lifecycle (boot → run → teardown)** | **~3.5s** |
-
-Command execution uses persistent SSH connections — subsequent commands in the same session run at the same ~43ms regardless of count.
 
 Run the benchmark yourself:
 
