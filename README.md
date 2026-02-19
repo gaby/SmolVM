@@ -182,6 +182,16 @@ python scripts/benchmarks/bench_subprocess.py --vms 10 -v
 
 > Measured on AMD Ryzen 7 7800X3D (8C/16T), Ubuntu Linux, KVM/Firecracker backend.
 
+## 🔐 SSH trust model (important)
+
+SmolVM currently prioritizes zero-touch VM access for local agent workflows.
+By default, SSH host keys are not strictly verified during first connection
+(`paramiko.AutoAddPolicy`).
+
+- Use SmolVM on trusted/local networks and hosts.
+- Do not expose guest SSH endpoints publicly without additional controls.
+- See [SECURITY.md](SECURITY.md) for policy and scope details.
+
 ## 📄 License
 
 Apache 2.0 License - see [LICENSE](LICENSE) for details.
