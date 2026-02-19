@@ -703,21 +703,22 @@ class SmolVMManager:
             logger.info("VM stopped: %s (backend=%s)", vm_id, backend)
             return vm_info
 
-        # Firecracker graceful shutdown
+        # Firecracker shutdown — fast path for ephemeral sandbox VMs.
+        # These VMs use isolated disk copies and host-side cleanup happens
+        # in delete(), so there's no meaningful state to preserve.
+        # Try CtrlAltDel with a brief grace window, then SIGKILL.
         if vm_info.socket_path and vm_info.socket_path.exists():
             try:
                 client = FirecrackerClient(vm_info.socket_path)
                 client.send_ctrl_alt_del()
                 client.close()
-
-                # Wait for process to exit
+                # Brief wait — if guest handles it, great
                 if vm_info.pid:
-                    self._wait_for_process(vm_info.pid, timeout)
-
+                    self._wait_for_process(vm_info.pid, min(timeout, 0.5))
             except Exception as e:
-                logger.warning("Graceful shutdown failed for %s: %s", vm_id, e)
+                logger.debug("CtrlAltDel failed for %s: %s", vm_id, e)
 
-        # Force kill if still running
+        # Kill the Firecracker process directly
         if vm_info.pid and self._is_process_running(vm_info.pid):
             self._kill_process(vm_info.pid)
 

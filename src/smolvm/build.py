@@ -459,7 +459,22 @@ RUN chmod +x /init
         return r"""#!/bin/sh
 # SmolVM custom init - runs as PID 1 inside Firecracker VM
 
-# Mount essential filesystems
+# ── Signal handling ──────────────────────────────────────────
+# Firecracker's SendCtrlAltDel sends Ctrl+Alt+Del to the guest
+# kernel.  By default the kernel handles this by calling
+# kernel_restart() which tries a hardware reboot (doesn't exist
+# in Firecracker, so the VM hangs).  We disable CAD so the
+# kernel sends SIGINT to PID 1 instead, where we trap it.
+shutdown() {
+    echo "SmolVM init: shutting down..."
+    kill -TERM -1 2>/dev/null
+    sleep 0.2
+    sync
+    poweroff -f
+}
+trap shutdown INT TERM PWR
+
+# ── Mount essential filesystems ──────────────────────────────
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null  # may already be mounted
@@ -468,13 +483,17 @@ mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 
+# Disable Ctrl+Alt+Del hardware reboot — send SIGINT to PID 1 instead
+echo 0 > /proc/sys/kernel/ctrl-alt-del
+
 # Remount root read-write
 mount -o remount,rw /
 
 # Create required directories
 mkdir -p /run/sshd /var/log
 
-# Configure networking from kernel command line ip= parameter
+# ── Networking ───────────────────────────────────────────────
+# Configure from kernel command line ip= parameter
 # Format: ip=<guest_ip>::<gateway>:<netmask>::eth0:off
 IP_CONFIG=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ip=' | head -1)
 if [ -n "$IP_CONFIG" ]; then
@@ -485,10 +504,8 @@ else
     GATEWAY="172.16.0.1"
 fi
 
-# Bring up networking
 ip link set lo up
 ip link set eth0 up
-# Use CIDR /24 — ip command does not accept dotted netmask
 ip addr add "${GUEST_IP}/24" dev eth0 2>/dev/null || true
 ip route add default via "${GATEWAY}" dev eth0 2>/dev/null || true
 
@@ -499,17 +516,18 @@ echo "nameserver 8.8.4.4" >> /etc/resolv.conf
 # Set hostname
 hostname smolvm
 
-# Generate host keys if missing
+# ── SSH ──────────────────────────────────────────────────────
 ssh-keygen -A 2>/dev/null
-
-# Start SSH daemon
 /usr/sbin/sshd -e
 
 echo "SmolVM init complete: IP=${GUEST_IP}, SSH listening on port 22"
 
-# Keep PID 1 alive (if PID 1 exits the kernel panics)
+# ── Keep PID 1 alive ────────────────────────────────────────
+# Use 'wait' so signals are delivered promptly (plain 'sleep'
+# in a while-loop prevents signal delivery until sleep exits).
 while true; do
-    sleep 3600
+    sleep 3600 &
+    wait $!
 done
 """
 

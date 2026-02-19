@@ -304,7 +304,7 @@ class SmolVM:
 
         return self
 
-    def stop(self, timeout: float = 10.0) -> SmolVM:
+    def stop(self, timeout: float = 3.0) -> SmolVM:
         """Stop the VM.
 
         Args:
@@ -315,6 +315,8 @@ class SmolVM:
         """
         self._cleanup_local_forwards()
         self._info = self._sdk.stop(self._vm_id, timeout=timeout)
+        if self._ssh is not None:
+            self._ssh.close()
         self._ssh = None
         self._ssh_ready = False
         logger.info("VM %s stopped", self._vm_id)
@@ -324,6 +326,8 @@ class SmolVM:
         """Delete the VM and release all resources."""
         self._cleanup_local_forwards()
         self._sdk.delete(self._vm_id)
+        if self._ssh is not None:
+            self._ssh.close()
         self._ssh = None
         self._ssh_ready = False
         logger.info("VM %s deleted", self._vm_id)

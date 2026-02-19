@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "SmolVM Team" }
+    { name = "Celesto AI" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -25,6 +25,7 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 dependencies = [
+    "paramiko>=3.0",
     "pydantic>=2.0",
     "requests>=2.28",
     "requests-unixsocket>=0.3",
