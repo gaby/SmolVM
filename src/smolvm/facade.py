@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from smolvm.backends import BACKEND_QEMU, resolve_backend
+from smolvm.boot_profiles import KernelBootProfile, get_boot_profile_spec
 from smolvm.env import inject_env_vars, read_env_vars, remove_env_vars
 from smolvm.exceptions import (
     CommandExecutionUnavailableError,
@@ -68,15 +69,15 @@ def _build_auto_config(
     ssh_key_path: str | None = None,
 ) -> tuple[VMConfig, str | None]:
     """Build the default SSH-ready VM config used by zero-config flows."""
-    from smolvm.build import SSH_BOOT_ARGS, ImageBuilder
+    from smolvm.build import ImageBuilder
     from smolvm.utils import ensure_ssh_key
 
     resolved_backend = resolve_backend(backend)
-    boot_args = SSH_BOOT_ARGS
-    if resolved_backend == BACKEND_QEMU:
-        arch = platform.machine().lower()
-        console = "ttyAMA0" if arch in {"arm64", "aarch64"} else "ttyS0"
-        boot_args = f"console={console} reboot=k panic=1 init=/init"
+    kernel_profile = KernelBootProfile.MICROVM_DIRECT
+    boot_args = get_boot_profile_spec(kernel_profile).base_boot_args_for_backend(
+        resolved_backend,
+        platform.machine(),
+    )
 
     private_key, public_key = ensure_ssh_key()
     resolved_ssh_key_path = ssh_key_path or str(private_key)
@@ -100,6 +101,7 @@ def _build_auto_config(
         public_key,
         name=image_name,
         rootfs_size_mb=resolved_disk_size_mib,
+        kernel_profile=kernel_profile,
     )
 
     resolved_vm_name = vm_name or f"vm-{uuid.uuid4().hex[:8]}"
@@ -560,6 +562,7 @@ class SmolVM:
 
         guest_ip = self._info.network.guest_ip
         attempts: list[str] = []
+        should_try_nftables = self._should_try_nftables_local_forward()
 
         for candidate in candidate_ports:
             key = (candidate, guest_port)
@@ -573,45 +576,46 @@ class SmolVM:
 
             nftables_configured = False
             keep_nftables = False
-            try:
-                self._sdk.network.setup_local_port_forward(
-                    vm_id=self._vm_id,
-                    guest_ip=guest_ip,
-                    host_port=candidate,
-                    guest_port=guest_port,
-                )
-                nftables_configured = True
-                if self._probe_local_forward(candidate):
-                    self._local_forwards[key] = _LocalForward(
+            if should_try_nftables:
+                try:
+                    self._sdk.network.setup_local_port_forward(
+                        vm_id=self._vm_id,
+                        guest_ip=guest_ip,
                         host_port=candidate,
                         guest_port=guest_port,
-                        transport="nftables",
                     )
-                    keep_nftables = True
-                    logger.info(
-                        "VM %s exposed localhost:%d -> guest:%d (transport=nftables)",
-                        self._vm_id,
-                        candidate,
-                        guest_port,
-                    )
-                    return candidate
-                attempts.append(
-                    f"nftables forward localhost:{candidate} -> guest:{guest_port} "
-                    "was configured but not reachable"
-                )
-            except Exception as e:
-                attempts.append(
-                    f"nftables forward localhost:{candidate} -> guest:{guest_port} failed: {e}"
-                )
-            finally:
-                if nftables_configured and not keep_nftables:
-                    with suppress(Exception):
-                        self._sdk.network.cleanup_local_port_forward(
-                            vm_id=self._vm_id,
-                            guest_ip=guest_ip,
+                    nftables_configured = True
+                    if self._probe_local_forward(candidate):
+                        self._local_forwards[key] = _LocalForward(
                             host_port=candidate,
                             guest_port=guest_port,
+                            transport="nftables",
                         )
+                        keep_nftables = True
+                        logger.info(
+                            "VM %s exposed localhost:%d -> guest:%d (transport=nftables)",
+                            self._vm_id,
+                            candidate,
+                            guest_port,
+                        )
+                        return candidate
+                    attempts.append(
+                        f"nftables forward localhost:{candidate} -> guest:{guest_port} "
+                        "was configured but not reachable"
+                    )
+                except Exception as e:
+                    attempts.append(
+                        f"nftables forward localhost:{candidate} -> guest:{guest_port} failed: {e}"
+                    )
+                finally:
+                    if nftables_configured and not keep_nftables:
+                        with suppress(Exception):
+                            self._sdk.network.cleanup_local_port_forward(
+                                vm_id=self._vm_id,
+                                guest_ip=guest_ip,
+                                host_port=candidate,
+                                guest_port=guest_port,
+                            )
 
             try:
                 tunnel_proc = self._start_local_tunnel(
@@ -1031,6 +1035,12 @@ class SmolVM:
                 )
             finally:
                 self._local_forwards.pop(key, None)
+
+    def _should_try_nftables_local_forward(self) -> bool:
+        """Return whether localhost exposure should attempt host nftables first."""
+        config = getattr(self._info, "config", None)
+        backend = getattr(config, "backend", None)
+        return backend != BACKEND_QEMU
 
     @staticmethod
     def _find_available_local_port() -> int:

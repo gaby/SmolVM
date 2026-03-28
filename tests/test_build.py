@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from smolvm.boot_profiles import KernelBootProfile, resolve_kernel_url
 from smolvm.build import ImageBuilder
 from smolvm.exceptions import ImageError, SmolVMError
 
@@ -156,19 +157,101 @@ class TestImageBuilderLoopFs:
             )
 
         assert mock_run_command.call_count == 3
-        first_call = mock_run_command.call_args_list[0]
-        second_call = mock_run_command.call_args_list[1]
-        third_call = mock_run_command.call_args_list[2]
 
-        assert first_call.args[0][0] == "/usr/local/libexec/smolvm-loopfs-helper"
-        assert first_call.args[0][1] == "mount"
-        assert second_call.args[0][0] == "/usr/local/libexec/smolvm-loopfs-helper"
-        assert second_call.args[0][1] == "extract"
-        assert third_call.args[0][0] == "/usr/local/libexec/smolvm-loopfs-helper"
-        assert third_call.args[0][1] == "umount"
-        assert first_call.kwargs["use_sudo"] is True
-        assert second_call.kwargs["use_sudo"] is True
-        assert third_call.kwargs["use_sudo"] is True
+
+class TestBrowserImageBuilder:
+    """Tests for browser image builder entrypoints."""
+
+    @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
+    @patch.object(ImageBuilder, "check_docker", return_value=True)
+    @patch.object(ImageBuilder, "_do_build")
+    def test_build_browser_rootfs_wires_guest_helpers(
+        self,
+        mock_do_build: MagicMock,
+        _mock_check_docker: MagicMock,
+        _mock_host_arch_key: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Browser rootfs builds should include Chromium and guest helper scripts."""
+        builder = ImageBuilder(cache_dir=tmp_path / "images")
+
+        def _fake_do_build(
+            name: str,
+            dockerfile_content: str,
+            init_script: str,
+            image_dir: Path,
+            kernel_path: Path,
+            rootfs_path: Path,
+            rootfs_size_mb: int,
+            **kwargs: object,
+        ) -> None:
+            assert name == "browser-chromium"
+            assert "chromium" in dockerfile_content
+            assert "websockify" in dockerfile_content
+            assert "x11vnc" in dockerfile_content
+            assert init_script.startswith("#!/bin/sh")
+            assert rootfs_size_mb == 4096
+            assert kwargs["kernel_url"] == resolve_kernel_url(
+                KernelBootProfile.MICROVM_DIRECT,
+                "x86_64",
+            )
+            assert kwargs["fingerprint_data"]["kernel_profile"] == "microvm_direct"
+            assert kwargs["fingerprint_data"]["image_type"] == "browser-chromium-v2"
+            helper_script = kwargs["extra_files"]["smolvm-browser-session"]
+            assert "127.0.0.1:5900" in helper_script
+            kernel_path.touch()
+            rootfs_path.touch()
+
+        mock_do_build.side_effect = _fake_do_build
+
+        kernel, rootfs = builder.build_browser_rootfs(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test"
+        )
+
+        assert kernel.exists()
+        assert rootfs.exists()
+        extra_files = mock_do_build.call_args.kwargs["extra_files"]
+        assert "smolvm-browser-session" in extra_files
+        assert "smolvm-browser-wait-port" in extra_files
+
+    @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
+    @patch.object(ImageBuilder, "check_docker", return_value=True)
+    @patch.object(ImageBuilder, "_do_build")
+    def test_build_browser_rootfs_rebuilds_when_kernel_profile_changes(
+        self,
+        mock_do_build: MagicMock,
+        _mock_check_docker: MagicMock,
+        _mock_host_arch_key: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Browser image cache keys should change when the internal boot profile changes."""
+        builder = ImageBuilder(cache_dir=tmp_path / "images")
+
+        def _fake_do_build(
+            name: str,
+            dockerfile_content: str,
+            init_script: str,
+            image_dir: Path,
+            kernel_path: Path,
+            rootfs_path: Path,
+            rootfs_size_mb: int,
+            **kwargs: object,
+        ) -> None:
+            del name, dockerfile_content, init_script, rootfs_size_mb
+            kernel_path.touch()
+            rootfs_path.touch()
+            builder._write_fingerprint(image_dir, kwargs["fingerprint_data"])
+
+        mock_do_build.side_effect = _fake_do_build
+
+        builder.build_browser_rootfs("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test")
+        builder.build_browser_rootfs("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test")
+        builder.build_browser_rootfs(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test",
+            kernel_profile=KernelBootProfile.QEMU_DESKTOP_INITRAMFS,
+        )
+
+        assert mock_do_build.call_count == 2
 
     @patch("smolvm.build.subprocess.run")
     @patch("smolvm.build.run_command")

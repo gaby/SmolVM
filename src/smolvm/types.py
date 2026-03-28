@@ -14,12 +14,13 @@
 
 """Core types and Pydantic models for SmolVM SDK."""
 
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class VMState(str, Enum):
@@ -31,9 +32,46 @@ class VMState(str, Enum):
     ERROR = "error"
 
 
+class BrowserSessionState(str, Enum):
+    """Browser session lifecycle states."""
+
+    CREATED = "created"
+    STARTING = "starting"
+    READY = "ready"
+    STOPPING = "stopping"
+    ERROR = "error"
+
+
 def _generate_vm_id() -> str:
     """Generate a VM identifier compatible with VMConfig validation."""
     return f"vm-{uuid4().hex[:8]}"
+
+
+def _generate_browser_session_id() -> str:
+    """Generate a browser session identifier."""
+    return f"browser-{uuid4().hex[:8]}"
+
+
+_IDENTIFIER_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$"
+
+
+class BrowserViewport(BaseModel):
+    """Viewport settings for browser sessions."""
+
+    width: Annotated[int, Field(ge=640, le=7680)] = 1280
+    height: Annotated[int, Field(ge=480, le=4320)] = 720
+
+    model_config = {"frozen": True}
+
+
+class PortForwardConfig(BaseModel):
+    """Host-to-guest TCP port forwarding configuration."""
+
+    host_port: Annotated[int, Field(ge=1, le=65535)]
+    guest_port: Annotated[int, Field(ge=1, le=65535)]
+    host_address: str = "127.0.0.1"
+
+    model_config = {"frozen": True}
 
 
 class VMConfig(BaseModel):
@@ -56,13 +94,14 @@ class VMConfig(BaseModel):
             create with the same VM ID can reuse prior state.
         env_vars: Environment variables to inject into the guest
             after boot via SSH. Keys must be valid shell identifiers.
+        port_forwards: Optional host TCP forwards configured at VM launch.
     """
 
     vm_id: Annotated[
         str,
         Field(
             default_factory=_generate_vm_id,
-            pattern=r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$",
+            pattern=_IDENTIFIER_PATTERN,
         ),
     ]
     vcpu_count: Annotated[int, Field(ge=1, le=32)] = 2
@@ -76,6 +115,7 @@ class VMConfig(BaseModel):
     retain_disk_on_delete: bool = False
     env_vars: dict[str, str] = {}
     network_rate_limit_mbps: Annotated[int, Field(ge=1)] | None = None
+    port_forwards: list[PortForwardConfig] = []
 
     @field_validator("vm_id", mode="before")
     @classmethod
@@ -107,6 +147,122 @@ class VMConfig(BaseModel):
         if not v.is_file():
             raise ValueError(f"Path is not a file: {v}")
         return v
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_keys(cls, v: dict[str, str]) -> dict[str, str]:
+        """Ensure all env var keys are valid shell identifiers."""
+        from smolvm.env import validate_env_key  # deferred to avoid circular import
+
+        for key in v:
+            validate_env_key(key)
+        return v
+
+    @field_validator("port_forwards")
+    @classmethod
+    def validate_port_forwards(cls, v: list[PortForwardConfig]) -> list[PortForwardConfig]:
+        """Ensure port-forward definitions do not reuse host or guest ports."""
+        seen_host_ports: set[int] = set()
+        seen_guest_ports: set[int] = set()
+        for forward in v:
+            if forward.host_port in seen_host_ports:
+                raise ValueError(f"Duplicate host port in port_forwards: {forward.host_port}")
+            if forward.guest_port in seen_guest_ports:
+                raise ValueError(f"Duplicate guest port in port_forwards: {forward.guest_port}")
+            seen_host_ports.add(forward.host_port)
+            seen_guest_ports.add(forward.guest_port)
+        return v
+
+    model_config = {"frozen": True}
+
+
+class BrowserSessionConfig(BaseModel):
+    """Configuration for launching a browser session."""
+
+    session_id: Annotated[
+        str | None,
+        Field(default=None, pattern=_IDENTIFIER_PATTERN),
+    ] = None
+    backend: Literal["firecracker", "qemu", "auto"] = "auto"
+    browser: Literal["chromium"] = "chromium"
+    mode: Literal["headless", "live"] = "headless"
+    profile_mode: Literal["ephemeral", "persistent"] = "ephemeral"
+    profile_id: Annotated[
+        str | None,
+        Field(default=None, pattern=_IDENTIFIER_PATTERN),
+    ] = None
+    timeout_minutes: Annotated[int, Field(ge=1, le=240)] = 30
+    viewport_width: Annotated[int, Field(ge=640, le=7680)] = 1280
+    viewport_height: Annotated[int, Field(ge=480, le=4320)] = 720
+    viewport: BrowserViewport | None = None
+    record_video: bool = False
+    allow_downloads: bool = True
+    network_policy_id: str | None = None
+    env_vars: dict[str, str] = {}
+    mem_size_mib: Annotated[int, Field(ge=512, le=16384)] = 2048
+    disk_size_mib: Annotated[int, Field(ge=2048, le=16384)] = 4096
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_viewport(cls, raw: Any) -> Any:
+        """Allow callers to specify viewport via a nested object."""
+        if not isinstance(raw, dict):
+            return raw
+
+        data = dict(raw)
+        viewport = data.get("viewport")
+        if viewport is None:
+            data["viewport"] = {
+                "width": data.get("viewport_width", 1280),
+                "height": data.get("viewport_height", 720),
+            }
+            return data
+
+        if isinstance(viewport, BrowserViewport):
+            width = viewport.width
+            height = viewport.height
+        elif isinstance(viewport, dict):
+            width = viewport.get("width")
+            height = viewport.get("height")
+        else:
+            raise ValueError("viewport must be a mapping with width/height values")
+
+        data.setdefault("viewport_width", width)
+        data.setdefault("viewport_height", height)
+        return data
+
+    @model_validator(mode="after")
+    def validate_browser_session_config(self) -> "BrowserSessionConfig":
+        """Validate cross-field browser session constraints."""
+        if self.viewport is None:
+            raise ValueError("viewport could not be resolved")
+
+        if self.viewport.width != self.viewport_width:
+            raise ValueError("viewport.width must match viewport_width")
+        if self.viewport.height != self.viewport_height:
+            raise ValueError("viewport.height must match viewport_height")
+
+        if self.profile_mode == "persistent" and not self.profile_id:
+            raise ValueError("profile_id is required when profile_mode='persistent'")
+
+        if self.record_video and self.mode != "live":
+            raise ValueError("record_video requires mode='live'")
+
+        if self.network_policy_id is not None and not self.network_policy_id.strip():
+            raise ValueError("network_policy_id cannot be empty")
+
+        return self
+
+    @field_validator("session_id", "profile_id", "network_policy_id")
+    @classmethod
+    def strip_optional_identifiers(cls, value: str | None) -> str | None:
+        """Normalize optional identifier-like strings."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        return normalized
 
     @field_validator("env_vars")
     @classmethod
@@ -161,6 +317,22 @@ class VMInfo(BaseModel):
     network: NetworkConfig | None = None
     pid: int | None = None
     socket_path: Path | None = None
+
+    model_config = {"frozen": True}
+
+
+class BrowserSessionInfo(BaseModel):
+    """Runtime information about a browser session."""
+
+    session_id: str
+    vm_id: str
+    status: BrowserSessionState
+    cdp_url: str | None = None
+    live_url: str | None = None
+    debug_port: int | None = None
+    profile_id: str | None = None
+    expires_at: datetime | None = None
+    artifacts_dir: Path | None = None
 
     model_config = {"frozen": True}
 

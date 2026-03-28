@@ -32,10 +32,10 @@ from rich.text import Text
 from smolvm.cleanup import add_cleanup_args, run_cleanup
 from smolvm.cli_output import console_stdout, emit_json, render_empty, render_error, status_style
 from smolvm.doctor import run_doctor
-from smolvm.types import VMState
+from smolvm.types import BrowserSessionState, VMState
 
 if TYPE_CHECKING:
-    from smolvm.types import VMInfo
+    from smolvm.types import BrowserSessionInfo, VMInfo
 
 DASHBOARD_ALLOW_BETA_ENV = "SMOLVM_DASHBOARD_ALLOW_BETA"
 DASHBOARD_URL_ENV = "SMOLVM_DASHBOARD_URL"
@@ -91,6 +91,42 @@ class CreatePayload(TypedDict):
 
     vm: CreateVmPayload
     next: CreateNextPayload
+
+
+class BrowserRow(TypedDict):
+    """Machine-readable data for a listed browser session."""
+
+    session_id: str
+    vm_id: str
+    status: str
+    cdp_url: str | None
+    live_url: str | None
+    profile_id: str | None
+
+
+class BrowserListFiltersPayload(TypedDict):
+    """Filter metadata included with browser list output."""
+
+    status: str | None
+
+
+class BrowserListPayload(TypedDict):
+    """JSON payload for ``smolvm browser list``."""
+
+    filters: BrowserListFiltersPayload
+    sessions: list[BrowserRow]
+
+
+class BrowserSessionPayload(TypedDict):
+    """Machine-readable session details for ``smolvm browser start``."""
+
+    session_id: str
+    vm_id: str
+    status: str
+    cdp_url: str | None
+    live_url: str | None
+    profile_id: str | None
+    artifacts_dir: str | None
 
 
 def _current_version_is_prerelease() -> bool:
@@ -265,6 +301,141 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_parser.add_argument("vm_id", help="VM identifier")
     _add_ssh_auth_args(ssh_parser)
     _add_boot_timeout_arg(ssh_parser)
+
+    browser_parser = subparsers.add_parser(
+        "browser",
+        help="Manage disposable browser sessions",
+    )
+    browser_sub = browser_parser.add_subparsers(dest="browser_action")
+
+    browser_start = browser_sub.add_parser(
+        "start",
+        help="Create and start a browser session",
+    )
+    browser_start.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional browser session identifier.",
+    )
+    browser_start.add_argument(
+        "--backend",
+        choices=["auto", "firecracker", "qemu"],
+        default="auto",
+        help="Backend override (default: auto).",
+    )
+    browser_start.add_argument(
+        "--mode",
+        choices=["headless", "live"],
+        default="headless",
+        help="Browser mode (default: headless).",
+    )
+    browser_start.add_argument(
+        "--profile-mode",
+        choices=["ephemeral", "persistent"],
+        default="ephemeral",
+        help="Profile lifecycle mode (default: ephemeral).",
+    )
+    browser_start.add_argument(
+        "--profile-id",
+        default=None,
+        help="Persistent profile identifier.",
+    )
+    browser_start.add_argument(
+        "--timeout-minutes",
+        type=int,
+        default=30,
+        help="Session TTL metadata in minutes (default: 30).",
+    )
+    browser_start.add_argument(
+        "--viewport-width",
+        type=int,
+        default=1280,
+        help="Browser viewport width (default: 1280).",
+    )
+    browser_start.add_argument(
+        "--viewport-height",
+        type=int,
+        default=720,
+        help="Browser viewport height (default: 720).",
+    )
+    browser_start.add_argument(
+        "--memory-mib",
+        type=int,
+        default=2048,
+        help="Guest memory in MiB (default: 2048).",
+    )
+    browser_start.add_argument(
+        "--disk-size-mib",
+        type=int,
+        default=4096,
+        help="Root filesystem size in MiB (default: 4096).",
+    )
+    browser_start.add_argument(
+        "--record-video",
+        action="store_true",
+        help="Record live sessions inside the guest artifact directory.",
+    )
+    browser_start.add_argument(
+        "--no-downloads",
+        action="store_true",
+        help="Disable writeable browser downloads inside the guest.",
+    )
+    browser_start.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
+    )
+    _add_boot_timeout_arg(browser_start)
+
+    browser_stop = browser_sub.add_parser(
+        "stop",
+        help="Stop and delete a browser session",
+    )
+    browser_stop_target = browser_stop.add_mutually_exclusive_group(required=True)
+    browser_stop_target.add_argument(
+        "session_id",
+        nargs="?",
+        help="Browser session identifier",
+    )
+    browser_stop_target.add_argument(
+        "--all",
+        action="store_true",
+        help="Stop and delete all persisted browser sessions.",
+    )
+
+    browser_list = browser_sub.add_parser(
+        "list",
+        help="List browser sessions",
+    )
+    browser_list.add_argument(
+        "--status",
+        choices=["created", "starting", "ready", "stopping", "error"],
+        default=None,
+        help="Filter sessions by browser session status.",
+    )
+    browser_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
+    )
+
+    browser_open = browser_sub.add_parser(
+        "open",
+        help="Open a live browser session in the local default browser",
+    )
+    browser_open.add_argument("session_id", help="Browser session identifier")
+
+    browser_logs = browser_sub.add_parser(
+        "logs",
+        help="Print browser session logs",
+    )
+    browser_logs.add_argument("session_id", help="Browser session identifier")
+    browser_logs.add_argument(
+        "--tail",
+        type=int,
+        default=100,
+        help="Number of log lines to tail from each source (default: 100).",
+    )
 
     env_parser = subparsers.add_parser(
         "env",
@@ -471,7 +642,10 @@ def _render_create_result(data: CreatePayload) -> None:
     details.add_column("Field")
     details.add_column("Value")
     details.add_row("Name", str(vm_data["name"]))
-    details.add_row("Status", Text(str(vm_data["status"]), style=status_style(str(vm_data["status"]))))
+    details.add_row(
+        "Status",
+        Text(str(vm_data["status"]), style=status_style(str(vm_data["status"]))),
+    )
     details.add_row("Backend", str(vm_data["backend"]))
     details.add_row("IP Address", str(vm_data["ip_address"] or "-"))
     details.add_row(
@@ -726,7 +900,14 @@ def _run_ssh(args: argparse.Namespace) -> int:
             vm.close()
 
 
-def _render_ui_startup(host: str, port: int, dashboard_url: str, *, allow_beta: bool, auto_beta: bool) -> None:
+def _render_ui_startup(
+    host: str,
+    port: int,
+    dashboard_url: str,
+    *,
+    allow_beta: bool,
+    auto_beta: bool,
+) -> None:
     """Render the UI startup panel."""
     lines = [
         f"Starting SmolVM UI on http://{host}:{port} ...",
@@ -785,7 +966,12 @@ def _run_ui(host: str, port: int, allow_beta: bool) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        return _emit_cli_error("ui", 1, RuntimeError(f"failed to start UI: {exc}"), json_output=False)
+        return _emit_cli_error(
+            "ui",
+            1,
+            RuntimeError(f"failed to start UI: {exc}"),
+            json_output=False,
+        )
     finally:
         if allow_beta:
             if previous_allow_beta is None:
@@ -797,6 +983,214 @@ def _run_ui(host: str, port: int, allow_beta: bool) -> int:
             os.environ.pop(DASHBOARD_URL_ENV, None)
         else:
             os.environ[DASHBOARD_URL_ENV] = previous_dashboard_url
+
+
+def _browser_rows(sessions: Sequence[BrowserSessionInfo]) -> list[BrowserRow]:
+    """Normalize browser session info objects into CLI rows."""
+    rows: list[BrowserRow] = []
+    for session in sessions:
+        rows.append(
+            {
+                "session_id": session.session_id,
+                "vm_id": session.vm_id,
+                "status": session.status.value,
+                "cdp_url": session.cdp_url,
+                "live_url": session.live_url,
+                "profile_id": session.profile_id,
+            }
+        )
+    return rows
+
+
+def _render_browser_list(rows: list[BrowserRow]) -> None:
+    """Render the human-facing browser session list."""
+    table = Table(title="SmolVM Browser Sessions")
+    table.add_column("Session")
+    table.add_column("Status")
+    table.add_column("VM")
+    table.add_column("Live URL")
+    for row in rows:
+        table.add_row(
+            str(row["session_id"]),
+            Text(str(row["status"]), style=status_style(str(row["status"]))),
+            str(row["vm_id"]),
+            str(row["live_url"] or "-"),
+        )
+
+    console = console_stdout()
+    console.print(table)
+    console.print(f"Total: {len(rows)} session(s).")
+
+
+def _run_browser(args: argparse.Namespace) -> int:
+    """Handle ``smolvm browser`` commands."""
+    from smolvm.browser import BrowserSession
+    from smolvm.storage import StateManager
+    from smolvm.types import BrowserSessionConfig
+    from smolvm.vm import resolve_data_dir
+
+    json_output = getattr(args, "json", False)
+    command_name = f"browser.{args.browser_action}" if args.browser_action else "browser"
+
+    if args.browser_action is None:
+        render_error("Usage: smolvm browser {start,stop,list,open,logs} ...")
+        return 2
+
+    if args.browser_action == "start":
+        session: BrowserSession | None = None
+        try:
+            config = BrowserSessionConfig(
+                session_id=args.session_id,
+                backend=args.backend,
+                mode=args.mode,
+                profile_mode=args.profile_mode,
+                profile_id=args.profile_id,
+                timeout_minutes=args.timeout_minutes,
+                viewport_width=args.viewport_width,
+                viewport_height=args.viewport_height,
+                viewport={"width": args.viewport_width, "height": args.viewport_height},
+                record_video=args.record_video,
+                allow_downloads=not args.no_downloads,
+                mem_size_mib=args.memory_mib,
+                disk_size_mib=args.disk_size_mib,
+            )
+            session = BrowserSession(config)
+            session.start(boot_timeout=args.boot_timeout)
+
+            data: BrowserSessionPayload = {
+                "session_id": session.session_id,
+                "vm_id": session.vm_id,
+                "status": session.status.value,
+                "cdp_url": session.cdp_url,
+                "live_url": session.live_url,
+                "profile_id": session.info.profile_id,
+                "artifacts_dir": str(session.artifacts_dir) if session.artifacts_dir else None,
+            }
+
+            if json_output:
+                emit_json(command_name, 0, data=data)
+            else:
+                print(f"Started browser session '{session.session_id}'.")
+                print(f"  VM: {session.vm_id}")
+                print(f"  Mode: {config.mode}")
+                print(f"  CDP URL: {session.cdp_url}")
+                if session.live_url:
+                    print(f"  Live URL: {session.live_url}")
+                if session.artifacts_dir:
+                    print(f"  Artifacts: {session.artifacts_dir}")
+            return 0
+        except Exception as exc:
+            return _emit_cli_error(command_name, 1, exc, json_output=json_output)
+        finally:
+            if session is not None:
+                session.close()
+
+    if args.browser_action == "stop":
+        if args.all:
+            state = StateManager(resolve_data_dir() / "smolvm.db")
+            try:
+                sessions = state.list_browser_sessions()
+            except Exception as exc:
+                return _emit_cli_error(command_name, 1, exc, json_output=False)
+
+            if not sessions:
+                render_empty("SmolVM Browser Sessions", "No browser sessions found.")
+                return 0
+
+            failures: list[str] = []
+            stopped_session_ids: list[str] = []
+            for session_info in sessions:
+                session: BrowserSession | None = None
+                try:
+                    session = BrowserSession.from_id(session_info.session_id)
+                    session.stop()
+                    stopped_session_ids.append(session_info.session_id)
+                except Exception as exc:
+                    failures.append(f"{session_info.session_id}: {exc}")
+                finally:
+                    if session is not None:
+                        session.close()
+
+            if failures:
+                render_error(
+                    "Failed to stop one or more browser sessions.",
+                    hint="; ".join(failures),
+                )
+                return 1
+
+            print(f"Stopped {len(stopped_session_ids)} browser session(s).")
+            return 0
+
+        session: BrowserSession | None = None
+        try:
+            assert args.session_id is not None
+            session = BrowserSession.from_id(args.session_id)
+            session.stop()
+            print(f"Stopped browser session '{args.session_id}'.")
+            return 0
+        except Exception as exc:
+            return _emit_cli_error(command_name, 1, exc, json_output=False)
+        finally:
+            if session is not None:
+                session.close()
+
+    if args.browser_action == "open":
+        session: BrowserSession | None = None
+        try:
+            session = BrowserSession.from_id(args.session_id)
+            if session.live_url is None:
+                raise RuntimeError(
+                    f"Browser session '{args.session_id}' does not have a live_url."
+                )
+            opened = session.open_live_view()
+            if not opened:
+                print(f"Open this URL manually: {session.live_url}")
+            else:
+                print(f"Opened {session.live_url}")
+            return 0
+        except Exception as exc:
+            return _emit_cli_error(command_name, 1, exc, json_output=False)
+        finally:
+            if session is not None:
+                session.close()
+
+    if args.browser_action == "logs":
+        session: BrowserSession | None = None
+        try:
+            session = BrowserSession.from_id(args.session_id)
+            output = session.logs(tail=args.tail)
+            if output:
+                print(output)
+            return 0
+        except Exception as exc:
+            return _emit_cli_error(command_name, 1, exc, json_output=False)
+        finally:
+            if session is not None:
+                session.close()
+
+    state = StateManager(resolve_data_dir() / "smolvm.db")
+    try:
+        status = BrowserSessionState(args.status) if args.status else None
+        sessions = state.list_browser_sessions(status=status)
+        rows = _browser_rows(sessions)
+        data: BrowserListPayload = {
+            "filters": {
+                "status": args.status,
+            },
+            "sessions": rows,
+        }
+        if json_output:
+            emit_json(command_name, 0, data=data)
+            return 0
+
+        if not sessions:
+            render_empty("SmolVM Browser Sessions", "No browser sessions found.")
+            return 0
+
+        _render_browser_list(rows)
+        return 0
+    except Exception as exc:
+        return _emit_cli_error(command_name, 1, exc, json_output=json_output)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -834,6 +1228,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "ui":
         return _run_ui(host=args.host, port=args.port, allow_beta=args.allow_beta)
+
+    if args.command == "browser":
+        return _run_browser(args)
 
     if args.command == "env":
         return _run_env(args)

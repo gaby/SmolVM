@@ -32,6 +32,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from smolvm.boot_profiles import (
+    QEMU_DESKTOP_KERNEL_URLS,
+    KernelBootProfile,
+    normalize_arch,
+    resolve_kernel_url,
+)
 from smolvm.exceptions import ImageError, SmolVMError
 from smolvm.utils import RUNTIME_PRIVILEGE_SETUP_HINT, run_command
 
@@ -45,23 +51,7 @@ SSH_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/i
 # 200+ VMs.  No console= since we don't need serial output in production.
 OPENCLAW_BOOT_ARGS = "reboot=k panic=1 pci=off init=/init 8250.nr_uarts=0"
 
-# Firecracker-compatible uncompressed kernels.
-FIRECRACKER_KERNEL_URLS = {
-    "x86_64": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.6/x86_64/vmlinux-5.10.198",
-    "aarch64": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.6/aarch64/vmlinux-5.10.198",
-}
-
-# QEMU-compatible kernels (Ubuntu cloud kernels, unpacked).
-QEMU_KERNEL_URLS = {
-    "x86_64": (
-        "https://cloud-images.ubuntu.com/jammy/current/unpacked/"
-        "jammy-server-cloudimg-amd64-vmlinuz-generic"
-    ),
-    "aarch64": (
-        "https://cloud-images.ubuntu.com/jammy/current/unpacked/"
-        "jammy-server-cloudimg-arm64-vmlinuz-generic"
-    ),
-}
+QEMU_KERNEL_URLS = QEMU_DESKTOP_KERNEL_URLS
 
 LOOPFS_HELPER_PATH = Path("/usr/local/libexec/smolvm-loopfs-helper")
 
@@ -176,6 +166,7 @@ class ImageBuilder:
         ssh_password: str = "smolvm",
         rootfs_size_mb: int = 512,
         kernel_url: str | None = None,
+        kernel_profile: KernelBootProfile = KernelBootProfile.MICROVM_DIRECT,
     ) -> tuple[Path, Path]:
         """Build Alpine Linux image with SSH server.
 
@@ -209,9 +200,12 @@ class ImageBuilder:
         rootfs_path = image_dir / "rootfs.ext4"
 
         # Check fingerprint cache
+        resolved_kernel_url = self._resolve_kernel_url(kernel_profile, kernel_url)
+
         fingerprint_data = {
             "rootfs_size_mb": rootfs_size_mb,
-            "kernel_url": kernel_url,
+            "kernel_url": resolved_kernel_url,
+            "kernel_profile": kernel_profile.value,
             "ssh_password": ssh_password,
         }
         if (
@@ -261,7 +255,7 @@ RUN chmod +x /init
                 rootfs_path,
                 rootfs_size_mb,
                 build_args={"SSH_PASSWORD": ssh_password},
-                kernel_url=kernel_url,
+                kernel_url=resolved_kernel_url,
                 fingerprint_data=fingerprint_data,
             )
         except (subprocess.CalledProcessError, ImageError) as e:
@@ -283,6 +277,7 @@ RUN chmod +x /init
         name: str = "alpine-ssh-key",
         rootfs_size_mb: int = 512,
         kernel_url: str | None = None,
+        kernel_profile: KernelBootProfile = KernelBootProfile.MICROVM_DIRECT,
     ) -> tuple[Path, Path]:
         """Build Alpine Linux image with key-only SSH access.
 
@@ -304,9 +299,12 @@ RUN chmod +x /init
         kernel_path = image_dir / "vmlinux.bin"
         rootfs_path = image_dir / "rootfs.ext4"
 
+        resolved_kernel_url = self._resolve_kernel_url(kernel_profile, kernel_url)
+
         fingerprint_data = {
             "rootfs_size_mb": rootfs_size_mb,
-            "kernel_url": kernel_url,
+            "kernel_url": resolved_kernel_url,
+            "kernel_profile": kernel_profile.value,
             "ssh_public_key": key_value,
         }
 
@@ -359,7 +357,7 @@ RUN chmod +x /init
                 rootfs_path,
                 rootfs_size_mb,
                 extra_files={"authorized_keys": f"{key_value}\n"},
-                kernel_url=kernel_url,
+                kernel_url=resolved_kernel_url,
                 fingerprint_data=fingerprint_data,
             )
         except (subprocess.CalledProcessError, ImageError) as e:
@@ -381,6 +379,7 @@ RUN chmod +x /init
         rootfs_size_mb: int = 2048,
         base_image: str = "debian:bookworm-slim",
         kernel_url: str | None = None,
+        kernel_profile: KernelBootProfile = KernelBootProfile.MICROVM_DIRECT,
     ) -> tuple[Path, Path]:
         """Build Debian Linux image with key-only SSH access.
 
@@ -403,9 +402,12 @@ RUN chmod +x /init
         kernel_path = image_dir / "vmlinux.bin"
         rootfs_path = image_dir / "rootfs.ext4"
 
+        resolved_kernel_url = self._resolve_kernel_url(kernel_profile, kernel_url)
+
         fingerprint_data = {
             "rootfs_size_mb": rootfs_size_mb,
-            "kernel_url": kernel_url,
+            "kernel_url": resolved_kernel_url,
+            "kernel_profile": kernel_profile.value,
             "ssh_public_key": key_value,
             "base_image": base_image,
         }
@@ -463,7 +465,365 @@ RUN chmod +x /init
                 rootfs_path,
                 rootfs_size_mb,
                 extra_files={"authorized_keys": f"{key_value}\n"},
-                kernel_url=kernel_url,
+                kernel_url=resolved_kernel_url,
+                fingerprint_data=fingerprint_data,
+            )
+        except (subprocess.CalledProcessError, ImageError) as e:
+            if rootfs_path.exists():
+                rootfs_path.unlink()
+            if kernel_path.exists():
+                kernel_path.unlink()
+            if isinstance(e, ImageError):
+                raise
+            raise ImageError(f"Image build failed: {e}") from e
+
+        logger.info("Image '%s' built successfully at %s", name, image_dir)
+        return (kernel_path, rootfs_path)
+
+    def build_browser_rootfs(
+        self,
+        ssh_public_key: str | Path,
+        name: str = "browser-chromium",
+        rootfs_size_mb: int = 4096,
+        base_image: str = "debian:bookworm-slim",
+        kernel_url: str | None = None,
+        kernel_profile: KernelBootProfile = KernelBootProfile.MICROVM_DIRECT,
+    ) -> tuple[Path, Path]:
+        """Build a Chromium browser image with optional live-view tooling.
+
+        The resulting image includes:
+        - Chromium with remote debugging enabled at runtime
+        - OpenSSH server for orchestration and artifact collection
+        - Xvfb + Openbox + x11vnc + noVNC/websockify for live mode
+        - ffmpeg for optional session recording
+        - Guest helper scripts for starting/stopping browser sessions
+        """
+        if not self.check_docker():
+            raise self.docker_requirement_error()
+
+        key_value = self._resolve_public_key(ssh_public_key)
+
+        image_dir = self.cache_dir / name
+        kernel_path = image_dir / "vmlinux.bin"
+        rootfs_path = image_dir / "rootfs.ext4"
+
+        resolved_kernel_url = self._resolve_kernel_url(kernel_profile, kernel_url)
+
+        fingerprint_data = {
+            "rootfs_size_mb": rootfs_size_mb,
+            "kernel_url": resolved_kernel_url,
+            "kernel_profile": kernel_profile.value,
+            "ssh_public_key": key_value,
+            "base_image": base_image,
+            "image_type": "browser-chromium-v2",
+        }
+
+        if kernel_path.exists() and rootfs_path.exists():
+            if self._check_fingerprint(image_dir, fingerprint_data):
+                logger.info(
+                    "Image '%s' already exists and fingerprint matches at %s", name, image_dir
+                )
+                return (kernel_path, rootfs_path)
+
+            logger.info("Inputs changed for browser image '%s'. Rebuilding...", name)
+            kernel_path.unlink(missing_ok=True)
+            rootfs_path.unlink(missing_ok=True)
+
+        logger.info("Building browser image '%s'...", name)
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        init_script = self._default_init_script()
+
+        browser_session_sh = r"""#!/bin/sh
+set -eu
+
+RUNTIME_DIR=/run/smolvm-browser
+LOG_DIR=/var/log/smolvm-browser
+NOVNC_WEB_ROOT=/usr/share/novnc
+
+mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+
+find_browser_bin() {
+    for candidate in chromium chromium-browser /usr/bin/chromium /usr/bin/chromium-browser; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    echo "Chromium binary not found" >&2
+    return 1
+}
+
+stop_pid_file() {
+    pid_file="$1"
+    if [ -f "$pid_file" ]; then
+        pid="$(cat "$pid_file" 2>/dev/null || true)"
+        if [ -n "${pid}" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+}
+
+write_preferences() {
+    profile_dir="$1"
+    download_dir="$2"
+    python3 - "$profile_dir" "$download_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+profile_dir = pathlib.Path(sys.argv[1])
+download_dir = pathlib.Path(sys.argv[2])
+default_dir = profile_dir / "Default"
+default_dir.mkdir(parents=True, exist_ok=True)
+
+preferences = {
+    "browser": {
+        "check_default_browser": False,
+    },
+    "distribution": {
+        "import_bookmarks": False,
+        "skip_first_run_ui": True,
+    },
+    "download": {
+        "default_directory": str(download_dir),
+        "directory_upgrade": True,
+        "prompt_for_download": False,
+    },
+    "profile": {
+        "default_content_setting_values": {
+            "notifications": 2,
+        },
+    },
+}
+
+(default_dir / "Preferences").write_text(json.dumps(preferences))
+PY
+}
+
+start_live_stack() {
+    width="$1"
+    height="$2"
+    live_port="$3"
+    record_video="$4"
+    artifacts_dir="$5"
+
+    mkdir -p "$artifacts_dir"
+
+    nohup Xvfb :99 -screen 0 "${width}x${height}x24" \
+        >"${LOG_DIR}/xvfb.log" 2>&1 &
+    echo $! >"${RUNTIME_DIR}/xvfb.pid"
+
+    DISPLAY=:99 HOME=/root nohup openbox \
+        >"${LOG_DIR}/openbox.log" 2>&1 &
+    echo $! >"${RUNTIME_DIR}/openbox.pid"
+
+    nohup x11vnc -display :99 -nopw -forever -shared -rfbport 5900 \
+        >"${LOG_DIR}/x11vnc.log" 2>&1 &
+    echo $! >"${RUNTIME_DIR}/x11vnc.pid"
+
+    nohup websockify --web="${NOVNC_WEB_ROOT}" "${live_port}" 127.0.0.1:5900 \
+        >"${LOG_DIR}/websockify.log" 2>&1 &
+    echo $! >"${RUNTIME_DIR}/websockify.pid"
+
+    if [ "${record_video}" = "1" ]; then
+        nohup ffmpeg -y -video_size "${width}x${height}" -framerate 12 \
+            -f x11grab -i :99 -codec:v libx264 -preset ultrafast \
+            "${artifacts_dir}/session.mp4" \
+            >"${LOG_DIR}/ffmpeg.log" 2>&1 &
+        echo $! >"${RUNTIME_DIR}/ffmpeg.pid"
+    fi
+}
+
+stop_session() {
+    stop_pid_file "${RUNTIME_DIR}/ffmpeg.pid"
+    stop_pid_file "${RUNTIME_DIR}/websockify.pid"
+    stop_pid_file "${RUNTIME_DIR}/x11vnc.pid"
+    stop_pid_file "${RUNTIME_DIR}/openbox.pid"
+    stop_pid_file "${RUNTIME_DIR}/xvfb.pid"
+    stop_pid_file "${RUNTIME_DIR}/chromium.pid"
+}
+
+start_session() {
+    mode="$1"
+    width="$2"
+    height="$3"
+    debug_port="$4"
+    live_port="$5"
+    profile_dir="$6"
+    download_dir="$7"
+    record_video="$8"
+    downloads_enabled="$9"
+    artifacts_dir="${10}"
+
+    browser_bin="$(find_browser_bin)"
+
+    mkdir -p "$profile_dir" "$download_dir" "$artifacts_dir"
+    if [ "${downloads_enabled}" = "1" ]; then
+        chmod 700 "$download_dir"
+    else
+        chmod 500 "$download_dir"
+    fi
+
+    write_preferences "$profile_dir" "$download_dir"
+    stop_session
+
+    if [ "${mode}" = "live" ]; then
+        start_live_stack "$width" "$height" "$live_port" "$record_video" "$artifacts_dir"
+    fi
+
+    if [ "${mode}" = "headless" ]; then
+        nohup "$browser_bin" \
+            --headless=new \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-background-networking \
+            --disable-component-update \
+            --metrics-recording-only \
+            --password-store=basic \
+            --use-mock-keychain \
+            --remote-allow-origins=* \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port="${debug_port}" \
+            --user-data-dir="${profile_dir}" \
+            --window-size="${width},${height}" \
+            about:blank \
+            >"${LOG_DIR}/chromium.log" 2>&1 &
+    else
+        DISPLAY=:99 HOME=/root nohup "$browser_bin" \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-background-networking \
+            --disable-component-update \
+            --metrics-recording-only \
+            --password-store=basic \
+            --use-mock-keychain \
+            --remote-allow-origins=* \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port="${debug_port}" \
+            --user-data-dir="${profile_dir}" \
+            --window-size="${width},${height}" \
+            about:blank \
+            >"${LOG_DIR}/chromium.log" 2>&1 &
+    fi
+
+    echo $! >"${RUNTIME_DIR}/chromium.pid"
+}
+
+case "${1:-}" in
+    start)
+        if [ "$#" -ne 11 ]; then
+            echo "usage: smolvm-browser-session start <mode> <width> <height>" >&2
+            echo "  <debug_port> <live_port> <profile_dir> <download_dir>" >&2
+            echo "  <record_video> <downloads_enabled> <artifacts_dir>" >&2
+            exit 2
+        fi
+        shift
+        start_session "$@"
+        ;;
+    stop)
+        stop_session
+        ;;
+    *)
+        echo "usage: smolvm-browser-session {start|stop}" >&2
+        exit 2
+        ;;
+esac
+"""
+
+        wait_port_py = r"""#!/usr/bin/env python3
+import socket
+import sys
+import time
+
+if len(sys.argv) != 3:
+    raise SystemExit("usage: smolvm-browser-wait-port <port> <timeout_seconds>")
+
+port = int(sys.argv[1])
+timeout = float(sys.argv[2])
+deadline = time.time() + timeout
+
+while time.time() < deadline:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(0)
+    time.sleep(0.5)
+
+raise SystemExit(1)
+"""
+
+        dockerfile_content = f"""
+FROM {base_image}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    openssh-server \\
+    iproute2 \\
+    curl \\
+    bash \\
+    ca-certificates \\
+    python3 \\
+    chromium \\
+    xvfb \\
+    x11vnc \\
+    novnc \\
+    websockify \\
+    openbox \\
+    ffmpeg \\
+    fonts-dejavu-core \\
+    fonts-liberation \\
+    dbus-x11 \\
+    xauth \\
+    procps \\
+    tar \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ssh-keygen -A && \\
+    mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh && \\
+    sed -ri 's/^#?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \\
+    sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config && \\
+    sed -ri 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+COPY authorized_keys /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh
+
+RUN mkdir -p \\
+    /opt/smolvm-browser/profiles \\
+    /opt/smolvm-browser/downloads \\
+    /opt/smolvm-browser/artifacts
+
+COPY smolvm-browser-session /usr/local/bin/smolvm-browser-session
+COPY smolvm-browser-wait-port /usr/local/bin/smolvm-browser-wait-port
+RUN chmod +x /usr/local/bin/smolvm-browser-session /usr/local/bin/smolvm-browser-wait-port
+
+COPY init /init
+RUN chmod +x /init
+"""
+
+        try:
+            self._do_build(
+                name,
+                dockerfile_content,
+                init_script,
+                image_dir,
+                kernel_path,
+                rootfs_path,
+                rootfs_size_mb,
+                extra_files={
+                    "authorized_keys": f"{key_value}\n",
+                    "smolvm-browser-session": browser_session_sh,
+                    "smolvm-browser-wait-port": wait_port_py,
+                },
+                kernel_url=resolved_kernel_url,
                 fingerprint_data=fingerprint_data,
             )
         except (subprocess.CalledProcessError, ImageError) as e:
@@ -906,21 +1266,28 @@ echo "Device-approver running with PID=${DEVICE_APPROVER_PID}"
     def _host_arch_key() -> str:
         """Normalize host architecture to SmolVM kernel key."""
         arch = platform.machine().lower()
-        if arch in {"x86_64", "amd64"}:
-            return "x86_64"
-        if arch in {"arm64", "aarch64"}:
-            return "aarch64"
-        raise ImageError(f"Unsupported host architecture '{arch}'")
+        try:
+            return normalize_arch(arch)
+        except ValueError as exc:
+            raise ImageError(str(exc)) from exc
 
     def _kernel_url_for_host(self) -> str:
         """Return a Firecracker-compatible kernel URL for the current host arch."""
-        arch_key = self._host_arch_key()
-        return FIRECRACKER_KERNEL_URLS[arch_key]
+        return self._resolve_kernel_url(KernelBootProfile.MICROVM_DIRECT)
 
     def qemu_kernel_url_for_host(self) -> str:
-        """Return a QEMU-compatible kernel URL for the current host arch."""
-        arch_key = self._host_arch_key()
-        return QEMU_KERNEL_URLS[arch_key]
+        """Return the future desktop/initramfs QEMU kernel URL for the host arch."""
+        return self._resolve_kernel_url(KernelBootProfile.QEMU_DESKTOP_INITRAMFS)
+
+    def _resolve_kernel_url(
+        self,
+        kernel_profile: KernelBootProfile,
+        kernel_url: str | None = None,
+    ) -> str:
+        """Return the effective kernel URL for an image build."""
+        if kernel_url is not None:
+            return kernel_url
+        return resolve_kernel_url(kernel_profile, self._host_arch_key())
 
     def _check_fingerprint(self, image_dir: Path, data: dict[str, typing.Any]) -> bool:
         """Check if the cached image fingerprint matches the current build inputs."""
