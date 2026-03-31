@@ -38,10 +38,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
-from pydantic_ai import Agent
 
-if TYPE_CHECKING:
+try:
     from pydantic_ai import RunContext
+except ImportError:
+    if TYPE_CHECKING:
+        raise
+
+    class RunContext:
+        """Fallback used so runtime annotation evaluation does not fail."""
+
+        def __class_getitem__(cls, _item: Any) -> type["RunContext"]:
+            return cls
 
 DEFAULT_MODEL = "openai:gpt-4.1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +57,8 @@ ARTIFACTS_DIR = REPO_ROOT / "artifacts" / "pydanticai-agent-browser"
 FINAL_SCREENSHOT_PATH = "artifacts/pydanticai-agent-browser/final.png"
 SYSTEM_INSTRUCTIONS = (
     "You automate one SmolVM browser session from the host.\n"
+    "First read `agent-browser --help`.\n"
+    "Decide on the exact commands before you run them.\n"
     "Follow this workflow exactly:\n"
     "1. First run `smolvm browser start --live --json`.\n"
     "2. Read `cdp_port` from the `parsed_browser_session` section in the tool output.\n"
@@ -61,15 +71,17 @@ SYSTEM_INSTRUCTIONS = (
 )
 DEMO_PROMPT = (
     "Use run_host_bash to complete this exact demo:\n"
-    "1. Open https://celesto.ai\n"
-    "2. Capture a snapshot\n"
-    "3. Click the `Get started...` link\n"
-    "4. Wait for the destination page to load\n"
-    "5. Capture another snapshot\n"
-    "6. Scroll down a bit\n"
-    f"7. Save a screenshot to `{FINAL_SCREENSHOT_PATH}`\n"
-    "8. Fetch the current title and URL\n"
-    "9. Stop the session\n"
+    "1. Read `agent-browser --help`\n"
+    "2. Make a short plan\n"
+    "3. Open https://celesto.ai\n"
+    "4. Capture a snapshot\n"
+    "5. Click the `Get started...` link\n"
+    "6. Wait for the destination page to load\n"
+    "7. Capture another snapshot\n"
+    "8. Scroll down a bit\n"
+    f"9. Save a screenshot to `{FINAL_SCREENSHOT_PATH}`\n"
+    "10. Fetch the current title and URL\n"
+    "11. Stop the session\n"
     "Return only the final title, URL, page summary, screenshot path, and session ID."
 )
 
@@ -79,6 +91,23 @@ class BrowserCliDeps:
     """Hold the active browser session so cleanup can happen outside the agent."""
 
     session: dict[str, Any] | None = None
+
+
+def _log_progress(message: str) -> None:
+    """Print progress updates immediately so the demo does not look stuck."""
+    print(message, flush=True)
+
+
+def _require_dependency(import_path: str, install_hint: str) -> Any:
+    """Import an optional dependency lazily with a useful installation hint."""
+    module_name, _, attr_name = import_path.partition(":")
+    try:
+        module = __import__(module_name, fromlist=[attr_name] if attr_name else [])
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Missing dependency '{module_name}'. Install it with: {install_hint}"
+        ) from exc
+    return getattr(module, attr_name) if attr_name else module
 
 
 def _parse_browser_start_output(stdout: str) -> dict[str, Any] | None:
@@ -166,6 +195,7 @@ def run_host_bash(
         command: Shell command to execute on the host.
         timeout: Maximum number of seconds to wait for the command.
     """
+    _log_progress(f"Running command: {command}")
     try:
         result = subprocess.run(
             ["bash", "-lc", command],
@@ -183,7 +213,9 @@ def run_host_bash(
             stderr = f"{timeout_message}\n{stderr}"
         else:
             stderr = timeout_message
-        return _format_command_result(124, stdout, stderr)
+        formatted = _format_command_result(124, stdout, stderr)
+        _log_progress(f"Command result:\n{formatted}")
+        return formatted
 
     parsed_browser_session: dict[str, Any] | None = None
     if (
@@ -195,16 +227,19 @@ def run_host_bash(
         if parsed_browser_session is not None:
             ctx.deps.session = parsed_browser_session
 
-    return _format_command_result(
+    formatted = _format_command_result(
         result.returncode,
         result.stdout,
         result.stderr,
         parsed_browser_session=parsed_browser_session,
     )
+    _log_progress(f"Command result:\n{formatted}")
+    return formatted
 
 
 def _build_agent() -> Any:
-    agent = Agent(
+    agent_cls = _require_dependency("pydantic_ai:Agent", "pip install pydantic-ai")
+    agent = agent_cls(
         os.environ.get("PYDANTICAI_MODEL", DEFAULT_MODEL),
         deps_type=BrowserCliDeps,
         instructions=SYSTEM_INSTRUCTIONS,
