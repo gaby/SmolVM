@@ -21,12 +21,14 @@ import logging
 import os
 import platform
 import pwd
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import time
 from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -34,12 +36,14 @@ from smolvm.api import FirecrackerClient
 from smolvm.backends import BACKEND_FIRECRACKER, BACKEND_QEMU, resolve_backend
 from smolvm.exceptions import (
     SmolVMError,
+    SnapshotAlreadyExistsError,
+    SnapshotNotFoundError,
     VMNotFoundError,
 )
 from smolvm.host import HostCapability, HostManager
 from smolvm.network import NetworkManager, check_network_prerequisites
 from smolvm.storage import StateManager
-from smolvm.types import NetworkConfig, VMConfig, VMInfo, VMState
+from smolvm.types import NetworkConfig, SnapshotInfo, VMConfig, VMInfo, VMState
 from smolvm.utils import RUNTIME_PRIVILEGE_SETUP_HINT, which
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,7 @@ DEFAULT_SOCKET_DIR = Path("/tmp")
 QEMU_GUEST_IP = "10.0.2.15"
 QEMU_GATEWAY_IP = "10.0.2.2"
 QEMU_NETMASK = "255.255.255.0"
+SNAPSHOT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 
 
 def _get_sudo_user_info() -> pwd.struct_passwd | None:
@@ -163,13 +168,16 @@ class SmolVMManager:
         self.socket_dir = socket_dir or DEFAULT_SOCKET_DIR
         self.backend = resolve_backend(backend)
         self.disk_dir = self.data_dir / "disks"
+        self.snapshot_dir = self.data_dir / "snapshots"
         self.disk_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         # Under sudo, keep the chosen user-state path owned by the real user.
         owner = _get_sudo_user_info()
         if owner is not None:
             self._ensure_path_owner(self.data_dir, owner.pw_uid, owner.pw_gid)
             self._ensure_path_owner(self.disk_dir, owner.pw_uid, owner.pw_gid)
+            self._ensure_path_owner(self.snapshot_dir, owner.pw_uid, owner.pw_gid)
 
         # Initialize managers
         db_path = self.data_dir / "smolvm.db"
@@ -311,6 +319,102 @@ class SmolVMManager:
         if actual != expected:
             return None
         return expected
+
+    def _ensure_firecracker_runtime_supported(self, vm_info: VMInfo) -> None:
+        """Validate whether a VM can be managed through the Firecracker API."""
+        backend = self._backend_for_vm(vm_info)
+        if backend != BACKEND_FIRECRACKER:
+            raise SmolVMError("This operation is only supported with the Firecracker backend")
+
+    def _ensure_firecracker_snapshot_supported(self, vm_info: VMInfo) -> None:
+        """Validate whether snapshot operations are supported for a VM."""
+        self._ensure_firecracker_runtime_supported(vm_info)
+        if vm_info.config.disk_mode != "isolated":
+            raise SmolVMError("Snapshotting currently supports only isolated-disk VMs")
+        if vm_info.config.extra_drives:
+            raise SmolVMError("Snapshotting currently supports only VMs without extra drives")
+        if vm_info.network is None:
+            raise SmolVMError("VM has no network configuration", {"vm_id": vm_info.vm_id})
+
+    def _require_firecracker_client(self, vm_info: VMInfo) -> FirecrackerClient:
+        """Return a Firecracker client for a running or paused VM."""
+        self._ensure_firecracker_runtime_supported(vm_info)
+        if vm_info.socket_path is None:
+            raise SmolVMError("VM has no Firecracker socket path", {"vm_id": vm_info.vm_id})
+        if not vm_info.socket_path.exists():
+            raise SmolVMError(
+                "Firecracker socket is not available",
+                {"vm_id": vm_info.vm_id, "socket_path": str(vm_info.socket_path)},
+            )
+        return FirecrackerClient(vm_info.socket_path)
+
+    def _warn_low_disk_space_for_snapshot(self, vm_info: VMInfo) -> None:
+        """Warn when snapshot creation looks likely to exhaust local disk space."""
+        rootfs_size = vm_info.config.rootfs_path.stat().st_size
+        mem_size = vm_info.config.mem_size_mib * 1024 * 1024
+        required_bytes = rootfs_size + (2 * mem_size)
+        free_bytes = shutil.disk_usage(self.snapshot_dir).free
+        if free_bytes < required_bytes:
+            logger.warning(
+                "Low disk space for snapshotting VM %s: free=%d required~=%d",
+                vm_info.vm_id,
+                free_bytes,
+                required_bytes,
+            )
+
+    def _snapshot_root_for_id(self, snapshot_id: str) -> Path:
+        """Return a validated snapshot directory path under ``self.snapshot_dir``."""
+        if not snapshot_id:
+            raise ValueError("snapshot_id cannot be empty")
+        if not SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id):
+            raise ValueError(
+                "snapshot_id must contain only lowercase letters, numbers, hyphens, "
+                "or underscores"
+            )
+
+        snapshot_root = (self.snapshot_dir / snapshot_id).resolve(strict=False)
+        snapshot_dir = self.snapshot_dir.resolve()
+        try:
+            snapshot_root.relative_to(snapshot_dir)
+        except ValueError as exc:
+            raise ValueError("snapshot_id must resolve within the snapshot directory") from exc
+        return snapshot_root
+
+    def _ensure_firecracker_network_for_restore(self, vm_id: str, network: NetworkConfig) -> None:
+        """Ensure host-side network resources exist for a restored Firecracker VM."""
+        user = os.environ.get("USER", "root")
+        self.network.create_tap(network.tap_device, user)
+        self.network.configure_tap(
+            network.tap_device,
+            host_ip=network.gateway_ip,
+            netmask="32",
+        )
+        self.network.add_route(network.guest_ip, network.tap_device)
+        self.network.setup_nat(network.tap_device)
+        if network.ssh_host_port is not None:
+            self.network.setup_ssh_port_forward(
+                vm_id=vm_id,
+                guest_ip=network.guest_ip,
+                host_port=network.ssh_host_port,
+            )
+
+    def _teardown_firecracker_network_for_restore(self, vm_id: str, network: NetworkConfig) -> None:
+        """Best-effort teardown for host networking provisioned during restore."""
+        if network.ssh_host_port is not None:
+            with suppress(Exception):
+                self.network.cleanup_ssh_port_forward(
+                    vm_id=vm_id,
+                    guest_ip=network.guest_ip,
+                    host_port=network.ssh_host_port,
+                )
+        with suppress(Exception):
+            self.network.cleanup_all_local_port_forwards(vm_id)
+        with suppress(Exception):
+            self.network.remove_egress_rules(network.tap_device)
+        with suppress(Exception):
+            self.network.cleanup_nat_rules(network.tap_device)
+        with suppress(Exception):
+            self.network.cleanup_tap(network.tap_device)
 
     def _qemu_binary_candidates(self) -> list[str]:
         """Return architecture-aware qemu-system binary candidates."""
@@ -584,7 +688,12 @@ class SmolVMManager:
             except Exception as e:
                 logger.error("Failed to start VM %s: %s", vm_id, e)
                 self._kill_process(process.pid)
-                self.state.update_vm(vm_id, status=VMState.ERROR, clear_pid=True)
+                self.state.update_vm(
+                    vm_id,
+                    status=VMState.ERROR,
+                    clear_pid=True,
+                    clear_socket_path=True,
+                )
                 raise
 
         # Firecracker path
@@ -658,7 +767,12 @@ class SmolVMManager:
             # Kill process on failure
             logger.error("Failed to start VM %s: %s", vm_id, e)
             self._kill_process(process.pid)
-            self.state.update_vm(vm_id, status=VMState.ERROR, clear_pid=True)
+            self.state.update_vm(
+                vm_id,
+                status=VMState.ERROR,
+                clear_pid=True,
+                clear_socket_path=True,
+            )
             raise
 
     def stop(self, vm_id: str, timeout: float = 10.0) -> VMInfo:
@@ -681,7 +795,7 @@ class SmolVMManager:
 
         vm_info = self.state.get_vm(vm_id)
 
-        if vm_info.status != VMState.RUNNING:
+        if vm_info.status not in (VMState.RUNNING, VMState.PAUSED):
             logger.warning("VM %s is not running (status: %s)", vm_id, vm_info.status)
             return vm_info
 
@@ -708,6 +822,7 @@ class SmolVMManager:
                 vm_id,
                 status=VMState.STOPPED,
                 clear_pid=True,
+                clear_socket_path=True,
             )
             logger.info("VM stopped: %s (backend=%s)", vm_id, backend)
             return vm_info
@@ -715,8 +830,12 @@ class SmolVMManager:
         # Firecracker shutdown — fast path for ephemeral sandbox VMs.
         # These VMs use isolated disk copies and host-side cleanup happens
         # in delete(), so there's no meaningful state to preserve.
-        # Try CtrlAltDel with a brief grace window, then SIGKILL.
-        if vm_info.socket_path and vm_info.socket_path.exists():
+        # Try CtrlAltDel with a brief grace window for running guests, then SIGKILL.
+        if (
+            vm_info.status == VMState.RUNNING
+            and vm_info.socket_path
+            and vm_info.socket_path.exists()
+        ):
             try:
                 client = FirecrackerClient(vm_info.socket_path)
                 client.send_ctrl_alt_del()
@@ -740,10 +859,303 @@ class SmolVMManager:
             vm_id,
             status=VMState.STOPPED,
             clear_pid=True,
+            clear_socket_path=True,
         )
 
         logger.info("VM stopped: %s", vm_id)
         return vm_info
+
+    def pause(self, vm_id: str) -> VMInfo:
+        """Pause a running Firecracker VM."""
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+
+        vm_info = self.state.get_vm(vm_id)
+
+        if vm_info.status != VMState.RUNNING:
+            raise SmolVMError(
+                f"Cannot pause VM in state '{vm_info.status.value}'",
+                {"vm_id": vm_id, "current_status": vm_info.status.value},
+            )
+
+        client = self._require_firecracker_client(vm_info)
+        try:
+            client.pause_vm()
+        finally:
+            client.close()
+
+        return self.state.update_vm(vm_id, status=VMState.PAUSED)
+
+    def resume(self, vm_id: str) -> VMInfo:
+        """Resume a paused Firecracker VM."""
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+
+        vm_info = self.state.get_vm(vm_id)
+
+        if vm_info.status != VMState.PAUSED:
+            raise SmolVMError(
+                f"Cannot resume VM in state '{vm_info.status.value}'",
+                {"vm_id": vm_id, "current_status": vm_info.status.value},
+            )
+
+        client = self._require_firecracker_client(vm_info)
+        try:
+            client.resume_vm()
+        finally:
+            client.close()
+
+        return self.state.update_vm(vm_id, status=VMState.RUNNING)
+
+    def create_snapshot(
+        self,
+        vm_id: str,
+        snapshot_id: str | None = None,
+        *,
+        resume_source: bool = False,
+    ) -> SnapshotInfo:
+        """Create a full Firecracker snapshot for a paused or running VM."""
+        if not vm_id:
+            raise ValueError("vm_id cannot be empty")
+
+        vm_info = self.state.get_vm(vm_id)
+        self._ensure_firecracker_snapshot_supported(vm_info)
+        if vm_info.status not in (VMState.RUNNING, VMState.PAUSED):
+            raise SmolVMError(
+                f"Cannot snapshot VM in state '{vm_info.status.value}'",
+                {"vm_id": vm_id, "current_status": vm_info.status.value},
+            )
+
+        snapshot_id = snapshot_id or f"snap-{vm_id}-{int(time.time())}"
+        snapshot_root = self._snapshot_root_for_id(snapshot_id)
+        if snapshot_root.exists():
+            raise SnapshotAlreadyExistsError(snapshot_id)
+        with suppress(SnapshotNotFoundError):
+            self.state.get_snapshot(snapshot_id)
+            raise SnapshotAlreadyExistsError(snapshot_id)
+
+        original_status = vm_info.status
+        client = self._require_firecracker_client(vm_info)
+        snapshot_persisted = False
+
+        try:
+            snapshot_root.mkdir(parents=True, exist_ok=False)
+            snapshot_path = snapshot_root / "vmstate.bin"
+            mem_file_path = snapshot_root / "mem.bin"
+            disk_path = snapshot_root / "disk.ext4"
+
+            if original_status == VMState.RUNNING:
+                client.pause_vm()
+                vm_info = self.state.update_vm(vm_id, status=VMState.PAUSED)
+
+            self._warn_low_disk_space_for_snapshot(vm_info)
+            client.create_snapshot(snapshot_path, mem_file_path, snapshot_type="Full")
+            shutil.copy2(vm_info.config.rootfs_path, disk_path)
+
+            snapshot_info = SnapshotInfo(
+                snapshot_id=snapshot_id,
+                vm_id=vm_info.vm_id,
+                snapshot_path=snapshot_path,
+                mem_file_path=mem_file_path,
+                disk_path=disk_path,
+                vm_config=vm_info.config,
+                network_config=vm_info.network,
+                created_at=datetime.now(timezone.utc),
+            )
+            self.state.create_snapshot(snapshot_info)
+            snapshot_persisted = True
+
+            if original_status == VMState.RUNNING and resume_source:
+                client.resume_vm()
+                self.state.update_vm(vm_id, status=VMState.RUNNING)
+
+            return snapshot_info
+        except Exception as original_error:
+            snapshot_dir_removed = False
+            rollback_error: Exception | None = None
+            try:
+                shutil.rmtree(snapshot_root)
+                snapshot_dir_removed = True
+            except FileNotFoundError:
+                snapshot_dir_removed = True
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to remove snapshot directory during rollback for %s: %s",
+                    snapshot_id,
+                    cleanup_error,
+                )
+                rollback_error = cleanup_error
+            if snapshot_persisted and snapshot_dir_removed:
+                with suppress(Exception):
+                    self.state.delete_snapshot(snapshot_id)
+            if original_status == VMState.RUNNING:
+                with suppress(Exception):
+                    client.resume_vm()
+                    self.state.update_vm(vm_id, status=VMState.RUNNING)
+            if rollback_error is not None:
+                raise rollback_error from original_error
+            raise
+        finally:
+            client.close()
+
+    def restore_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        resume_vm: bool = False,
+        force: bool = False,
+    ) -> VMInfo:
+        """Restore a snapshot back into its original VM identity."""
+        if not snapshot_id:
+            raise ValueError("snapshot_id cannot be empty")
+
+        snapshot = self.state.get_snapshot(snapshot_id)
+        if snapshot.restored and not force:
+            raise SmolVMError("Snapshot already restored", {"snapshot_id": snapshot_id})
+
+        restore_vm_id = snapshot.vm_id
+        existing_vm: VMInfo | None = None
+        with suppress(VMNotFoundError):
+            existing_vm = self.state.get_vm(restore_vm_id)
+
+        if snapshot.restored and snapshot.restored_vm_id:
+            with suppress(VMNotFoundError):
+                restored_vm = self.state.get_vm(snapshot.restored_vm_id)
+                if restored_vm.status in (VMState.RUNNING, VMState.PAUSED):
+                    raise SmolVMError(
+                        "Snapshot is already backing an active restored VM",
+                        {
+                            "snapshot_id": snapshot_id,
+                            "restored_vm_id": snapshot.restored_vm_id,
+                        },
+                    )
+
+        if existing_vm is not None and existing_vm.config != snapshot.vm_config:
+            raise SmolVMError(
+                "Snapshot restore requires the original VM identity and config",
+                {"snapshot_id": snapshot_id, "vm_id": restore_vm_id},
+            )
+
+        if existing_vm is not None and existing_vm.status in (VMState.RUNNING, VMState.PAUSED):
+            self.stop(restore_vm_id)
+            existing_vm = self.state.get_vm(restore_vm_id)
+
+        if not snapshot.vm_config.kernel_path.exists():
+            raise SmolVMError(
+                "Snapshot restore requires the original kernel path to exist",
+                {
+                    "snapshot_id": snapshot_id,
+                    "kernel_path": str(snapshot.vm_config.kernel_path),
+                },
+            )
+        for required_path, label in (
+            (snapshot.snapshot_path, "snapshot_path"),
+            (snapshot.mem_file_path, "mem_file_path"),
+            (snapshot.disk_path, "disk_path"),
+        ):
+            if not required_path.exists():
+                raise SmolVMError(
+                    f"Snapshot restore requires {label} to exist",
+                    {"snapshot_id": snapshot_id, label: str(required_path)},
+                )
+
+        snapshot.vm_config.rootfs_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot.disk_path, snapshot.vm_config.rootfs_path)
+
+        socket_path = self.socket_dir / f"fc-{restore_vm_id}.sock"
+        created_vm_record = False
+        process: Any | None = None
+        client: FirecrackerClient | None = None
+
+        try:
+            if existing_vm is None:
+                self.state.create_vm(snapshot.vm_config)
+                created_vm_record = True
+            self.state.allocate_ip(
+                restore_vm_id,
+                snapshot.network_config.tap_device,
+                requested_ip=snapshot.network_config.guest_ip,
+            )
+            if snapshot.network_config.ssh_host_port is not None:
+                self.state.reserve_ssh_port(
+                    restore_vm_id,
+                    host_port=snapshot.network_config.ssh_host_port,
+                )
+            self.state.update_vm(restore_vm_id, network=snapshot.network_config)
+
+            self._ensure_firecracker_network_for_restore(restore_vm_id, snapshot.network_config)
+
+            if socket_path.exists():
+                self._unlink_socket(socket_path)
+
+            log_path = self.data_dir / f"{restore_vm_id}.log"
+            process = self._start_firecracker(socket_path, log_path)
+            client = FirecrackerClient(socket_path)
+            client.wait_for_socket()
+            client.load_snapshot(
+                snapshot.snapshot_path,
+                snapshot.mem_file_path,
+                resume_vm=resume_vm,
+            )
+            vm_info = self.state.update_vm(
+                restore_vm_id,
+                status=VMState.RUNNING if resume_vm else VMState.PAUSED,
+                pid=process.pid,
+                socket_path=socket_path,
+            )
+            self.state.mark_snapshot_restored(snapshot_id, restore_vm_id)
+            return vm_info
+        except Exception:
+            if process is not None:
+                with suppress(Exception):
+                    self._kill_process(process.pid)
+            if socket_path.exists():
+                with suppress(Exception):
+                    self._unlink_socket(socket_path)
+
+            if created_vm_record:
+                self._teardown_firecracker_network_for_restore(
+                    restore_vm_id,
+                    snapshot.network_config,
+                )
+                with suppress(Exception):
+                    if snapshot.vm_config.rootfs_path.exists():
+                        snapshot.vm_config.rootfs_path.unlink()
+                with suppress(Exception):
+                    self.state.delete_vm(restore_vm_id)
+            else:
+                self.state.update_vm(
+                    restore_vm_id,
+                    status=VMState.ERROR,
+                    clear_pid=True,
+                    clear_socket_path=True,
+                )
+            raise
+        finally:
+            if client is not None:
+                with suppress(Exception):
+                    client.close()
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete snapshot files and metadata."""
+        snapshot_root = self._snapshot_root_for_id(snapshot_id)
+
+        snapshot = self.state.get_snapshot(snapshot_id)
+        if snapshot.restored and snapshot.restored_vm_id:
+            with suppress(VMNotFoundError):
+                restored_vm = self.state.get_vm(snapshot.restored_vm_id)
+                if restored_vm.status in (VMState.RUNNING, VMState.PAUSED):
+                    raise SmolVMError(
+                        "Cannot delete snapshot while restored VM is active",
+                        {
+                            "snapshot_id": snapshot_id,
+                            "restored_vm_id": snapshot.restored_vm_id,
+                        },
+                    )
+
+        with suppress(FileNotFoundError):
+            shutil.rmtree(snapshot_root)
+        self.state.delete_snapshot(snapshot_id)
 
     def delete(self, vm_id: str) -> None:
         """Delete a VM and all its resources.
@@ -767,7 +1179,7 @@ class SmolVMManager:
             self._cleanup_resources(vm_id)
             raise
 
-        if vm_info.status == VMState.RUNNING:
+        if vm_info.status in (VMState.RUNNING, VMState.PAUSED):
             self.stop(vm_id)
 
         # Cleanup all resources
@@ -802,6 +1214,14 @@ class SmolVMManager:
             List of VMInfo objects.
         """
         return self.state.list_vms(status)
+
+    def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:
+        """Get snapshot metadata."""
+        return self.state.get_snapshot(snapshot_id)
+
+    def list_snapshots(self, vm_id: str | None = None) -> list[SnapshotInfo]:
+        """List snapshots, optionally filtered by source VM ID."""
+        return self.state.list_snapshots(vm_id=vm_id)
 
     def reconcile(self) -> list[str]:
         """Reconcile state with actual system state.
