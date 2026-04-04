@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from smolvm.exceptions import ImageError
 
@@ -41,16 +41,39 @@ class ImageSource(BaseModel):
         kernel_url: URL to download the kernel binary.
         kernel_sha256: Expected SHA-256 hex digest of the kernel,
             or None to skip verification.
+        kernel_filename: Local cache filename for the kernel.
+        initrd_url: Optional URL to download an initrd.
+        initrd_sha256: Expected SHA-256 digest for the initrd, or None.
+        initrd_filename: Local cache filename for the initrd.
         rootfs_url: URL to download the root filesystem.
         rootfs_sha256: Expected SHA-256 hex digest of the rootfs,
             or None to skip verification.
+        rootfs_filename: Local cache filename for the rootfs.
     """
 
     name: str
     kernel_url: str
     kernel_sha256: str | None = None
+    kernel_filename: str = "vmlinux.bin"
+    initrd_url: str | None = None
+    initrd_sha256: str | None = None
+    initrd_filename: str = "initrd.img"
     rootfs_url: str
     rootfs_sha256: str | None = None
+    rootfs_filename: str = "rootfs.ext4"
+
+    @field_validator("kernel_filename", "initrd_filename", "rootfs_filename")
+    @classmethod
+    def normalize_cache_filename(cls, value: str) -> str:
+        """Normalize cache filenames to safe basenames."""
+        raw_path = Path(value)
+        if raw_path.is_absolute():
+            raise ValueError("image cache filenames must be relative paths")
+
+        normalized = raw_path.name
+        if not normalized or normalized in {".", ".."}:
+            raise ValueError("image cache filenames must resolve to a basename")
+        return normalized
 
     model_config = {"frozen": True}
 
@@ -61,11 +84,13 @@ class LocalImage(BaseModel):
     Attributes:
         name: Image name.
         kernel_path: Absolute path to the kernel binary.
+        initrd_path: Optional absolute path to the initrd.
         rootfs_path: Absolute path to the root filesystem.
     """
 
     name: str
     kernel_path: Path
+    initrd_path: Path | None = None
     rootfs_path: Path
 
     model_config = {"frozen": True}
@@ -142,10 +167,13 @@ class ImageManager:
             raise ValueError("image name cannot be empty")
 
         image_dir = self.cache_dir / name
-        kernel = image_dir / "vmlinux.bin"
-        rootfs = image_dir / "rootfs.ext4"
+        source = self.registry.get(name)
+        if source is None:
+            return False
 
-        return kernel.is_file() and rootfs.is_file()
+        kernel, initrd, rootfs = self._resolve_asset_paths(image_dir, source)
+
+        return kernel.is_file() and rootfs.is_file() and (initrd is None or initrd.is_file())
 
     def ensure_image(self, name: str) -> LocalImage:
         """Ensure an image is available locally, downloading if necessary.
@@ -172,18 +200,24 @@ class ImageManager:
             raise ImageError(f"Unknown image: '{name}'. Available images: {available}")
 
         image_dir = self.cache_dir / name
-        kernel_path = image_dir / "vmlinux.bin"
-        rootfs_path = image_dir / "rootfs.ext4"
+        kernel_path, initrd_path, rootfs_path = self._resolve_asset_paths(image_dir, source)
 
         # Check cache — re-download if SHA mismatch
-        if kernel_path.is_file() and rootfs_path.is_file():
+        initrd_ready = initrd_path is None or initrd_path.is_file()
+        if kernel_path.is_file() and rootfs_path.is_file() and initrd_ready:
             kernel_ok = self._verify_sha256(kernel_path, source.kernel_sha256)
+            initrd_ok = (
+                True
+                if initrd_path is None
+                else self._verify_sha256(initrd_path, source.initrd_sha256)
+            )
             rootfs_ok = self._verify_sha256(rootfs_path, source.rootfs_sha256)
-            if kernel_ok and rootfs_ok:
+            if kernel_ok and initrd_ok and rootfs_ok:
                 logger.info("Image '%s' found in cache: %s", name, image_dir)
                 return LocalImage(
                     name=name,
                     kernel_path=kernel_path,
+                    initrd_path=initrd_path,
                     rootfs_path=rootfs_path,
                 )
             logger.warning("Cached image '%s' failed SHA-256 check, re-downloading", name)
@@ -194,6 +228,10 @@ class ImageManager:
         logger.info("Downloading image '%s' kernel...", name)
         self._download_file(source.kernel_url, kernel_path, source.kernel_sha256)
 
+        if initrd_path is not None and source.initrd_url is not None:
+            logger.info("Downloading image '%s' initrd...", name)
+            self._download_file(source.initrd_url, initrd_path, source.initrd_sha256)
+
         logger.info("Downloading image '%s' rootfs...", name)
         self._download_file(source.rootfs_url, rootfs_path, source.rootfs_sha256)
 
@@ -201,12 +239,51 @@ class ImageManager:
         return LocalImage(
             name=name,
             kernel_path=kernel_path,
+            initrd_path=initrd_path,
             rootfs_path=rootfs_path,
         )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _resolve_asset_paths(
+        self,
+        image_dir: Path,
+        source: ImageSource,
+    ) -> tuple[Path, Path | None, Path]:
+        """Return validated cache destinations for image assets."""
+        filenames = {
+            "kernel": source.kernel_filename,
+            "rootfs": source.rootfs_filename,
+        }
+        if source.initrd_url is not None:
+            filenames["initrd"] = source.initrd_filename
+
+        labels_by_filename: dict[str, str] = {}
+        for label, filename in filenames.items():
+            existing_label = labels_by_filename.get(filename)
+            if existing_label is not None:
+                raise ImageError(
+                    "Image asset filenames collide within the cache directory: "
+                    f"{existing_label} and {label} both map to '{filename}'"
+                )
+            labels_by_filename[filename] = label
+
+        resolved_paths: dict[str, Path] = {}
+        for label, filename in filenames.items():
+            destination = image_dir / filename
+            if destination.name != filename or destination.parent != image_dir:
+                raise ImageError(
+                    f"Image asset '{label}' must stay within the cache directory: {filename!r}"
+                )
+            resolved_paths[label] = destination
+
+        return (
+            resolved_paths["kernel"],
+            resolved_paths.get("initrd"),
+            resolved_paths["rootfs"],
+        )
 
     def _download_file(self, url: str, dest: Path, expected_sha256: str | None = None) -> None:
         """Download a file with atomic write and optional SHA-256 verification.

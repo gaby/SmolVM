@@ -395,6 +395,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON output.",
     )
 
+    from smolvm.backends import BACKEND_QEMU, resolve_backend
+    from smolvm.facade import _default_guest_os_for_backend
+
+    current_default_backend = resolve_backend(None)
+    current_default_guest_os = _default_guest_os_for_backend(current_default_backend)
+    qemu_default_guest_os = _default_guest_os_for_backend(BACKEND_QEMU)
+
     create_parser = subparsers.add_parser(
         "create",
         help="Create an SSH-ready VM and leave it running",
@@ -408,7 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--os",
         choices=[guest_os.value for guest_os in GuestOS],
         default=None,
-        help="Guest OS for the auto-configured VM (default: alpine).",
+        help=(
+            "Guest OS for the auto-configured VM (default: backend-specific; "
+            f"{qemu_default_guest_os.value} for qemu-backed creates, "
+            f"{GuestOS.ALPINE.value} otherwise; current default backend: "
+            f"{current_default_backend} -> {current_default_guest_os.value})."
+        ),
     )
     create_parser.add_argument(
         "--memory-mib",
@@ -947,11 +959,17 @@ def _render_create_result(data: CreatePayload) -> None:
 
 def _run_create(args: argparse.Namespace) -> int:
     """Handle ``smolvm create``."""
-    from smolvm.facade import SmolVM, _build_auto_config
+    from smolvm.backends import resolve_backend
+    from smolvm.facade import SmolVM, _build_auto_config, _default_guest_os_for_backend
 
     vm: SmolVM | None = None
     try:
-        resolved_guest_os = GuestOS(args.os) if args.os is not None else GuestOS.ALPINE
+        resolved_backend = resolve_backend(args.backend)
+        resolved_guest_os = (
+            GuestOS(args.os)
+            if args.os is not None
+            else _default_guest_os_for_backend(resolved_backend)
+        )
         config, ssh_key_path = _build_auto_config(
             vm_name=args.name,
             os=args.os,
@@ -1045,7 +1063,9 @@ def _snapshot_row(snapshot: SnapshotInfo) -> SnapshotRow:
         "restored_vm_id": snapshot.restored_vm_id,
         "created_at": snapshot.created_at.isoformat(),
         "artifacts": {
-            "state_path": str(snapshot.artifacts.state_path) if snapshot.artifacts.state_path else None,
+            "state_path": (
+                str(snapshot.artifacts.state_path) if snapshot.artifacts.state_path else None
+            ),
             "memory_path": (
                 str(snapshot.artifacts.memory_path) if snapshot.artifacts.memory_path else None
             ),

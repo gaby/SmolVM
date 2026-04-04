@@ -48,6 +48,7 @@ class GuestOS(str, Enum):
 
     ALPINE = "alpine"
     DEBIAN = "debian"
+    UBUNTU = "ubuntu"
 
 
 def _generate_vm_id() -> str:
@@ -96,9 +97,12 @@ class VMConfig(BaseModel):
         vcpu_count: Number of virtual CPUs (1-32).
         mem_size_mib: Memory size in MiB (128-16384).
         kernel_path: Path to the kernel image.
+        initrd_path: Optional path to the initrd image.
         rootfs_path: Path to the root filesystem image.
         extra_drives: Additional block-device image paths to attach at boot.
         boot_args: Kernel boot arguments.
+        ssh_capable: Whether this boot path is expected to start guest SSH
+            without relying on ``init=/init``.
         backend: Optional runtime backend override ("firecracker" or "qemu").
         disk_mode: Disk lifecycle mode:
             - ``"isolated"`` (default): clone rootfs per VM for sandbox isolation.
@@ -120,9 +124,11 @@ class VMConfig(BaseModel):
     vcpu_count: Annotated[int, Field(ge=1, le=32)] = 2
     mem_size_mib: Annotated[int, Field(ge=128, le=16384)] = 512
     kernel_path: Path
+    initrd_path: Path | None = None
     rootfs_path: Path
     extra_drives: list[Path] = []
     boot_args: str = "console=ttyS0 reboot=k panic=1 pci=off"
+    ssh_capable: bool = False
     backend: str | None = None
     disk_mode: Literal["isolated", "shared"] = "isolated"
     retain_disk_on_delete: bool = False
@@ -144,6 +150,14 @@ class VMConfig(BaseModel):
         """Ensure paths exist on the filesystem."""
         if not cls._should_validate_paths(info):
             return v
+        return cls._validate_file_path(v)
+
+    @field_validator("initrd_path")
+    @classmethod
+    def validate_optional_path_exists(cls, v: Path | None) -> Path | None:
+        """Ensure optional paths exist on the filesystem."""
+        if v is None:
+            return None
         return cls._validate_file_path(v)
 
     @field_validator("extra_drives")

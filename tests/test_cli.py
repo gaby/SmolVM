@@ -79,6 +79,20 @@ def test_top_level_help_mentions_json_for_agents() -> None:
     assert "LLMs, agents, and automation" in help_text
 
 
+def test_create_help_describes_backend_specific_guest_default(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Create help should describe the backend-specific guest OS default."""
+    with pytest.raises(SystemExit) as exc_info:
+        main(["create", "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "default: backend-" in help_text
+    assert "specific; ubuntu for qemu-backed creates" in help_text
+    assert "current default backend" in help_text
+
+
 class TestCliEnv:
     """Tests for `smolvm env` subcommands."""
 
@@ -318,13 +332,17 @@ class TestCliCreate:
 
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.backends.platform.system", return_value="Darwin")
     def test_create_auto_generated_name(
         self,
+        _: MagicMock,
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ) -> None:
         """`smolvm create` should auto-generate a VM name when omitted."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="vm-a1b2c3d4")
         mock_build_auto_config.return_value = (config, "/tmp/id_ed25519")
 
@@ -354,18 +372,22 @@ class TestCliCreate:
         out = capsys.readouterr().out
         assert "Created VM 'vm-a1b2c3d4'." in out
         assert "OS" in out
-        assert "alpine" in out
+        assert "ubuntu" in out
         assert "smolvm ssh vm-a1b2c3d4" in out
 
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.backends.platform.system", return_value="Darwin")
     def test_create_success(
         self,
+        _: MagicMock,
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ) -> None:
         """`smolvm create` should build, start, and report a named VM."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="project-spacex")
         mock_build_auto_config.return_value = (config, "/tmp/id_ed25519")
 
@@ -411,7 +433,7 @@ class TestCliCreate:
         out = capsys.readouterr().out
         assert "Created VM 'project-spacex'." in out
         assert "OS" in out
-        assert "alpine" in out
+        assert "ubuntu" in out
         assert "Backend" in out
         assert "qemu" in out
         assert "172.16.0.2" in out
@@ -455,13 +477,17 @@ class TestCliCreate:
 
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.backends.platform.system", return_value="Darwin")
     def test_create_json(
         self,
+        _: MagicMock,
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ) -> None:
         """`smolvm create --json` should emit the shared envelope."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="project-spacex")
         mock_build_auto_config.return_value = (config, "/tmp/id_ed25519")
 
@@ -479,7 +505,7 @@ class TestCliCreate:
         payload = json.loads(capsys.readouterr().out)
         assert payload["command"] == "create"
         assert payload["data"]["vm"]["name"] == "project-spacex"
-        assert payload["data"]["vm"]["os"] == "alpine"
+        assert payload["data"]["vm"]["os"] == "ubuntu"
         assert payload["data"]["vm"]["backend"] == "qemu"
         assert payload["data"]["next"]["ssh_command"] == "smolvm ssh project-spacex"
 
@@ -568,7 +594,7 @@ class TestCliCreate:
     ) -> None:
         """Argparse should reject unsupported guest OS values."""
         with pytest.raises(SystemExit) as exc_info:
-            main(["create", "--os", "ubuntu"])
+            main(["create", "--os", "fedora"])
 
         assert exc_info.value.code == 2
         assert "invalid choice" in capsys.readouterr().err
