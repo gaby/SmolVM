@@ -207,8 +207,43 @@ def parse_s3_image_uri(uri: str) -> S3ImageRef:
     return S3ImageRef(bucket=bucket, prefix=prefix)
 
 
+# ---------------------------------------------------------------------------
+# S3 credential resolution
+#
+# SmolVM checks its own env vars first, then falls back to boto3's
+# standard credential chain (AWS_* env vars, ~/.aws/credentials, IAM
+# roles).  This lets users point SmolVM at S3-compatible stores
+# (Cloudflare R2, MinIO, etc.) without touching their AWS config.
+#
+#   SMOLVM_S3_ENDPOINT_URL       — Custom S3 endpoint
+#   SMOLVM_S3_ACCESS_KEY_ID      — Access key (falls back to AWS_ACCESS_KEY_ID)
+#   SMOLVM_S3_SECRET_ACCESS_KEY  — Secret key (falls back to AWS_SECRET_ACCESS_KEY)
+# ---------------------------------------------------------------------------
+
+_S3_ENV_VARS = {
+    "endpoint_url": "SMOLVM_S3_ENDPOINT_URL",
+    "access_key": "SMOLVM_S3_ACCESS_KEY_ID",
+    "secret_key": "SMOLVM_S3_SECRET_ACCESS_KEY",
+}
+
+
 def _require_boto3() -> S3Client:
-    """Import boto3 and return an S3 client, or raise a helpful error."""
+    """Import boto3 and return an S3 client, or raise a helpful error.
+
+    Credentials are resolved in order:
+
+    1. ``SMOLVM_S3_*`` environment variables (explicit SmolVM config)
+    2. ``AWS_*`` environment variables (standard boto3 chain)
+    3. ``~/.aws/credentials`` / IAM roles (standard boto3 chain)
+
+    For S3-compatible stores set at minimum::
+
+        export SMOLVM_S3_ENDPOINT_URL=https://<id>.r2.cloudflarestorage.com
+        export SMOLVM_S3_ACCESS_KEY_ID=<key>
+        export SMOLVM_S3_SECRET_ACCESS_KEY=<secret>
+    """
+    import os
+
     try:
         import boto3  # type: ignore[import-untyped]
     except ImportError:
@@ -216,7 +251,46 @@ def _require_boto3() -> S3Client:
             "S3 image support requires boto3. Install it with:\n"
             "  pip install 'smolvm[s3]'"
         ) from None
-    return boto3.client("s3")  # type: ignore[no-any-return]
+
+    # Load .env file if present (walks up from cwd to find it).
+    # Only sets vars not already in os.environ, so explicit exports win.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        logger.debug("python-dotenv not installed; skipping .env loading")
+
+    kwargs: dict[str, str] = {}
+
+    endpoint_url = os.environ.get(_S3_ENV_VARS["endpoint_url"])
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        # S3-compatible stores (R2, MinIO) typically need region="auto"
+        # to avoid boto3 sending the default AWS region which they reject.
+        kwargs["region_name"] = "auto"
+
+    access_key = os.environ.get(_S3_ENV_VARS["access_key"])
+    secret_key = os.environ.get(_S3_ENV_VARS["secret_key"])
+    if access_key or secret_key:
+        if not (access_key and secret_key):
+            missing = "SMOLVM_S3_SECRET_ACCESS_KEY" if access_key else "SMOLVM_S3_ACCESS_KEY_ID"
+            raise ImageError(
+                f"Incomplete S3 credentials: {missing} is not set. "
+                f"Both SMOLVM_S3_ACCESS_KEY_ID and SMOLVM_S3_SECRET_ACCESS_KEY "
+                f"must be set together."
+            )
+        kwargs["aws_access_key_id"] = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+
+    if kwargs:
+        logger.info(
+            "Using SmolVM S3 config: endpoint=%s, credentials=%s",
+            endpoint_url or "(default)",
+            "SMOLVM_S3_*" if access_key else "(boto3 chain)",
+        )
+
+    return boto3.client("s3", **kwargs)  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -588,16 +662,20 @@ class ImageManager:
         image_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Atomic download: temp file → rename
+            # Atomic download: temp file → rename.
+            # Uses get_object (single GetObject call) instead of
+            # download_file/download_fileobj which issue HeadObject
+            # first — some S3-compatible stores (e.g. R2) reject
+            # HeadObject on certain token types.
             tmp_fd, tmp_path_str = tempfile.mkstemp(
                 dir=image_dir, suffix=".tmp"
             )
             tmp_path = Path(tmp_path_str)
             try:
-                import os as _os
-
-                _os.close(tmp_fd)
-                s3.download_file(ref.bucket, manifest_key, str(tmp_path))
+                with open(tmp_fd, "wb") as f:
+                    response = s3.get_object(Bucket=ref.bucket, Key=manifest_key)
+                    for chunk in response["Body"].iter_chunks():
+                        f.write(chunk)
                 tmp_path.rename(manifest_dest)
             finally:
                 tmp_path.unlink(missing_ok=True)
@@ -639,18 +717,17 @@ class ImageManager:
 
         try:
             sha256 = hashlib.sha256() if expected_sha256 else None
+            # Use get_object (single GetObject call) instead of
+            # download_fileobj which issues HeadObject first — some
+            # S3-compatible stores reject HeadObject.
             with open(tmp_fd, "wb") as f:
-                s3.download_fileobj(bucket, key, f)
-
-            # SHA-256 verification requires re-reading the file since
-            # download_fileobj doesn't support streaming callbacks easily.
-            if sha256 is not None and expected_sha256 is not None:
-                with open(tmp_path, "rb") as f:
-                    while True:
-                        chunk = f.read(_DOWNLOAD_CHUNK_SIZE)
-                        if not chunk:
-                            break
+                response = s3.get_object(Bucket=bucket, Key=key)
+                for chunk in response["Body"].iter_chunks(_DOWNLOAD_CHUNK_SIZE):
+                    f.write(chunk)
+                    if sha256 is not None:
                         sha256.update(chunk)
+
+            if sha256 is not None and expected_sha256 is not None:
                 actual_hash = sha256.hexdigest()
                 if actual_hash != expected_sha256:
                     raise ImageError(

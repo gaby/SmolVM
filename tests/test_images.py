@@ -520,20 +520,27 @@ class TestEnsureS3Image:
         self,
         manifest_data: dict[str, object],
         assets: dict[str, bytes],
+        *,
+        expected_bucket: str = "bucket",
     ) -> MagicMock:
         """Create a mock boto3 S3 client that serves a manifest + assets."""
         client = MagicMock()
+        manifest_json = json.dumps(manifest_data).encode()
 
-        def download_file(bucket: str, key: str, dest: str) -> None:
-            Path(dest).write_text(json.dumps(manifest_data))
+        def get_object(Bucket: str, Key: str) -> dict[str, object]:  # noqa: N803
+            assert Bucket == expected_bucket, f"unexpected bucket: {Bucket}"
+            filename = Key.rsplit("/", 1)[-1]
+            if filename == "smolvm-image.json":
+                content = manifest_json
+            elif filename in assets:
+                content = assets[filename]
+            else:
+                raise Exception(f"unexpected S3 key: {Key}")
+            body = MagicMock()
+            body.iter_chunks.return_value = iter([content])
+            return {"Body": body}
 
-        def download_fileobj(bucket: str, key: str, fileobj: object) -> None:
-            filename = key.rsplit("/", 1)[-1]
-            content = assets.get(filename, b"")
-            fileobj.write(content)  # type: ignore[union-attr]
-
-        client.download_file.side_effect = download_file
-        client.download_fileobj.side_effect = download_fileobj
+        client.get_object.side_effect = get_object
         return client
 
     def test_downloads_and_caches(self, tmp_path: Path) -> None:
@@ -579,12 +586,13 @@ class TestEnsureS3Image:
             # First call downloads
             mgr.ensure_s3_image("s3://bucket/images/test/")
             # Reset mock call count
-            mock_s3.download_fileobj.reset_mock()
+            mock_s3.get_object.reset_mock()
             # Second call should use cache
             local, _ = mgr.ensure_s3_image("s3://bucket/images/test/")
 
         assert local.kernel_path.exists()
-        mock_s3.download_fileobj.assert_not_called()
+        # Only manifest was re-fetched; assets came from cache
+        assert mock_s3.get_object.call_count == 1
 
     def test_sha_mismatch_re_downloads(self, tmp_path: Path) -> None:
         """Corrupted cache should trigger re-download."""
@@ -609,11 +617,12 @@ class TestEnsureS3Image:
         local.kernel_path.write_bytes(b"corrupted")
 
         with patch("smolvm.images._require_boto3", return_value=mock_s3):
-            mock_s3.download_fileobj.reset_mock()
+            mock_s3.get_object.reset_mock()
             local2, _ = mgr.ensure_s3_image("s3://bucket/images/test/")
 
         # Kernel should have been re-downloaded (but rootfs cache hit)
-        assert mock_s3.download_fileobj.call_count == 1
+        # Manifest + 1 re-downloaded asset = 2 get_object calls
+        assert mock_s3.get_object.call_count == 2
         assert local2.kernel_path.read_bytes() == kernel_content
 
     def test_no_sha_still_caches(self, tmp_path: Path) -> None:
@@ -634,7 +643,7 @@ class TestEnsureS3Image:
     def test_manifest_download_failure_raises(self, tmp_path: Path) -> None:
         """Failed manifest download should raise ImageError."""
         mock_s3 = MagicMock()
-        mock_s3.download_file.side_effect = Exception("Access Denied")
+        mock_s3.get_object.side_effect = Exception("Access Denied")
 
         mgr = ImageManager(cache_dir=tmp_path / "images")
         with (
@@ -646,9 +655,9 @@ class TestEnsureS3Image:
     def test_invalid_manifest_json_raises(self, tmp_path: Path) -> None:
         """Malformed manifest JSON should raise ImageError."""
         mock_s3 = MagicMock()
-        mock_s3.download_file.side_effect = (
-            lambda bucket, key, dest: Path(dest).write_text("not-json{{{")
-        )
+        body = MagicMock()
+        body.iter_chunks.return_value = iter([b"not-json{{{"])
+        mock_s3.get_object.return_value = {"Body": body}
 
         mgr = ImageManager(cache_dir=tmp_path / "images")
         with (
@@ -716,8 +725,7 @@ class TestEnsureS3Image:
 
         # Second call — S3 is down, should use cached manifest + assets
         offline_s3 = MagicMock()
-        offline_s3.download_file.side_effect = Exception("Network unreachable")
-        offline_s3.download_fileobj.side_effect = Exception("Network unreachable")
+        offline_s3.get_object.side_effect = Exception("Network unreachable")
 
         with patch("smolvm.images._require_boto3", return_value=offline_s3):
             local, _ = mgr.ensure_s3_image("s3://bucket/images/test/")
@@ -725,3 +733,107 @@ class TestEnsureS3Image:
         assert local.kernel_path.exists()
         assert local.rootfs_path.exists()
         assert local.kernel_path.read_bytes() == kernel_content
+
+
+class TestS3CredentialResolution:
+    """Tests for SMOLVM_S3_* env var resolution."""
+
+    _TEST_ACCESS_KEY = "test-access-key-id"  # noqa: S105
+    _TEST_SECRET_KEY = "test-secret-access-key"  # noqa: S105
+
+    def test_smolvm_env_vars_override_defaults(self) -> None:
+        """SMOLVM_S3_* vars should be passed to boto3.client()."""
+        import sys
+
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = MagicMock()
+
+        env = {
+            "SMOLVM_S3_ENDPOINT_URL": "https://custom.endpoint.example",
+            "SMOLVM_S3_ACCESS_KEY_ID": self._TEST_ACCESS_KEY,
+            "SMOLVM_S3_SECRET_ACCESS_KEY": self._TEST_SECRET_KEY,
+        }
+        with patch.dict("os.environ", env), patch.dict(sys.modules, {"boto3": mock_boto3}):
+            from smolvm.images import _require_boto3
+
+            _require_boto3()
+
+        mock_boto3.client.assert_called_once_with(
+            "s3",
+            endpoint_url="https://custom.endpoint.example",
+            region_name="auto",
+            aws_access_key_id=self._TEST_ACCESS_KEY,
+            aws_secret_access_key=self._TEST_SECRET_KEY,
+        )
+
+    def test_endpoint_only_uses_boto3_cred_chain(self) -> None:
+        """When only endpoint is set, credentials fall back to boto3 chain."""
+        import os
+        import sys
+
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = MagicMock()
+        mock_dotenv = MagicMock()
+
+        env = {"SMOLVM_S3_ENDPOINT_URL": "https://r2.example.com"}
+        with (
+            patch.dict("os.environ", env),
+            patch.dict(sys.modules, {"boto3": mock_boto3, "dotenv": mock_dotenv}),
+        ):
+            os.environ.pop("SMOLVM_S3_ACCESS_KEY_ID", None)
+            os.environ.pop("SMOLVM_S3_SECRET_ACCESS_KEY", None)
+
+            from smolvm.images import _require_boto3
+
+            _require_boto3()
+
+        mock_boto3.client.assert_called_once_with(
+            "s3",
+            endpoint_url="https://r2.example.com",
+            region_name="auto",
+        )
+
+    def test_no_smolvm_vars_uses_plain_boto3(self) -> None:
+        """Without SMOLVM_S3_* vars, boto3 defaults should be used."""
+        import os
+        import sys
+
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = MagicMock()
+        mock_dotenv = MagicMock()
+
+        with (
+            patch.dict("os.environ", {}, clear=False),
+            patch.dict(sys.modules, {"boto3": mock_boto3, "dotenv": mock_dotenv}),
+        ):
+            os.environ.pop("SMOLVM_S3_ENDPOINT_URL", None)
+            os.environ.pop("SMOLVM_S3_ACCESS_KEY_ID", None)
+            os.environ.pop("SMOLVM_S3_SECRET_ACCESS_KEY", None)
+
+            from smolvm.images import _require_boto3
+
+            _require_boto3()
+
+        mock_boto3.client.assert_called_once_with("s3")
+
+    def test_half_set_credentials_raises(self) -> None:
+        """Setting only access key without secret should raise."""
+        import sys
+
+        mock_boto3 = MagicMock()
+        mock_dotenv = MagicMock()
+
+        env = {"SMOLVM_S3_ACCESS_KEY_ID": "only-key"}
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch.dict(sys.modules, {"boto3": mock_boto3, "dotenv": mock_dotenv}),
+            pytest.raises(ImageError, match="Incomplete S3 credentials"),
+        ):
+            import os
+
+            os.environ.pop("SMOLVM_S3_SECRET_ACCESS_KEY", None)
+            os.environ.pop("SMOLVM_S3_ENDPOINT_URL", None)
+
+            from smolvm.images import _require_boto3
+
+            _require_boto3()
