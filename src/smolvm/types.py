@@ -18,6 +18,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
@@ -88,6 +89,90 @@ class PortForwardConfig(BaseModel):
     model_config = {"frozen": True}
 
 
+class InternetSettings(BaseModel):
+    """Network access controls for a VM.
+
+    Restricts which external domains (and eventually HTTP methods) the guest
+    can reach.  Domain entries may be full URLs (``https://example.com/path``)
+    or bare hostnames (``example.com``).  The special value ``"*"`` means
+    "allow everything" (the default).
+
+    Attributes:
+        allowed_domains: Domains the guest may connect to.
+            Accepts URLs or bare hostnames.  Default ``["*"]`` allows all.
+        allowed_http_methods: HTTP methods the guest may use.
+            Default ``["*"]`` allows all.  **Not enforced yet** — reserved
+            for a future proxy-based implementation.
+    """
+
+    allowed_domains: list[str] = ["*"]
+    allowed_http_methods: list[str] = ["*"]
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def normalize_domains(cls, v: list[str]) -> list[str]:
+        """Extract and store only lowercased hostnames."""
+        normalized: list[str] = []
+        for entry in v:
+            entry = entry.strip()
+            if not entry:
+                continue
+            if entry == "*":
+                normalized.append(entry)
+                continue
+            if "://" in entry:
+                parsed = urlparse(entry)
+                if parsed.username or parsed.password:
+                    raise ValueError(
+                        f"allowed_domains entries must not contain credentials: {entry!r}"
+                    )
+                if parsed.path and parsed.path != "/":
+                    raise ValueError(
+                        f"allowed_domains entries must be hostnames, not URLs with paths: {entry!r}"
+                    )
+                if parsed.query or parsed.fragment or parsed.params:
+                    raise ValueError(
+                        f"allowed_domains entries must be hostnames, "
+                        f"not URLs with query/fragment: {entry!r}"
+                    )
+                hostname = parsed.hostname
+                if not hostname:
+                    raise ValueError(f"Could not extract hostname from: {entry!r}")
+                normalized.append(hostname.lower())
+            else:
+                # Bare hostname, possibly with a port like "example.com:8080"
+                hostname = entry.split(":")[0]
+                normalized.append(hostname.lower())
+        if not normalized:
+            raise ValueError("allowed_domains must contain at least one entry")
+        return normalized
+
+    @field_validator("allowed_http_methods")
+    @classmethod
+    def normalize_methods(cls, v: list[str]) -> list[str]:
+        """Uppercase and deduplicate HTTP method entries."""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for method in v:
+            method = method.strip().upper()
+            if not method:
+                continue
+            if method in seen:
+                continue
+            seen.add(method)
+            normalized.append(method)
+        if not normalized:
+            raise ValueError("allowed_http_methods must contain at least one entry")
+        return normalized
+
+    @property
+    def is_allow_all_domains(self) -> bool:
+        """Whether all domains are allowed (wildcard)."""
+        return "*" in self.allowed_domains
+
+    model_config = {"frozen": True}
+
+
 class VMConfig(BaseModel):
     """Configuration for creating a microVM.
 
@@ -135,6 +220,7 @@ class VMConfig(BaseModel):
     env_vars: dict[str, str] = {}
     network_rate_limit_mbps: Annotated[int, Field(ge=1)] | None = None
     port_forwards: list[PortForwardConfig] = []
+    internet_settings: InternetSettings | None = None
 
     @field_validator("vm_id", mode="before")
     @classmethod
