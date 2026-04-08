@@ -947,6 +947,60 @@ class SmolVM:
         command.append(f"{self._ssh.user}@{self._ssh.host}")
         return command
 
+    def _ssh_direct_command(self) -> list[str]:
+        """Build an SSH command from VM metadata without probing.
+
+        Uses the VM's known network info and key path to construct the
+        command directly, skipping the ``wait_for_ssh`` polling machinery.
+        Suitable for interactive CLI use where OpenSSH handles retries.
+        """
+        self._refresh_info()
+
+        if self._info.network is None:
+            raise SmolVMError(
+                "Cannot build SSH command: VM has no network configuration",
+                {"vm_id": self._vm_id},
+            )
+
+        # Reuse shared endpoint selection (prefers localhost forward, falls
+        # back to guest IP).
+        host, port = self._ssh_endpoints()[0]
+
+        # Resolve key: explicit > default SmolVM key.
+        key_path = self._ssh_key_path
+        explicit_key = key_path is not None
+        if key_path is None:
+            from smolvm.utils import ensure_ssh_key
+
+            try:
+                default_key, _ = ensure_ssh_key()
+                key_path = str(default_key)
+            except Exception:
+                logger.debug(
+                    "VM %s: could not resolve default SSH key, "
+                    "falling back to agent/default auth",
+                    self._vm_id,
+                )
+
+        command = [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-p",
+            str(port),
+        ]
+        if key_path:
+            command.extend(["-i", key_path])
+            # Only lock to this key when the user explicitly provided it;
+            # for the auto-resolved SmolVM key, allow agent/default auth
+            # as a fallback.
+            if explicit_key:
+                command.extend(["-o", "IdentitiesOnly=yes"])
+        command.append(f"{self._ssh_user}@{host}")
+        return command
+
     def expose_local(self, guest_port: int, host_port: int | None = None) -> int:
         """Expose a guest TCP port on localhost only.
 
