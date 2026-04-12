@@ -1,0 +1,137 @@
+name: Publish smolvm-core
+
+on:
+  push:
+    tags:
+      - "core-v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag and package versions
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          core_tag_prefix = "core-v"
+          if not tag.startswith(core_tag_prefix):
+              raise SystemExit(f"Unexpected tag format: {tag!r}")
+
+          version = tag.removeprefix(core_tag_prefix)
+
+          cargo_text = Path("smolvm-core/Cargo.toml").read_text()
+          cargo_match = re.search(r'^version = "([^"]+)"$', cargo_text, re.MULTILINE)
+          if cargo_match is None:
+              raise SystemExit("Could not find version in smolvm-core/Cargo.toml")
+
+          cargo_version = cargo_match.group(1)
+          if cargo_version != version:
+              raise SystemExit(
+                  f"Tag {tag!r} does not match smolvm-core/Cargo.toml version {cargo_version!r}."
+              )
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+          smolvm_version = pyproject["project"]["version"]
+          expected_dep = f"smolvm-core=={version}"
+          if smolvm_version != version:
+              raise SystemExit(
+                  f"pyproject.toml version {smolvm_version!r} does not match core release {version!r}."
+              )
+          if expected_dep not in pyproject["project"]["dependencies"]:
+              raise SystemExit(
+                  f"pyproject.toml must pin {expected_dep!r} before publishing smolvm-core."
+              )
+
+          print(f"Release preflight OK for smolvm-core {version}.")
+          PY
+
+  build-linux:
+    needs: verify-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: smolvm-core
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: smolvm-core/dist
+
+  build-macos:
+    needs: verify-release
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: smolvm-core
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: smolvm-core/dist
+
+  build-sdist:
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: smolvm-core
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: smolvm-core/dist
+
+  publish:
+    needs: [build-linux, build-macos, build-sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          skip-existing: true
