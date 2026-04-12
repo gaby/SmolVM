@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from uuid import uuid4
 
-from smolvm.backends import BACKEND_FIRECRACKER, BACKEND_QEMU, resolve_backend
+from smolvm.backends import BACKEND_FIRECRACKER, BACKEND_LIBKRUN, BACKEND_QEMU, resolve_backend
 from smolvm.exceptions import (
     SmolVMError,
     SnapshotAlreadyExistsError,
@@ -47,6 +47,7 @@ from smolvm.host import HostCapability, HostManager
 from smolvm.network import NetworkManager, check_network_prerequisites, resolve_domains_to_ips
 from smolvm.runtime import RuntimeContext, SnapshotCreateRequest, SnapshotRestoreRequest
 from smolvm.runtime_firecracker import FirecrackerRuntimeAdapter
+from smolvm.runtime_libkrun import LibkrunRuntimeAdapter
 from smolvm.runtime_qemu import QEMU_ROOT_NODE_NAME, QemuRuntimeAdapter
 from smolvm.storage import StateManagerProtocol, create_state_manager, ip_to_pool_index
 from smolvm.types import NetworkConfig, SnapshotInfo, VMConfig, VMInfo, VMState
@@ -194,6 +195,7 @@ class SmolVMManager:
 
         # Track open log file handles per VM for proper cleanup
         self._log_files: dict[str, TextIO] = {}
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
         logger.info(
@@ -258,6 +260,10 @@ class SmolVMManager:
             with suppress(Exception):
                 fh.close()
         self._log_files.clear()
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        self._background_tasks.clear()
         self._closed = True
         logger.debug("SmolVM resources released")
 
@@ -289,34 +295,38 @@ class SmolVMManager:
             resolve_boot_args=self._resolve_boot_args,
             start_firecracker=self._start_firecracker,
             start_qemu=self._start_qemu,
+            start_libkrun=self._start_libkrun,
             unlink_socket=self._unlink_socket,
             kill_process=self._kill_process,
             wait_for_process=self._wait_for_process,
             is_process_running=self._is_process_running,
             find_qemu_binary=self._find_qemu_binary,
+            async_start_libkrun=self._async_start_libkrun,
         )
 
     def _runtime_adapter_for_backend(
         self, backend: str
-    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter:
+    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter | LibkrunRuntimeAdapter:
         """Construct a runtime adapter for the requested backend."""
         context = self._runtime_context()
         if backend == BACKEND_FIRECRACKER:
             return FirecrackerRuntimeAdapter(context)
         if backend == BACKEND_QEMU:
             return QemuRuntimeAdapter(context)
+        if backend == BACKEND_LIBKRUN:
+            return LibkrunRuntimeAdapter(context)
         raise SmolVMError("Unsupported backend", {"backend": backend})
 
     def _runtime_adapter_for_vm(
         self, vm_info: VMInfo
-    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter:
+    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter | LibkrunRuntimeAdapter:
         """Resolve the runtime adapter for a persisted VM."""
         return self._runtime_adapter_for_backend(self._backend_for_vm(vm_info))
 
     def _runtime_adapter_for_snapshot(
         self,
         snapshot: SnapshotInfo,
-    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter:
+    ) -> FirecrackerRuntimeAdapter | QemuRuntimeAdapter | LibkrunRuntimeAdapter:
         """Resolve the runtime adapter for a persisted snapshot."""
         return self._runtime_adapter_for_backend(snapshot.backend)
 
@@ -663,6 +673,18 @@ class SmolVMManager:
 
         return errors
 
+    def _check_libkrun_prerequisites(self) -> list[str]:
+        """Check host prerequisites for the libkrun backend."""
+        errors: list[str] = []
+
+        if self._find_krunvm_binary() is None:
+            errors.append("'krunvm' command not found (install libkrun/krunvm)")
+
+        if which("ssh") is None:
+            errors.append("'ssh' command not found (install openssh-client)")
+
+        return errors
+
     def check_prerequisites(self) -> list[str]:
         """Check if all prerequisites are met.
 
@@ -675,6 +697,8 @@ class SmolVMManager:
         """
         if self.backend == BACKEND_QEMU:
             return self._check_qemu_prerequisites()
+        if self.backend == BACKEND_LIBKRUN:
+            return self._check_libkrun_prerequisites()
 
         errors = []
 
@@ -736,14 +760,15 @@ class SmolVMManager:
         try:
             ssh_host_port = self.state.reserve_ssh_port(effective_config.vm_id)
 
-            if backend == BACKEND_QEMU:
+            if backend in {BACKEND_QEMU, BACKEND_LIBKRUN}:
                 if (
                     effective_config.internet_settings is not None
                     and not effective_config.internet_settings.is_allow_all_domains
                 ):
                     logger.warning(
                         "internet_settings domain allowlist is not supported "
-                        "with the QEMU backend (user-mode networking)"
+                        "with the %s backend (user-mode networking)",
+                        backend,
                     )
                 mac_seed = (ssh_host_port % 65534) + 1
                 guest_mac = self.network.generate_mac(mac_seed)
@@ -1609,6 +1634,59 @@ class SmolVMManager:
         logger.debug("Started Firecracker: PID=%d, socket=%s", process.pid, socket_path)
         return process
 
+    def _find_krunvm_binary(self) -> Path | None:
+        """Find an available ``krunvm`` binary."""
+        return which("krunvm")
+
+    def _start_libkrun(
+        self,
+        vm_info: VMInfo,
+        log_path: Path,
+    ) -> subprocess.Popen[bytes]:
+        """Start a libkrun VM through the ``krunvm`` CLI."""
+        krunvm_path = self._find_krunvm_binary()
+        if krunvm_path is None:
+            raise SmolVMError("libkrun backend requires krunvm to be installed and on PATH")
+
+        cmd = [
+            str(krunvm_path),
+            "run",
+            "--cpus",
+            str(vm_info.config.vcpu_count),
+            "--memory",
+            str(vm_info.config.mem_size_mib),
+            "--kernel",
+            str(vm_info.config.kernel_path),
+            "--rootfs",
+            str(vm_info.config.rootfs_path),
+            "--kernel-params",
+            self._resolve_boot_args(vm_info),
+        ]
+        if vm_info.config.initrd_path is not None:
+            cmd.extend(["--initrd", str(vm_info.config.initrd_path)])
+        if vm_info.config.vsock is not None:
+            cmd.extend(["--vsock-cid", str(vm_info.config.vsock.guest_cid)])
+
+        logger.debug("Starting libkrun: %s", " ".join(shlex.quote(part) for part in cmd))
+        log_file = open(log_path, "w")  # noqa: SIM115 - must stay open for subprocess
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            log_file.close()
+            raise
+
+        key = f"libkrun:{vm_info.vm_id}"
+        self._log_files[key] = log_file
+        logger.debug("Started libkrun: PID=%d, vm_id=%s", process.pid, vm_info.vm_id)
+        return process
+
     def _unlink_socket(self, socket_path: Path) -> None:
         """Best-effort socket cleanup with sudo fallback for stale root-owned sockets."""
         try:
@@ -1697,6 +1775,8 @@ class SmolVMManager:
             keys.append(str(socket_path))
         elif backend == BACKEND_QEMU:
             keys.append(f"qemu:{vm_id}")
+        elif backend == BACKEND_LIBKRUN:
+            keys.append(f"libkrun:{vm_id}")
 
         for key in keys:
             fh = self._log_files.pop(key, None)
@@ -1710,8 +1790,8 @@ class SmolVMManager:
         parts = args.split()
 
         backend = self._backend_for_vm(vm_info)
-        if backend == BACKEND_QEMU:
-            # Firecracker defaults include pci=off, which breaks QEMU PCI devices.
+        if backend in {BACKEND_QEMU, BACKEND_LIBKRUN}:
+            # Firecracker defaults include pci=off, which breaks PCI-based desktop backends.
             parts = [part for part in parts if part != "pci=off"]
             if not any(part.startswith("root=") for part in parts):
                 parts.extend(["root=/dev/vda", "rw"])
@@ -1794,6 +1874,7 @@ class SmolVMManager:
 
             self._close_runtime_log(vm_id, BACKEND_FIRECRACKER)
             self._close_runtime_log(vm_id, BACKEND_QEMU)
+            self._close_runtime_log(vm_id, BACKEND_LIBKRUN)
 
             managed_disk = self._managed_disk_for_vm(vm_info)
             if managed_disk and managed_disk.exists():
@@ -1842,14 +1923,15 @@ class SmolVMManager:
         try:
             ssh_host_port = self.state.reserve_ssh_port(effective_config.vm_id)
 
-            if backend == BACKEND_QEMU:
+            if backend in {BACKEND_QEMU, BACKEND_LIBKRUN}:
                 if (
                     effective_config.internet_settings is not None
                     and not effective_config.internet_settings.is_allow_all_domains
                 ):
                     logger.warning(
                         "internet_settings domain allowlist is not supported "
-                        "with the QEMU backend (user-mode networking)"
+                        "with the %s backend (user-mode networking)",
+                        backend,
                     )
                 mac_seed = (ssh_host_port % 65534) + 1
                 guest_mac = self.network.generate_mac(mac_seed)
@@ -2123,6 +2205,70 @@ class SmolVMManager:
                 return
             await asyncio.sleep(0.1)
 
+    async def _async_start_libkrun(
+        self,
+        vm_info: VMInfo,
+        log_path: Path,
+    ) -> asyncio.subprocess.Process:
+        """Async version of :meth:`_start_libkrun`."""
+        import asyncio
+
+        krunvm_path = self._find_krunvm_binary()
+        if krunvm_path is None:
+            raise SmolVMError("libkrun backend requires krunvm to be installed and on PATH")
+
+        cmd = [
+            str(krunvm_path),
+            "run",
+            "--cpus",
+            str(vm_info.config.vcpu_count),
+            "--memory",
+            str(vm_info.config.mem_size_mib),
+            "--kernel",
+            str(vm_info.config.kernel_path),
+            "--rootfs",
+            str(vm_info.config.rootfs_path),
+            "--kernel-params",
+            self._resolve_boot_args(vm_info),
+        ]
+        if vm_info.config.initrd_path is not None:
+            cmd.extend(["--initrd", str(vm_info.config.initrd_path)])
+        if vm_info.config.vsock is not None:
+            cmd.extend(["--vsock-cid", str(vm_info.config.vsock.guest_cid)])
+
+        logger.debug("Async starting libkrun: %s", " ".join(shlex.quote(part) for part in cmd))
+        log_file = open(log_path, "w")  # noqa: SIM115 - must stay open while process runs
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            log_file.close()
+            raise
+
+        key = f"libkrun:{vm_info.vm_id}"
+        self._log_files[key] = log_file
+        logger.debug("Async started libkrun: PID=%d, vm_id=%s", process.pid, vm_info.vm_id)
+
+        async def _close_log_when_done() -> None:
+            try:
+                await process.wait()
+            finally:
+                try:
+                    log_file.close()
+                finally:
+                    self._log_files.pop(key, None)
+
+        task = asyncio.create_task(_close_log_when_done())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return process
+
     async def _async_start_qemu(
         self,
         vm_info: VMInfo,
@@ -2285,7 +2431,9 @@ class SmolVMManager:
                 finally:
                     self._log_files.pop(key, None)
 
-        asyncio.create_task(_close_log_when_done())
+        task = asyncio.create_task(_close_log_when_done())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         return process
 
     async def _async_cleanup_resources(self, vm_id: str) -> None:
@@ -2342,6 +2490,7 @@ class SmolVMManager:
 
             self._close_runtime_log(vm_id, BACKEND_FIRECRACKER)
             self._close_runtime_log(vm_id, BACKEND_QEMU)
+            self._close_runtime_log(vm_id, BACKEND_LIBKRUN)
 
             managed_disk = self._managed_disk_for_vm(vm_info)
             if managed_disk and managed_disk.exists():

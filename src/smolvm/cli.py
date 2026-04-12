@@ -322,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--backend",
-        choices=["auto", "firecracker", "qemu"],
+        choices=["auto", "firecracker", "qemu", "libkrun"],
         default=None,
         help="Virtualization backend to check (default: auto-detected).",
     )
@@ -428,13 +428,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON output.",
     )
 
-    from smolvm.backends import BACKEND_QEMU, resolve_backend
-    from smolvm.facade import _default_guest_os_for_backend
-
-    current_default_backend = resolve_backend(None)
-    current_default_guest_os = _default_guest_os_for_backend(current_default_backend)
-    qemu_default_guest_os = _default_guest_os_for_backend(BACKEND_QEMU)
-
     create_parser = subparsers.add_parser(
         "create",
         help="Create a sandbox and leave it running.",
@@ -474,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create_parser.add_argument(
         "--backend",
-        choices=["auto", "firecracker", "qemu"],
+        choices=["auto", "firecracker", "qemu", "libkrun"],
         default=None,
         help="Virtualization backend (default: auto-detected).",
     )
@@ -623,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     browser_start.add_argument(
         "--backend",
-        choices=["auto", "firecracker", "qemu"],
+        choices=["auto", "firecracker", "qemu", "libkrun"],
         default="auto",
         help="Virtualization backend (default: auto-detected).",
     )

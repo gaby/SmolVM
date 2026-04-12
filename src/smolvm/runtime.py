@@ -84,6 +84,7 @@ class RuntimeContext:
     wait_for_process: Callable[[int, float], None]
     is_process_running: Callable[[int], bool]
     find_qemu_binary: Callable[[], Path | None]
+    start_libkrun: Callable[[VMInfo, Path], subprocess.Popen[bytes]] | None = None
 
     # -- Async callable counterparts (populated when async operations are used) --
     async_start_firecracker: (
@@ -91,6 +92,9 @@ class RuntimeContext:
     ) = field(default=None)
     async_start_qemu: (
         Callable[..., Awaitable[asyncio.subprocess.Process]] | None
+    ) = field(default=None)
+    async_start_libkrun: (
+        Callable[[VMInfo, Path], Awaitable[asyncio.subprocess.Process]] | None
     ) = field(default=None)
     async_unlink_socket: Callable[[Path], Awaitable[None]] | None = field(default=None)
     async_kill_process: Callable[[int], Awaitable[None]] | None = field(default=None)
