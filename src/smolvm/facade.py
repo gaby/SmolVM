@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import shlex
 import socket
 import subprocess
 import time
@@ -59,6 +60,7 @@ from smolvm.types import (
     VMConfig,
     VMInfo,
     VMState,
+    WorkspaceMount,
 )
 from smolvm.vm import SmolVMManager
 
@@ -162,6 +164,24 @@ def _resolve_auto_config_public_key(ssh_key_path: str | None) -> tuple[str, Path
             f"{public_key}"
         )
     return ssh_key_path, public_key
+
+
+def _parse_mount_specs(specs: list[str]) -> list[WorkspaceMount]:
+    """Parse ``HOST_PATH[:GUEST_PATH]`` strings into WorkspaceMount objects.
+
+    If no guest path is given, the mount defaults to ``/workspace``
+    (for a single mount) or ``/workspace-N`` (for multiples).
+    """
+    mounts: list[WorkspaceMount] = []
+    for index, spec in enumerate(specs):
+        # Split on the *last* colon to allow Windows-style paths in the future
+        if ":" in spec:
+            host_str, guest_path = spec.rsplit(":", 1)
+        else:
+            host_str = spec
+            guest_path = "/workspace" if len(specs) == 1 else f"/workspace-{index}"
+        mounts.append(WorkspaceMount(host_path=Path(host_str), guest_path=guest_path))
+    return mounts
 
 
 def _build_auto_config_image_name(
@@ -468,6 +488,7 @@ class SmolVM:
         ssh_user: str = "root",
         ssh_key_path: str | None = None,
         internet_settings: InternetSettings | dict[str, Any] | None = None,
+        mounts: list[str] | None = None,
     ) -> None:
         if config is not None and vm_id is not None:
             raise ValueError("Provide either config or vm_id, not both.")
@@ -526,6 +547,21 @@ class SmolVM:
                 )
             if config is not None:
                 config = config.model_copy(update={"internet_settings": internet_settings})
+
+        # Normalize and merge mounts into the config
+        if mounts is not None:
+            if vm_id is not None:
+                raise ValueError(
+                    "mounts cannot be set when reconnecting to an existing VM."
+                )
+            workspace_mounts = _parse_mount_specs(mounts)
+            if config is not None:
+                if config.workspace_mounts:
+                    raise ValueError(
+                        "workspace_mounts is already set on the provided VMConfig; "
+                        "pass it in one place only."
+                    )
+                config = config.model_copy(update={"workspace_mounts": workspace_mounts})
 
         self._ssh_user = ssh_user
         self._ssh_key_path = ssh_key_path
@@ -718,6 +754,24 @@ class SmolVM:
                 len(injected),
                 ", ".join(injected),
             )
+
+        # Mount workspace directories after boot if configured.
+        if self._info.config.workspace_mounts:
+            if not self.can_run_commands():
+                raise SmolVMError(
+                    "Cannot mount workspaces: VM image does not support SSH.",
+                    {"vm_id": self._vm_id},
+                )
+            if not self._ssh_ready:
+                self.wait_for_ssh(timeout=boot_timeout)
+            if self._ssh is None:
+                self._ssh = SSHClient(
+                    host=self._info.network.guest_ip,
+                    user=self._ssh_user,
+                    key_path=self._ssh_key_path,
+                )
+                self._ssh_ready = True
+            self._mount_workspaces()
 
         return self
 
@@ -1267,6 +1321,24 @@ class SmolVM:
                 self._ssh_ready = True
             await asyncio.to_thread(inject_env_vars, self._ssh, env_vars)
 
+        # Mount workspace directories after boot if configured.
+        if self._info.config.workspace_mounts:
+            if not self.can_run_commands():
+                raise SmolVMError(
+                    "Cannot mount workspaces: VM image does not support SSH.",
+                    {"vm_id": self._vm_id},
+                )
+            if not self._ssh_ready:
+                await self.async_wait_for_ssh(timeout=boot_timeout)
+            if self._ssh is None:
+                self._ssh = SSHClient(
+                    host=self._info.network.guest_ip,
+                    user=self._ssh_user,
+                    key_path=self._ssh_key_path,
+                )
+                self._ssh_ready = True
+            await asyncio.to_thread(self._mount_workspaces)
+
         return self
 
     async def async_stop(self, timeout: float = 3.0) -> SmolVM:
@@ -1484,6 +1556,66 @@ class SmolVM:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _mount_workspaces(self) -> None:
+        """Mount 9p workspace shares with overlayfs inside the guest."""
+        assert self._ssh is not None  # noqa: S101 — caller guarantees SSH ready
+
+        workspace_mounts = self._info.config.workspace_mounts
+        if not workspace_mounts:
+            return
+
+        if self._ssh_user != "root":
+            raise SmolVMError(
+                "Workspace mounts require ssh_user='root' because the guest "
+                "must run modprobe and mount.",
+                {"vm_id": self._vm_id, "ssh_user": self._ssh_user},
+            )
+
+        for index, ws in enumerate(workspace_mounts):
+            tag = ws.resolved_tag(index)
+            guest_path = shlex.quote(ws.guest_path)
+            lower = shlex.quote(f"/mnt/.smolvm-ws-{tag}")
+            upper = shlex.quote(f"/tmp/.smolvm-ws-{tag}-upper")
+            work = shlex.quote(f"/tmp/.smolvm-ws-{tag}-work")
+            qtag = shlex.quote(tag)
+
+            mount_script = (
+                f"modprobe 9p 2>/dev/null; "
+                f"modprobe 9pnet_virtio 2>/dev/null; "
+                f"modprobe overlay 2>/dev/null; "
+                f"mkdir -p {lower} {upper} {work} {guest_path} && "
+                f"mount -t 9p -o trans=virtio,version=9p2000.L,ro "
+                f"{qtag} {lower} && "
+                f"mount -t overlay overlay "
+                f"-o lowerdir={lower},upperdir={upper},workdir={work} "
+                f"{guest_path}"
+            )
+            result = self._ssh.run(mount_script, timeout=15)
+            if result.exit_code != 0:
+                stderr = result.stderr.strip()
+                if "unknown filesystem type" in stderr or "No such device" in stderr:
+                    raise SmolVMError(
+                        "Guest kernel does not support 9p or overlay filesystem. "
+                        "The guest image needs CONFIG_NET_9P, CONFIG_NET_9P_VIRTIO, "
+                        "CONFIG_9P_FS, and CONFIG_OVERLAY_FS kernel options.",
+                        {"vm_id": self._vm_id, "mount_tag": tag, "stderr": stderr},
+                    )
+                raise SmolVMError(
+                    f"Failed to mount workspace '{tag}' at {ws.guest_path}",
+                    {
+                        "vm_id": self._vm_id,
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout.strip(),
+                        "stderr": stderr,
+                    },
+                )
+            logger.info(
+                "VM %s: mounted workspace '%s' at %s (overlay)",
+                self._vm_id,
+                tag,
+                ws.guest_path,
+            )
 
     def _reset_runtime_state(self, *, close_ssh: bool = True) -> None:
         """Clear cached runtime connection state after lifecycle changes."""
