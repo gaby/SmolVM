@@ -390,6 +390,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=_linux_only_help("Remove previously configured runtime permissions (Linux only)."),
     )
+    setup.add_argument(
+        "--for-bake",
+        action=_LinuxOnlyOption,
+        nargs=0,
+        const=True,
+        default=False,
+        help=_linux_only_help(
+            "Bake-friendly install: skip KVM and runtime self-tests so this can run "
+            "on a builder without /dev/kvm. Run 'smolvm doctor' on the runtime host."
+        ),
+    )
+    setup.add_argument(
+        "--skip-kvm-check",
+        action=_LinuxOnlyOption,
+        nargs=0,
+        const=True,
+        default=False,
+        help=_linux_only_help("Do not require /dev/kvm at install time (Linux only)."),
+    )
+    setup.add_argument(
+        "--skip-runtime-check",
+        action=_LinuxOnlyOption,
+        nargs=0,
+        const=True,
+        default=False,
+        help=_linux_only_help("Skip the post-install sudoers self-test (Linux only)."),
+    )
+    setup.add_argument(
+        "--firecracker-version",
+        action=_LinuxOnlyOption,
+        default=None,
+        metavar="VER",
+        help=_linux_only_help(
+            "Pin Firecracker release tag (e.g. v1.14.1). Falls back to "
+            "$SMOLVM_FIRECRACKER_VERSION or the built-in default (Linux only)."
+        ),
+    )
+    setup.add_argument(
+        "--assets-dir",
+        action="store_true",
+        help="Print the packaged setup-assets directory and exit.",
+    )
 
     def _add_ui_args(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument(
@@ -912,7 +954,11 @@ def _render_list(rows: list[VmRow]) -> None:
 
 def _run_setup(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Handle ``smolvm setup``."""
-    from smolvm.host.setup import SetupOptions, run_setup
+    from smolvm.host.setup import SetupOptions, packaged_asset_root, run_setup
+
+    if args.assets_dir:
+        print(packaged_asset_root())
+        return 0
 
     invalid_remove_runtime_flags: list[str] = []
     if args.check_only:
@@ -937,7 +983,17 @@ def _run_setup(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         skip_deps=args.skip_deps,
         runtime_user=args.runtime_user,
         remove_runtime_config=args.remove_runtime_config,
+        for_bake=args.for_bake,
+        skip_kvm_check=args.skip_kvm_check,
+        skip_runtime_check=args.skip_runtime_check,
+        firecracker_version=args.firecracker_version,
     )
+
+    if options.for_bake:
+        console_stdout().print(
+            "[yellow]ℹ️  --for-bake skips KVM and runtime self-tests. "
+            "Run 'smolvm doctor' on the runtime host before booting VMs.[/yellow]"
+        )
 
     try:
         return run_setup(options)
@@ -2004,9 +2060,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Best-effort PyPI update nag. Skipped in --json mode so we never
-    # pollute machine-readable output.
-    maybe_print_update_notice(json_output=bool(getattr(args, "json", False)))
+    # Best-effort PyPI update nag. Skipped in --json mode and for
+    # `setup --assets-dir` so we never pollute machine-readable output
+    # that scripts (Packer, Make, etc.) consume directly.
+    suppress_update_notice = bool(getattr(args, "json", False)) or (
+        args.command == "setup" and bool(getattr(args, "assets_dir", False))
+    )
+    maybe_print_update_notice(json_output=suppress_update_notice)
 
     if args.command == "delete":
         return run_delete(

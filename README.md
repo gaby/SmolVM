@@ -65,6 +65,8 @@ Linux may prompt for `sudo` during setup so it can install host dependencies and
 
 </details>
 
+For golden-AMI builds, two-stage deploys, pinning the Firecracker version, and other non-default install paths, see [docs/installation.md](docs/installation.md).
+
 ### Start a sandbox in Python
 
 ```python
