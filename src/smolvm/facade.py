@@ -714,6 +714,19 @@ class SmolVM:
                 "config and vm_id are omitted (auto-config mode)."
             )
 
+        # Workspace mounts currently require the QEMU backend (virtio-9p).
+        # When no backend was pinned and mounts were requested — either via
+        # the `mounts=` kwarg or via `config.workspace_mounts` on a pre-built
+        # VMConfig — default to QEMU. Callers who explicitly set `backend`
+        # (on the kwarg or the config) still get the SmolVMManager error if
+        # their choice can't host mounts.
+        wants_mounts = bool(mounts) or (
+            config is not None and bool(config.workspace_mounts)
+        )
+        if backend is None and wants_mounts and vm_id is None:
+            if config is None or config.backend is None:
+                backend = BACKEND_QEMU
+
         if image is not None:
             # S3 image mode
             logger.info("Resolving image from %s...", image)

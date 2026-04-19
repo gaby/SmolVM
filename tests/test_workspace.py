@@ -20,7 +20,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from smolvm.types import VMConfig, WorkspaceMount
+from smolvm.facade import SmolVM
+from smolvm.types import VMConfig, VMState, WorkspaceMount
 from smolvm.vm import SmolVMManager
 
 # ── WorkspaceMount validation ───────────────────────────────────────
@@ -229,6 +230,79 @@ def test_workspace_rejected_on_non_qemu_backend(
 
     with pytest.raises(SmolVMError, match="only supported with the QEMU"):
         sdk.create(config)
+
+
+# ── Mount auto-selects QEMU backend ─────────────────────────────────
+
+
+@patch("smolvm.facade.SmolVMManager")
+@patch("smolvm.facade._build_auto_config")
+def test_mounts_without_backend_auto_selects_qemu(
+    mock_build_auto_config: MagicMock,
+    mock_sdk_cls: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """`SmolVM(mounts=...)` without an explicit backend should pick QEMU so
+    `--mount` works out of the box instead of erroring out on a non-QEMU
+    default (Firecracker on Linux)."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+    ws_dir = tmp_path / "project"
+    ws_dir.mkdir()
+
+    mock_build_auto_config.return_value = (
+        VMConfig(
+            vm_id="vm-auto",
+            kernel_path=kernel,
+            rootfs_path=rootfs,
+            backend="qemu",
+        ),
+        None,
+    )
+
+    mock_sdk = MagicMock()
+    mock_sdk.create.return_value = MagicMock(vm_id="vm-auto", status=VMState.CREATED)
+    mock_sdk_cls.return_value = mock_sdk
+
+    SmolVM(mounts=[str(ws_dir)])
+
+    assert mock_build_auto_config.call_args.kwargs["backend"] == "qemu"
+    # SmolVMManager must be initialized with the upgraded backend, not the
+    # platform default.
+    assert mock_sdk_cls.call_args.kwargs["backend"] == "qemu"
+
+
+@patch("smolvm.facade.SmolVMManager")
+def test_config_with_workspace_mounts_auto_selects_qemu(
+    mock_sdk_cls: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """`SmolVM(config=cfg)` with populated `cfg.workspace_mounts` and no
+    backend pinned on either the config or the kwarg should upgrade the
+    manager backend to QEMU."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+    ws_dir = tmp_path / "project"
+    ws_dir.mkdir()
+
+    config = VMConfig(
+        vm_id="vm-cfg-ws",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        workspace_mounts=[WorkspaceMount(host_path=ws_dir)],
+    )
+
+    mock_sdk = MagicMock()
+    mock_sdk.create.return_value = MagicMock(vm_id="vm-cfg-ws", status=VMState.CREATED)
+    mock_sdk_cls.return_value = mock_sdk
+
+    SmolVM(config)
+
+    assert mock_sdk_cls.call_args.kwargs["backend"] == "qemu"
 
 
 # ── Snapshot guard ──────────────────────────────────────────────────
