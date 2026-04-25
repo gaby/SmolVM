@@ -2285,6 +2285,7 @@ class TestCliStart:
         assert ret == 0
         mock_build_auto_config.assert_called_once_with(
             vm_name="sbx-codex",
+            name_prefix="codex",
             os=GuestOS.UBUNTU,
             backend="qemu",
             memory=2048,
