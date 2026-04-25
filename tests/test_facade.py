@@ -170,7 +170,7 @@ class TestVMInit:
         mock_sdk.create.return_value = MagicMock(vm_id="vm001", status=VMState.CREATED)
         mock_sdk_cls.return_value = mock_sdk
 
-        vm = SmolVM(mem_size_mib=2048, disk_size_mib=4096)
+        vm = SmolVM(memory=2048, disk_size=4096)
 
         assert vm.vm_id.startswith("vm-")
         mock_builder.build_alpine_ssh_key.assert_called_once()
@@ -335,7 +335,7 @@ class TestVMInit:
         mock_prepare_sized: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """--disk-size-mib on debian/qemu should be forwarded to resize helper."""
+        """--disk-size on debian/qemu should be forwarded to resize helper."""
         private_key = tmp_path / "id_ed25519"
         public_key = tmp_path / "id_ed25519.pub"
         private_key.touch()
@@ -363,7 +363,7 @@ class TestVMInit:
         self,
         tmp_path: Path,
     ) -> None:
-        """Debian/qemu should reject --disk-size-mib below the default."""
+        """Debian/qemu should reject --disk-size below the default."""
         with pytest.raises(ValueError, match="disk_size_mib >= 2048"):
             _build_auto_config(os="debian", backend="qemu", disk_size_mib=1024)
 
@@ -371,7 +371,7 @@ class TestVMInit:
         self,
         tmp_path: Path,
     ) -> None:
-        """Ubuntu should reject --disk-size-mib below the default."""
+        """Ubuntu should reject --disk-size below the default."""
         with pytest.raises(ValueError, match="disk_size_mib >= 2048"):
             _build_auto_config(os="ubuntu", backend="qemu", disk_size_mib=512)
 
@@ -433,7 +433,7 @@ class TestVMInit:
     def test_custom_auto_sizing_with_config_raises(self, sample_config: VMConfig) -> None:
         """Custom auto sizing options are only valid in zero-config mode."""
         with pytest.raises(ValueError, match="auto-config mode"):
-            SmolVM(sample_config, mem_size_mib=1024)
+            SmolVM(sample_config, memory=1024)
 
     def test_debian_pinned_urls_carry_build_suffix(self) -> None:
         """Each pinned Debian URL must include the build tag in the filename.
@@ -807,7 +807,7 @@ class TestVMImageParam:
         mock_sdk.create.return_value = MagicMock(vm_id="vm-s3mem", status=VMState.CREATED)
         mock_sdk_cls.return_value = mock_sdk
 
-        SmolVM(image="s3://bucket/img/", backend="qemu", mem_size_mib=1024)
+        SmolVM(image="s3://bucket/img/", backend="qemu", memory=1024)
 
         mock_build_s3.assert_called_once_with(
             image="s3://bucket/img/",

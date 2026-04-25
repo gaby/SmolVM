@@ -366,7 +366,7 @@ class TestCliCreate:
             os=None,
             backend=None,
             mem_size_mib=None,
-            disk_size_mib=None,
+            disk_size_mib=4096,
             ssh_key_path=None,
             on_download=ANY,
         )
@@ -409,9 +409,9 @@ class TestCliCreate:
                 "create",
                 "--name",
                 "project-spacex",
-                "--memory-mib",
+                "--memory",
                 "1024",
-                "--disk-size-mib",
+                "--disk-size",
                 "2048",
                 "--backend",
                 "qemu",
@@ -448,12 +448,16 @@ class TestCliCreate:
 
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.runtime.backends.platform.system", return_value="Darwin")
     def test_create_success_with_short_name_flag(
         self,
+        _: MagicMock,
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """`smolvm create -n ...` should behave the same as `--name`."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="computer")
         mock_build_auto_config.return_value = (config, "/tmp/id_ed25519")
 
@@ -473,7 +477,7 @@ class TestCliCreate:
             os=None,
             backend=None,
             mem_size_mib=None,
-            disk_size_mib=None,
+            disk_size_mib=4096,
             ssh_key_path=None,
             on_download=ANY,
         )
@@ -546,11 +550,45 @@ class TestCliCreate:
             os="debian",
             backend=None,
             mem_size_mib=None,
-            disk_size_mib=None,
+            disk_size_mib=4096,
             ssh_key_path=None,
         )
         payload = json.loads(capsys.readouterr().out)
         assert payload["data"]["vm"]["os"] == "debian"
+
+    @patch("smolvm.facade._build_auto_config")
+    @patch("smolvm.facade.SmolVM")
+    def test_create_alpine_does_not_get_disk_size_default(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The 4096 MiB CLI default only applies to debian/ubuntu, not alpine."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+        mock_build_auto_config.return_value = (MagicMock(vm_id="vm"), "/tmp/id_ed25519")
+        vm = MagicMock()
+        vm.vm_id = "vm"
+        vm.info.config.backend = "firecracker"
+        vm.info.network = MagicMock(spec=NetworkConfig)
+        vm.info.network.guest_ip = "172.16.0.2"
+        vm.info.network.ssh_host_port = 2200
+        mock_vm_cls.return_value = vm
+
+        ret = main(["create", "--os", "alpine", "--json"])
+
+        assert ret == 0
+        mock_build_auto_config.assert_called_once_with(
+            vm_name=None,
+            os="alpine",
+            backend=None,
+            mem_size_mib=None,
+            disk_size_mib=None,
+            ssh_key_path=None,
+        )
+        vm.start.assert_called_once_with(boot_timeout=30.0)
+        vm.wait_for_ssh.assert_called_once_with(timeout=30.0)
+        vm.close.assert_called_once()
 
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
@@ -631,17 +669,34 @@ class TestCliCreateImage:
         assert "not allowed" in capsys.readouterr().err
 
     def test_image_with_name_and_memory(self) -> None:
-        """--image should work alongside --name and --memory-mib."""
+        """--image should work alongside --name, --memory, and --disk-size."""
         parser = build_parser()
         args = parser.parse_args([
             "create",
             "--image", "s3://bucket/img/",
             "--name", "my-vm",
-            "--memory-mib", "1024",
+            "--memory", "1024",
+            "--disk-size", "2048",
         ])
         assert args.image == "s3://bucket/img/"
         assert args.name == "my-vm"
         assert args.memory_mib == 1024
+        assert args.disk_size_mib == 2048
+
+    def test_image_with_disk_size_is_rejected(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--disk-size has no effect on prebuilt S3 images and must be rejected."""
+        ret = main([
+            "create",
+            "--image", "s3://bucket/img/",
+            "--disk-size", "8192",
+        ])
+
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "--disk-size is incompatible with --image" in err
 
 
 class TestCliStop:
