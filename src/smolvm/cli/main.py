@@ -25,6 +25,8 @@ import re
 import subprocess
 import sys
 from collections.abc import Sequence
+from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -88,15 +90,40 @@ class CreateVmPayload(TypedDict):
     name: str
     status: str
     os: str
-    backend: str
-    ip_address: str | None
-    ssh_port: int | None
+    started_at: str
 
 
 class CreateNextPayload(TypedDict):
-    """Suggested follow-up action for ``smolvm create``."""
+    """Suggested follow-up actions for ``smolvm create``."""
 
     ssh_command: str
+    info_command: str
+
+
+class InfoVmPayload(TypedDict):
+    """Machine-readable VM details for ``smolvm info``.
+
+    Memory and disk fields are in MiB (SmolVM's house unit, matching
+    :attr:`VMConfig.memory`).
+    """
+
+    name: str
+    status: str
+    os: str | None
+    backend: str
+    ip_address: str | None
+    ssh_port: int | None
+    pid: int | None
+    vcpus: int
+    memory: int
+    memory_used: int | None
+    disk_size: int | None
+
+
+class InfoPayload(TypedDict):
+    """JSON payload for ``smolvm info``."""
+
+    vm: InfoVmPayload
 
 
 class CreatePayload(TypedDict):
@@ -604,6 +631,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only show sandboxes with this status.",
     )
     list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
+    )
+
+    info_parser = subparsers.add_parser(
+        "info",
+        help="Show full details for a sandbox.",
+    )
+    info_parser.add_argument(
+        "vm_id", metavar="sandbox", help="Name or ID of the sandbox."
+    )
+    info_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON output.",
@@ -1178,6 +1218,209 @@ def _run_list(*, include_all: bool, status_filter: str | None, json_output: bool
             return _emit_cli_error("list", 1, exc, json_output=json_output)
 
 
+_OS_HINT_KEYWORDS = ("ubuntu", "debian", "alpine")
+
+
+def _guess_os_from_paths(vm: VMInfo) -> str | None:
+    """Best-effort guess of the guest OS from cached image paths.
+
+    The per-VM rootfs clone lives under ``data_dir/disks/`` so it carries no
+    OS hint, but ``kernel_path`` (kernel-boot images) and the original rootfs
+    cache directory still embed the OS name. Returns ``None`` when no known
+    OS keyword is found.
+    """
+    candidates: list[str] = []
+    config = vm.config
+    if config.kernel_path is not None:
+        candidates.append(str(config.kernel_path))
+    if config.initrd_path is not None:
+        candidates.append(str(config.initrd_path))
+    candidates.append(str(config.rootfs_path))
+    for path in candidates:
+        lowered = path.lower()
+        for keyword in _OS_HINT_KEYWORDS:
+            if keyword in lowered:
+                return keyword
+    return None
+
+
+def _query_live_vm_info(vm: VMInfo) -> dict[str, object]:
+    """Query a running VM via SSH for OS pretty-name and used memory.
+
+    Connects directly with a short ``connect_timeout`` so half-dead VMs
+    (status=running in state but SSH unreachable) fail fast instead of
+    blocking on the SmolVM facade's 30-second SSH-ready wait.
+
+    Returns an empty dict on any failure so the caller can render fall-through
+    placeholders without surfacing transient SSH errors to the user.
+    """
+    from smolvm.ssh import SSHClient
+
+    network = vm.network
+    if network is None:
+        return {}
+
+    if network.ssh_host_port is not None:
+        host, port = "127.0.0.1", network.ssh_host_port
+    else:
+        host, port = network.guest_ip, 22
+
+    key_path = Path.home() / ".smolvm" / "keys" / "id_ed25519"
+    client = SSHClient(
+        host=host,
+        port=port,
+        key_path=str(key_path) if key_path.exists() else None,
+        connect_timeout=3,
+    )
+
+    cmd = (
+        "(. /etc/os-release 2>/dev/null && printf '%s' \"${PRETTY_NAME:-}\"); "
+        "printf '\\n---\\n'; "
+        "free -m 2>/dev/null | awk 'NR==2 {print $3}'"
+    )
+    try:
+        result = client.run(cmd, timeout=5, shell="raw")
+    except Exception:  # noqa: BLE001 - any SSH failure means "skip live data"
+        return {}
+    finally:
+        # Best-effort cleanup; a failed close on a dead transport is harmless.
+        with suppress(Exception):
+            client.close()
+
+    if result.exit_code != 0:
+        return {}
+    parts = result.stdout.split("---")
+    out: dict[str, object] = {}
+    if parts and parts[0].strip():
+        out["os"] = parts[0].strip()
+    if len(parts) > 1:
+        try:
+            out["memory_used"] = int(parts[1].strip())
+        except ValueError:
+            # `free -m` output unparseable on this guest (busybox variant,
+            # locale, etc.) — omit the field rather than fail the whole probe.
+            pass
+    return out
+
+
+def _disk_size_mib(rootfs_path: Path | None) -> int | None:
+    """Return the rootfs disk size visible to the guest, in MiB.
+
+    For qcow2 images, the host file footprint can be far smaller than the
+    guest-visible disk because of qcow2's sparse/copy-on-write semantics, so
+    we shell out to ``qemu-img`` for the virtual size. Other image formats
+    (raw, ext4) match the host file size, where ``stat`` is sufficient.
+    """
+    if rootfs_path is None:
+        return None
+    if rootfs_path.suffix.lower() == ".qcow2":
+        from smolvm.facade import _qcow2_virtual_size_mib
+
+        try:
+            return _qcow2_virtual_size_mib(rootfs_path)
+        except Exception:  # noqa: BLE001 - qemu-img missing or image unreadable
+            pass
+    try:
+        return rootfs_path.stat().st_size // (1024 * 1024)
+    except OSError:
+        return None
+
+
+def _info_payload(vm: VMInfo, *, live_data: dict[str, object] | None = None) -> InfoPayload:
+    """Build the info command payload from a VMInfo plus optional live data."""
+    network = vm.network
+    config = vm.config
+    live = live_data or {}
+
+    disk_size = _disk_size_mib(config.rootfs_path)
+    os_value = live.get("os") or _guess_os_from_paths(vm)
+    memory_used = live.get("memory_used")
+
+    return {
+        "vm": {
+            "name": vm.vm_id,
+            "status": vm.status.value,
+            "os": str(os_value) if os_value else None,
+            "backend": config.backend or "auto",
+            "ip_address": network.guest_ip if network else None,
+            "ssh_port": network.ssh_host_port if network else None,
+            "pid": vm.pid,
+            "vcpus": config.vcpu_count,
+            "memory": config.memory,
+            "memory_used": memory_used if isinstance(memory_used, int) else None,
+            "disk_size": disk_size,
+        }
+    }
+
+
+def _render_info_result(data: InfoPayload) -> None:
+    """Render the human-facing info result."""
+    console = console_stdout()
+    vm_data = data["vm"]
+
+    if vm_data["memory_used"] is not None:
+        memory_str = f"{vm_data['memory_used']} / {vm_data['memory']} MiB used"
+    else:
+        memory_str = f"{vm_data['memory']} MiB"
+
+    disk_str = (
+        f"{vm_data['disk_size']} MiB"
+        if vm_data["disk_size"] is not None
+        else "-"
+    )
+
+    details = Table(title="VM Details", show_header=False)
+    details.add_column("Field")
+    details.add_column("Value")
+    details.add_row("Name", str(vm_data["name"]))
+    details.add_row(
+        "Status",
+        Text(str(vm_data["status"]), style=status_style(str(vm_data["status"]))),
+    )
+    details.add_row("OS", str(vm_data["os"] or "-"))
+    details.add_row("Backend", str(vm_data["backend"]))
+    details.add_row("IP Address", str(vm_data["ip_address"] or "-"))
+    details.add_row(
+        "SSH Port",
+        str(vm_data["ssh_port"]) if vm_data["ssh_port"] is not None else "-",
+    )
+    details.add_row("CPUs", str(vm_data["vcpus"]))
+    details.add_row("Memory", memory_str)
+    details.add_row("Disk Size", disk_str)
+    details.add_row(
+        "PID",
+        str(vm_data["pid"]) if vm_data["pid"] is not None else "-",
+    )
+    console.print(details)
+
+
+def _run_info(*, vm_id: str, json_output: bool) -> int:
+    """Handle ``smolvm info``."""
+    from smolvm.vm import SmolVMManager
+
+    with SmolVMManager() as sdk:
+        try:
+            vm = sdk.state.get_vm(vm_id)
+            live_data: dict[str, object] | None = None
+            if vm.status == VMState.RUNNING:
+                live_data = _query_live_vm_info(vm)
+            data = _info_payload(vm, live_data=live_data)
+            if json_output:
+                emit_json("info", 0, data=data)
+            else:
+                _render_info_result(data)
+            return 0
+        except Exception as exc:
+            return _emit_cli_error("info", 1, exc, json_output=json_output)
+
+
+def _format_started_at(iso_ts: str) -> str:
+    """Render an ISO timestamp as ``YYYY-MM-DD HH:MM:SS UTC``."""
+    dt = datetime.fromisoformat(iso_ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
 def _render_create_result(data: CreatePayload) -> None:
     """Render the human-facing create result."""
@@ -1202,14 +1445,10 @@ def _render_create_result(data: CreatePayload) -> None:
         Text(str(vm_data["status"]), style=status_style(str(vm_data["status"]))),
     )
     details.add_row("OS", str(vm_data["os"]))
-    details.add_row("Backend", str(vm_data["backend"]))
-    details.add_row("IP Address", str(vm_data["ip_address"] or "-"))
-    details.add_row(
-        "SSH Port",
-        str(vm_data["ssh_port"]) if vm_data["ssh_port"] is not None else "-",
-    )
+    details.add_row("Started", _format_started_at(vm_data["started_at"]))
     console.print(details)
     console.print(f"Next: [bold]{next_step['ssh_command']}[/bold]")
+    console.print(f"      [bold]{next_step['info_command']}[/bold]")
 
 
 def _build_and_boot_with_progress(
@@ -1317,7 +1556,7 @@ def _run_create(args: argparse.Namespace) -> int:
                         image=image_uri,
                         vm_name=args.name,
                         backend=args.backend,
-                        mem_size_mib=args.memory_mib,
+                        memory=args.memory_mib,
                         ssh_key_path=None,
                         on_download=on_download,
                     ),
@@ -1329,7 +1568,7 @@ def _run_create(args: argparse.Namespace) -> int:
                     image=image_uri,
                     vm_name=args.name,
                     backend=args.backend,
-                    mem_size_mib=args.memory_mib,
+                    memory=args.memory_mib,
                     ssh_key_path=None,
                 )
                 vm = SmolVM(config, ssh_key_path=ssh_key_path, mounts=args.mounts)
@@ -1345,7 +1584,7 @@ def _run_create(args: argparse.Namespace) -> int:
                         vm_name=args.name,
                         os=args.os,
                         backend=args.backend,
-                        mem_size_mib=args.memory_mib,
+                        memory=args.memory_mib,
                         disk_size_mib=args.disk_size_mib,
                         ssh_key_path=None,
                         on_download=on_download,
@@ -1358,7 +1597,7 @@ def _run_create(args: argparse.Namespace) -> int:
                     vm_name=args.name,
                     os=args.os,
                     backend=args.backend,
-                    mem_size_mib=args.memory_mib,
+                    memory=args.memory_mib,
                     disk_size_mib=args.disk_size_mib,
                     ssh_key_path=None,
                 )
@@ -1367,7 +1606,6 @@ def _run_create(args: argparse.Namespace) -> int:
                 vm.wait_for_ssh(timeout=args.boot_timeout)
 
         os_label = "s3-image" if use_s3_image else resolved_guest_os.value
-        network = vm.info.network
         data: CreatePayload = {
             "vm": {
                 "name": vm.vm_id,
@@ -1377,12 +1615,11 @@ def _run_create(args: argparse.Namespace) -> int:
                     else VMState.RUNNING.value
                 ),
                 "os": os_label,
-                "backend": vm.info.config.backend or "auto",
-                "ip_address": network.guest_ip if network else None,
-                "ssh_port": network.ssh_host_port if network else None,
+                "started_at": datetime.now(timezone.utc).isoformat(),
             },
             "next": {
                 "ssh_command": f"smolvm ssh {vm.vm_id}",
+                "info_command": f"smolvm info {vm.vm_id}",
             },
         }
 
@@ -1476,7 +1713,7 @@ def _run_start(args: argparse.Namespace) -> int:
                     vm_name=args.name,
                     os=GuestOS.UBUNTU,
                     backend=backend,
-                    mem_size_mib=memory_mib,
+                    memory=memory_mib,
                     disk_size_mib=disk_size_mib,
                     ssh_key_path=None,
                     on_download=on_download,
@@ -1495,7 +1732,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 vm_name=args.name,
                 os=GuestOS.UBUNTU,
                 backend=backend,
-                mem_size_mib=memory_mib,
+                memory=memory_mib,
                 disk_size_mib=disk_size_mib,
                 ssh_key_path=None,
             )
@@ -2321,7 +2558,7 @@ def _run_browser(args: argparse.Namespace) -> int:
                 viewport={"width": args.viewport_width, "height": args.viewport_height},
                 record_video=args.record_video,
                 allow_downloads=not args.no_downloads,
-                mem_size_mib=args.memory_mib,
+                memory=args.memory_mib,
                 disk_size_mib=args.disk_size_mib,
             )
             session = BrowserSession(config)
@@ -2498,6 +2735,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             status_filter=args.status,
             json_output=args.json,
         )
+
+    if args.command == "info":
+        return _run_info(vm_id=args.vm_id, json_output=args.json)
 
     if args.command == "create":
         return _run_create(args)
