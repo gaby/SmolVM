@@ -28,7 +28,7 @@ from smolvm.cli.main import (
     build_parser,
     main,
 )
-from smolvm.types import BrowserSessionState, NetworkConfig, VMState
+from smolvm.types import BrowserSessionState, NetworkConfig, VMState, WorkspaceMount
 
 
 def _make_vm_info(
@@ -37,12 +37,14 @@ def _make_vm_info(
     guest_ip: str = "172.16.0.2",
     ssh_host_port: int | None = 2200,
     pid: int | None = 12345,
+    workspace_mounts: list[WorkspaceMount] | None = None,
 ) -> MagicMock:
     """Build a lightweight VMInfo-like mock for list tests."""
     vm = MagicMock()
     vm.vm_id = vm_id
     vm.status = status
     vm.pid = pid
+    vm.config.workspace_mounts = workspace_mounts or []
     if guest_ip:
         vm.network = MagicMock(spec=NetworkConfig)
         vm.network.guest_ip = guest_ip
@@ -50,6 +52,28 @@ def _make_vm_info(
     else:
         vm.network = None
     return vm
+
+
+def _make_vm_with_stale_mount(
+    tmp_path: Path,
+    *,
+    vm_id: str = "vm-abc123",
+    status: VMState = VMState.RUNNING,
+) -> tuple[MagicMock, Path]:
+    """Build a VMInfo mock whose workspace mount points at a now-deleted folder.
+
+    The mount is a real ``WorkspaceMount`` (not a loose ``MagicMock()``) so
+    if ``WorkspaceMount`` ever renames its public attributes, these tests
+    fail loudly instead of silently spoofing the API.
+
+    Returns ``(vm_info_mock, missing_host_path)``.
+    """
+    ws_dir = tmp_path / f"{vm_id}-deleted-worktree"
+    ws_dir.mkdir()
+    mount = WorkspaceMount(host_path=ws_dir)
+    ws_dir.rmdir()
+    vm = _make_vm_info(vm_id, status, workspace_mounts=[mount])
+    return vm, mount.host_path
 
 
 def _make_snapshot_info(
@@ -1774,6 +1798,7 @@ class TestCliList:
                 "ip_address": "172.16.0.2",
                 "ssh_port": 2200,
                 "pid": 12345,
+                "warnings": [],
             }
         ]
         mock_sdk_cls.return_value.list_vms.assert_called_once_with(status=VMState.RUNNING)
@@ -1841,6 +1866,73 @@ class TestCliList:
         assert ret == 1
         assert "Error: db unavailable" in capsys.readouterr().err
         mock_sdk_cls.return_value.close.assert_called_once()
+
+    def test_list_flags_stale_workspace_mount(
+        self,
+        mock_sdk_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+        tmp_path: Path,
+    ) -> None:
+        """`smolvm list` should keep listing VMs whose host mount is gone,
+        and print a warning naming the missing path."""
+        vm, missing = _make_vm_with_stale_mount(tmp_path)
+        mock_sdk_cls.return_value.list_vms.return_value = [vm]
+
+        ret = main(["list"])
+
+        # Rich may wrap long tmp paths across lines; flatten before asserting.
+        out = capsys.readouterr().out.replace("\n", "")
+        assert ret == 0
+        assert "vm-abc123" in out
+        assert "Warnings:" in out
+        assert str(missing) in out
+        # The warning explains what to do, not just what's wrong.
+        assert "smolvm delete vm-abc123" in out
+
+    def test_list_warning_does_not_claim_running_sandbox_cannot_start(
+        self,
+        mock_sdk_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+        tmp_path: Path,
+    ) -> None:
+        """The warning must not falsely claim a running sandbox can't start.
+
+        The user can SSH into a sandbox that was already running when its
+        host folder got deleted — saying 'cannot start' contradicts what
+        they're seeing. The chosen wording sidesteps the consequence
+        entirely and just states the fact + the recovery.
+        """
+        vm, _ = _make_vm_with_stale_mount(tmp_path, vm_id="sbx-running")
+        mock_sdk_cls.return_value.list_vms.return_value = [vm]
+
+        ret = main(["list", "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        warning = payload["data"]["vms"][0]["warnings"][0]
+        assert "cannot start" not in warning.lower()
+
+    def test_list_json_includes_warnings(
+        self,
+        mock_sdk_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+        tmp_path: Path,
+    ) -> None:
+        """`smolvm list --json` should expose stale mounts via `warnings`."""
+        vm, missing = _make_vm_with_stale_mount(tmp_path)
+        mock_sdk_cls.return_value.list_vms.return_value = [vm]
+
+        ret = main(["list", "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        warnings = payload["data"]["vms"][0]["warnings"]
+        assert len(warnings) == 1
+        # JSON consumers (agents) get the same self-contained message:
+        # what's wrong, the missing path, and how to recover.
+        assert str(missing) in warnings[0]
+        assert "missing" in warnings[0]
+        assert "smolvm delete vm-abc123" in warnings[0]
 
 
 class TestCliInfo:

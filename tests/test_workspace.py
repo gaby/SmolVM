@@ -68,6 +68,22 @@ class TestWorkspaceMountValidation:
         assert ws.resolved_tag(0) == "workspace0"
         assert ws.resolved_tag(3) == "workspace3"
 
+    def test_missing_host_path_loads_under_validate_paths_false(self, tmp_path: Path) -> None:
+        """Persisted configs reload even when the host path was deleted.
+
+        Read-only commands like ``smolvm list`` pass
+        ``context={"validate_paths": False}`` so a stale mount path on disk
+        does not crash the whole command. The validator must respect that.
+        """
+        ws_dir = tmp_path / "gone"
+        ws_dir.mkdir()
+        raw = WorkspaceMount(host_path=ws_dir).model_dump_json()
+        ws_dir.rmdir()
+
+        ws = WorkspaceMount.model_validate_json(raw, context={"validate_paths": False})
+
+        assert ws.host_path == ws_dir.resolve()
+
 
 # ── VMConfig workspace_mounts validation ────────────────────────────
 
@@ -133,6 +149,28 @@ class TestVMConfigWorkspaceMounts:
                 ],
             )
 
+    def test_persisted_config_reloads_with_missing_mount_host(self, tmp_path: Path) -> None:
+        """Storage reads must succeed when a workspace host folder is gone.
+
+        Reproduces the ``smolvm list`` crash where a deleted Conductor
+        worktree caused the whole command to fail. The fix is that
+        ``WorkspaceMount`` honors the ``validate_paths=False`` context the
+        storage layer already passes via ``vm_config_from_json``.
+        """
+        ws_dir = tmp_path / "project"
+        ws_dir.mkdir()
+        config = self._make_config(
+            tmp_path,
+            workspace_mounts=[WorkspaceMount(host_path=ws_dir)],
+        )
+        raw = config.model_dump_json()
+        ws_dir.rmdir()
+
+        reloaded = VMConfig.model_validate_json(raw, context={"validate_paths": False})
+
+        assert len(reloaded.workspace_mounts) == 1
+        assert reloaded.workspace_mounts[0].host_path == ws_dir.resolve()
+
 
 # ── QEMU command builder ────────────────────────────────────────────
 
@@ -194,6 +232,163 @@ def test_start_qemu_includes_9p_workspace_args(
 
     # Find the virtio-9p device (aarch64 → virtio-9p-device)
     assert "virtio-9p-device,fsdev=fsdev-workspace0,mount_tag=workspace0" in cmd
+
+
+@patch("smolvm.vm.subprocess.Popen")
+@patch.object(
+    SmolVMManager,
+    "_find_qemu_binary",
+    return_value=Path("/opt/homebrew/bin/qemu-system-aarch64"),
+)
+def test_start_friendly_error_when_workspace_host_path_missing(
+    _mock_find_qemu_binary: MagicMock,
+    mock_popen: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """`start` should refuse with a plain-English error when a mount's host
+    folder has been deleted since the VM was created — no Pydantic stack."""
+    from smolvm.exceptions import SmolVMError
+
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+
+    ws_dir = tmp_path / "project"
+    ws_dir.mkdir()
+
+    config = VMConfig(
+        vm_id="vm-stale-mount",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        backend="qemu",
+        boot_args="console=ttyAMA0 reboot=k panic=1 init=/init",
+        workspace_mounts=[WorkspaceMount(host_path=ws_dir)],
+    )
+
+    sdk = SmolVMManager(
+        data_dir=tmp_path / "data",
+        socket_dir=tmp_path / "sockets",
+        backend="qemu",
+    )
+    with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
+        mock_convert.side_effect = lambda source, target: target.touch()
+        sdk.create(config)
+
+    ws_dir.rmdir()  # simulate Conductor worktree cleanup
+
+    with pytest.raises(SmolVMError, match="shared folder is missing") as exc_info:
+        sdk.start("vm-stale-mount")
+    # The error names the sandbox and the recovery command, so a first-time
+    # user can act on it without reading the source.
+    message = str(exc_info.value)
+    assert "vm-stale-mount" in message
+    assert "smolvm delete vm-stale-mount" in message
+    mock_popen.assert_not_called()
+
+
+@patch("smolvm.vm.subprocess.Popen")
+@patch.object(
+    SmolVMManager,
+    "_find_qemu_binary",
+    return_value=Path("/opt/homebrew/bin/qemu-system-aarch64"),
+)
+def test_start_friendly_error_when_workspace_host_path_is_a_file(
+    _mock_find_qemu_binary: MagicMock,
+    mock_popen: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The preflight should also fire when the path now points to a file
+    instead of a directory — covers the gap where the path technically
+    exists but the original Pydantic ``is_dir()`` check would have
+    rejected it. Without this we'd fall through to a backend error."""
+    from smolvm.exceptions import SmolVMError
+
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+
+    ws_dir = tmp_path / "project"
+    ws_dir.mkdir()
+
+    config = VMConfig(
+        vm_id="vm-mount-is-file",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        backend="qemu",
+        boot_args="console=ttyAMA0 reboot=k panic=1 init=/init",
+        workspace_mounts=[WorkspaceMount(host_path=ws_dir)],
+    )
+
+    sdk = SmolVMManager(
+        data_dir=tmp_path / "data",
+        socket_dir=tmp_path / "sockets",
+        backend="qemu",
+    )
+    with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
+        mock_convert.side_effect = lambda source, target: target.touch()
+        sdk.create(config)
+
+    # Replace the directory with a file at the same path.
+    ws_dir.rmdir()
+    ws_dir.touch()
+
+    with pytest.raises(SmolVMError, match="shared folder is missing"):
+        sdk.start("vm-mount-is-file")
+    mock_popen.assert_not_called()
+
+
+@patch("smolvm.vm.subprocess.Popen")
+@patch.object(
+    SmolVMManager,
+    "_find_qemu_binary",
+    return_value=Path("/opt/homebrew/bin/qemu-system-aarch64"),
+)
+def test_async_start_runs_the_same_workspace_preflight(
+    _mock_find_qemu_binary: MagicMock,
+    mock_popen: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """``async_start`` is a parallel code path; if it skips the preflight
+    the friendly error becomes a backend failure for async callers. The
+    helper is shared so both surfaces give the same plain-English error.
+    """
+    import asyncio
+
+    from smolvm.exceptions import SmolVMError
+
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+
+    ws_dir = tmp_path / "project"
+    ws_dir.mkdir()
+
+    config = VMConfig(
+        vm_id="vm-async-stale",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        backend="qemu",
+        boot_args="console=ttyAMA0 reboot=k panic=1 init=/init",
+        workspace_mounts=[WorkspaceMount(host_path=ws_dir)],
+    )
+
+    sdk = SmolVMManager(
+        data_dir=tmp_path / "data",
+        socket_dir=tmp_path / "sockets",
+        backend="qemu",
+    )
+    with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
+        mock_convert.side_effect = lambda source, target: target.touch()
+        sdk.create(config)
+
+    ws_dir.rmdir()
+
+    with pytest.raises(SmolVMError, match="shared folder is missing"):
+        asyncio.run(sdk.async_start("vm-async-stale"))
+    mock_popen.assert_not_called()
 
 
 # ── Firecracker rejection ───────────────────────────────────────────
