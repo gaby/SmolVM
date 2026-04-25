@@ -2179,6 +2179,84 @@ class TestCliStart:
         # argparse produces "invalid choice" for unknown subcommand
         assert "invalid choice" in err or "argument command" in err
 
+    def test_launch_snippet_runs_when_env_file_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """The remote command built by `_exec_launch_command` must exec the
+        harness even when /etc/profile.d/smolvm_env.sh does not exist —
+        regression for claude-code with subscription auth where no
+        ANTHROPIC_API_KEY is set on the host, so env injection writes
+        nothing and the file is never created."""
+        import subprocess
+
+        from smolvm.cli.main import _exec_launch_command
+
+        captured: list[list[str]] = []
+
+        class _StubSshVm:
+            def _ssh_attach_command(self) -> list[str]:
+                return ["ssh", "-p", "2200", "root@127.0.0.1"]
+
+        def fake_run(*args: object, **_kwargs: object) -> MagicMock:
+            # Tolerate future kwargs (e.g. text=, env=) on the real
+            # subprocess.run call without rewriting the stub.
+            captured.append(args[0])  # type: ignore[arg-type]
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        with patch("smolvm.cli.main.subprocess.run", side_effect=fake_run):
+            _exec_launch_command(_StubSshVm(), "claude")
+
+        remote = captured[0][-1]
+        # Now actually evaluate the remote snippet under bash with a
+        # path that does not exist — the launch (here a `:` no-op
+        # standing in for `exec claude`) must still execute.
+        missing_env_file = tmp_path / "definitely-not-here.sh"
+        # The snippet calls `exec claude`; for the runtime check we
+        # substitute a benign command we can verify ran.
+        snippet = remote.replace("exec claude", "echo LAUNCHED")
+        snippet = snippet.replace(
+            "/etc/profile.d/smolvm_env.sh", str(missing_env_file)
+        )
+        completed = subprocess.run(
+            ["bash", "-c", snippet], capture_output=True, text=True, check=False
+        )
+        assert completed.returncode == 0
+        assert "LAUNCHED" in completed.stdout
+        assert "No such file" not in completed.stderr
+
+    def test_claude_alias_resolves_to_claude_code(self) -> None:
+        """`smolvm claude start` should be accepted as an alias for
+        `smolvm claude-code start` — first-time users keep typing the
+        short name and the previous behaviour was an unfriendly
+        argparse 'invalid choice' error."""
+        parser = build_parser()
+        args = parser.parse_args(["claude", "start"])
+        # argparse stores whichever spelling the user typed in
+        # ``args.command``, but the canonical preset name (set via
+        # ``set_defaults``) is what the dispatch path looks up.
+        assert args.command == "claude"
+        assert args.preset_name == "claude-code"
+
+    def test_top_level_help_lists_claude_alias(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The alias should appear in the top-level help so the
+        shorthand is discoverable, not a hidden trick."""
+        import re
+
+        with pytest.raises(SystemExit):
+            main(["--help"])
+        out = capsys.readouterr().out
+        # Must check 'claude' as a distinct token, not a substring of
+        # 'claude-code'. argparse renders the choices block as
+        # ``{a,b,claude-code,claude,...}`` so split on whitespace and the
+        # punctuation argparse uses there.
+        tokens = set(re.split(r"[\s{},]+", out))
+        assert "claude" in tokens
+        assert "claude-code" in tokens
+
     @patch("smolvm.cli.main._apply_preset_with_progress")
     @patch("smolvm.facade._build_auto_config")
     @patch("smolvm.facade.SmolVM")
@@ -2343,9 +2421,17 @@ class TestCliStart:
         # `-t` must come before user@host so OpenSSH allocates a TTY.
         assert "-t" in cmd
         assert cmd.index("-t") < cmd.index("root@127.0.0.1")
-        # Remote command must source the smolvm env file then exec codex.
-        assert cmd[-1].endswith("&& exec codex")
-        assert "/etc/profile.d/smolvm_env.sh" in cmd[-1]
+        # Remote command must guard the env-file source and still exec the
+        # harness if the file is missing (preset may inject zero env vars).
+        remote = cmd[-1]
+        assert "/etc/profile.d/smolvm_env.sh" in remote
+        assert remote.endswith("; exec codex"), (
+            "exec must chain with ';' not '&&' so a missing env file does "
+            f"not abort the launch — got {remote!r}"
+        )
+        assert "[ -r " in remote, (
+            "env file source must be guarded with a file-existence check"
+        )
 
     @patch("smolvm.cli.main.subprocess.run")
     @patch("smolvm.cli.main._apply_preset_with_progress")
