@@ -25,6 +25,7 @@ from smolvm.exceptions import SmolVMError
 from smolvm.presets import (
     CLAUDE_CODE_PRESET,
     CODEX_PRESET,
+    GIT_HOST_CONFIGS,
     HostConfigCopy,
     HostKeychainSecret,
     Preset,
@@ -44,6 +45,23 @@ def _ok(stdout: str = "", stderr: str = "") -> CommandResult:
 
 def _fail(stderr: str = "boom") -> CommandResult:
     return CommandResult(exit_code=1, stdout="", stderr=stderr)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin ``$HOME`` to a clean tmp dir for every test in this module.
+
+    ``apply_preset`` always layers ``GIT_HOST_CONFIGS`` (``~/.gitconfig``,
+    ``~/.ssh``, ``~/.config/gh``, …) onto each preset's own copies. If
+    the test runner's real home has any of those files, the unrelated
+    ``copied_configs`` / ``ssh.put_file`` assertions in this file pick
+    them up as extra entries and flake. Tests that need a populated
+    home call ``monkeypatch.setenv('HOME', ...)`` themselves; the later
+    setenv on the same monkeypatch instance overrides this default."""
+    home = tmp_path_factory.mktemp("isolated_home")
+    monkeypatch.setenv("HOME", str(home))
 
 
 class TestRegistry:
@@ -675,3 +693,225 @@ class TestApplyPresetKeychain:
         assert len(keychain_msgs) == 1
         assert "found" in keychain_msgs[0]
         assert "/root/a" in keychain_msgs[0]
+
+
+class TestGitCredentialInjection:
+    """Every preset start auto-copies the host's git/SSH/gh auth files.
+
+    The applier must layer ``GIT_HOST_CONFIGS`` onto whatever the preset
+    declares so a fresh sandbox has working ``git``, ``gh``, and
+    ``ssh git@github.com`` without the agent re-authenticating. Missing
+    files are skipped silently — a host with no ``~/.gitconfig`` should
+    not break ``smolvm codex start``.
+    """
+
+    def test_git_host_configs_constant_shape(self) -> None:
+        """Pin the contract: which host paths land where, and that all
+        entries are optional. Adding/removing a path here is a behavior
+        change that should be intentional."""
+        pairs = {(c.host_path, c.guest_path) for c in GIT_HOST_CONFIGS}
+        assert pairs == {
+            ("~/.gitconfig", "/root/.gitconfig"),
+            ("~/.config/git/config", "/root/.config/git/config"),
+            ("~/.git-credentials", "/root/.git-credentials"),
+            ("~/.ssh", "/root/.ssh"),
+            ("~/.config/gh", "/root/.config/gh"),
+        }
+        assert all(c.required is False for c in GIT_HOST_CONFIGS)
+
+    def _seed_git_home(self, home: Path) -> None:
+        """Create a host home dir with a representative git auth surface."""
+        (home / ".gitconfig").write_text("[user]\n\temail = u@example.com\n")
+        (home / ".git-credentials").write_text("https://x:y@github.com\n")
+        ssh_dir = home / ".ssh"
+        ssh_dir.mkdir()
+        key = ssh_dir / "id_ed25519"
+        key.write_text("PRIVATE")
+        key.chmod(0o600)
+
+    def _stub_codex_preset(self) -> Preset:
+        """Codex preset with the install step neutered.
+
+        The preset's real install_script runs apt-via-NodeSource which
+        doesn't make sense against a MagicMock; replace with a no-op so
+        the test focuses on the copy stage.
+        """
+        from dataclasses import replace
+
+        return replace(CODEX_PRESET, install_script="")
+
+    def _stub_claude_code_preset(self) -> Preset:
+        from dataclasses import replace
+
+        return replace(CLAUDE_CODE_PRESET, install_script="")
+
+    def test_codex_apply_copies_git_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._seed_git_home(tmp_path)
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        summary = apply_preset(ssh, self._stub_codex_preset())
+
+        copied = set(summary["copied_configs"])  # type: ignore[arg-type]
+        assert {
+            "/root/.gitconfig",
+            "/root/.git-credentials",
+            "/root/.ssh",
+        }.issubset(copied)
+
+    def test_claude_code_apply_copies_git_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._seed_git_home(tmp_path)
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        summary = apply_preset(ssh, self._stub_claude_code_preset())
+
+        copied = set(summary["copied_configs"])  # type: ignore[arg-type]
+        assert {
+            "/root/.gitconfig",
+            "/root/.git-credentials",
+            "/root/.ssh",
+        }.issubset(copied)
+
+    def test_git_injection_silent_when_files_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A host with no git config and no SSH dir must still
+        provision cleanly — copied_configs simply omits the missing
+        guest paths."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # No files seeded.
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        summary = apply_preset(ssh, self._stub_codex_preset())
+
+        copied = set(summary["copied_configs"])  # type: ignore[arg-type]
+        git_guest_paths = {c.guest_path for c in GIT_HOST_CONFIGS}
+        assert copied.isdisjoint(git_guest_paths)
+
+    def test_git_ssh_uploaded_via_tar_dir_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``~/.ssh`` must travel through the tar-based dir-copy path so
+        the guest's keys end up at 0o600 and sshd accepts them. Verified
+        indirectly: the recorded ssh.run includes the ``tar -xf ... -C
+        /root/.ssh`` template from ``_copy_dir``."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        key = ssh_dir / "id_ed25519"
+        key.write_text("PRIVATE")
+        key.chmod(0o600)
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        apply_preset(ssh, self._stub_codex_preset())
+
+        commands_run = [call.args[0] for call in ssh.run.call_args_list]
+        assert any(
+            "tar -xf" in cmd and "/root/.ssh" in cmd for cmd in commands_run
+        ), commands_run
+
+    def test_git_ssh_tar_owner_stripped_to_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tar staged for the guest must zero uid/gid on every entry.
+
+        Guests extract as root with default ``--same-owner``; if host
+        uids (e.g. macOS 501:20) survive, ``/root/.ssh/id_ed25519``
+        ends up owned by uid 501 and sshd refuses the key with "Bad
+        owner or permissions". File modes (the 0o600 we care about)
+        must remain intact.
+        """
+        import tarfile
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        key = ssh_dir / "id_ed25519"
+        key.write_text("PRIVATE")
+        key.chmod(0o600)
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+        staged_tars: list[Path] = []
+
+        def capture_put(local: object, _remote: str) -> None:
+            path = Path(str(local))
+            if path.suffix == ".tar":
+                # Copy aside before _copy_dir's finally clause unlinks it.
+                snapshot = tmp_path / f"snapshot-{len(staged_tars)}.tar"
+                snapshot.write_bytes(path.read_bytes())
+                staged_tars.append(snapshot)
+
+        ssh.put_file.side_effect = capture_put
+
+        apply_preset(ssh, self._stub_codex_preset())
+
+        assert staged_tars, "no tar archive was staged"
+        with tarfile.open(staged_tars[0]) as tf:
+            members = tf.getmembers()
+        assert members, "tar archive is empty"
+        assert all(m.uid == 0 and m.gid == 0 for m in members), [
+            (m.name, m.uid, m.gid) for m in members
+        ]
+        assert all(m.uname == "" and m.gname == "" for m in members), [
+            (m.name, m.uname, m.gname) for m in members
+        ]
+        # Mode bits survive — the SSH private key stays at 0o600.
+        key_member = next(m for m in members if m.name.endswith("id_ed25519"))
+        assert key_member.mode & 0o777 == 0o600
+
+    def test_git_credentials_chmodded_to_0600_after_upload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``~/.git-credentials`` is plaintext OAuth tokens. SFTP drops
+        the file at the server's umask (typically 0644). The applier
+        must chmod 0600 after upload so the file does not land
+        world-readable inside the guest."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".git-credentials").write_text(
+            "https://user:token@github.com\n"
+        )
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        apply_preset(ssh, self._stub_codex_preset())
+
+        commands_run = [call.args[0] for call in ssh.run.call_args_list]
+        assert any(
+            "chmod 600" in cmd and "/root/.git-credentials" in cmd
+            for cmd in commands_run
+        ), commands_run
+
+    def test_gitconfig_not_chmodded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``~/.gitconfig`` is conventionally world-readable; only
+        credential files get the 0600 treatment. Guards against
+        accidentally tightening every file_mode."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / ".gitconfig").write_text("[user]\n\temail = u@example.com\n")
+
+        ssh = MagicMock()
+        ssh.run.return_value = _ok()
+
+        apply_preset(ssh, self._stub_codex_preset())
+
+        chmod_targets = [
+            cmd for cmd in (call.args[0] for call in ssh.run.call_args_list)
+            if "chmod" in cmd and "/root/.gitconfig" in cmd
+        ]
+        assert chmod_targets == [], chmod_targets
