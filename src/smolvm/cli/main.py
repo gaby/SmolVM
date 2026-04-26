@@ -37,6 +37,7 @@ from rich.progress import (
     Progress,
     SpinnerColumn,
     TextColumn,
+    TimeElapsedColumn,
     TransferSpeedColumn,
 )
 from rich.table import Table
@@ -1521,6 +1522,7 @@ def _build_and_boot_with_progress(
         BarColumn(),
         DownloadColumn(),
         TransferSpeedColumn(),
+        TimeElapsedColumn(),
         console=_console,
         transient=True,
     ) as progress:
@@ -1534,12 +1536,22 @@ def _build_and_boot_with_progress(
 
         config, ssh_key_path = _build_fn(on_download)
 
-        boot_task = progress.add_task(
-            "Booting computer and waiting for SSH...", total=None
-        )
+        # One task that re-labels as the boot pipeline progresses
+        # (boot → ssh-ready → workspace mount when --mount is set).
+        # Phases come from start()/wait_for_ssh() via on_progress, so the
+        # spinner reflects what's actually slow rather than parking on
+        # "Starting VM..." for the full duration.
+        boot_task = progress.add_task("Booting sandbox...", total=None)
+
+        def on_phase(phase: str) -> None:
+            progress.update(boot_task, description=phase)
+
         vm = SmolVM(config, ssh_key_path=ssh_key_path, mounts=mounts)
-        vm.start(boot_timeout=boot_timeout)
-        vm.wait_for_ssh(timeout=boot_timeout)
+        vm.start(boot_timeout=boot_timeout, on_progress=on_phase)
+        # Idempotent: a no-op when start() already waited (mounts/env_vars
+        # path), and the on_progress flips the label only when a real wait
+        # actually happens.
+        vm.wait_for_ssh(timeout=boot_timeout, on_progress=on_phase)
         progress.remove_task(boot_task)
 
     return vm
@@ -1923,6 +1935,7 @@ def _apply_preset_with_progress(
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
         console=_console,
         transient=True,
     ) as progress:
