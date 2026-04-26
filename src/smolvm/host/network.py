@@ -39,6 +39,34 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST_IP = "172.16.0.1"
 DEFAULT_NETMASK = "16"
 
+# Matches the native EPERM signal precisely (\b prevents "errno 13" matching).
+_EPERM_RE = re.compile(r"\berrno 1\b|Operation not permitted")
+
+
+def _is_eperm(err: str) -> bool:
+    return bool(_EPERM_RE.search(err))
+
+
+# Once the native ioctl path returns EPERM, every later call in this process
+# will too — short-circuit straight to the subprocess path and stop emitting
+# duplicate warnings (and stop triggering noisy IFLA_INET6_CONF parse warnings
+# from the netlink crate, which happen during the native link lookups).
+_native_unprivileged = False
+
+
+def _native_available() -> bool:
+    return HAS_NETLINK and not _native_unprivileged
+
+
+def _mark_native_unprivileged() -> None:
+    global _native_unprivileged
+    if not _native_unprivileged:
+        _native_unprivileged = True
+        logger.warning(
+            "Native networking lacks CAP_NET_ADMIN; using sudo path for the "
+            "rest of this process"
+        )
+
 # SmolVM-managed nftables objects
 _NFT_NAT_FAMILY = "ip"
 _NFT_NAT_TABLE = "smolvm_nat"
@@ -131,7 +159,7 @@ class NetworkManager:
 
         logger.info("Creating TAP device: %s (user: %s)", tap_name, user)
 
-        if HAS_NETLINK:
+        if _native_available():
             import pwd
 
             try:
@@ -156,8 +184,12 @@ class NetworkManager:
                         )
                         time.sleep(delay)
                         continue
+                    if _is_eperm(err):
+                        _mark_native_unprivileged()
+                        break
                     raise SmolVMError(err) from e
-            return
+            else:
+                return
 
         max_busy_retries = 3
         for attempt in range(max_busy_retries + 1):
@@ -237,16 +269,22 @@ class NetworkManager:
 
         logger.info("Configuring TAP %s with IP %s/%s", tap_name, host_ip, netmask)
 
-        if HAS_NETLINK:
+        if _native_available():
             try:
                 native.flush_addrs(tap_name)
                 native.add_addr(tap_name, host_ip, int(netmask))
                 native.set_link_up(tap_name)
+                self._write_sysctl(f"net/ipv4/conf/{tap_name}/route_localnet", "1")
+                return
             except OSError as e:
-                if "RTNETLINK answers: File exists" not in str(e) and "File exists" not in str(e):
-                    raise SmolVMError(str(e)) from e
-            self._write_sysctl(f"net/ipv4/conf/{tap_name}/route_localnet", "1")
-            return
+                err = str(e)
+                if "RTNETLINK answers: File exists" in err or "File exists" in err:
+                    self._write_sysctl(f"net/ipv4/conf/{tap_name}/route_localnet", "1")
+                    return
+                if _is_eperm(err):
+                    _mark_native_unprivileged()
+                else:
+                    raise SmolVMError(err) from e
 
         batch = [
             f"addr flush dev {tap_name}",
@@ -301,13 +339,18 @@ class NetworkManager:
 
         logger.info("Adding route: %s via %s", ip_address, device)
 
-        if HAS_NETLINK:
+        if _native_available():
             try:
                 native.add_route(ip_address, 32, device)
+                return
             except OSError as e:
-                if "File exists" not in str(e):
-                    raise SmolVMError(str(e)) from e
-            return
+                err = str(e)
+                if "File exists" in err:
+                    return
+                if _is_eperm(err):
+                    _mark_native_unprivileged()
+                else:
+                    raise SmolVMError(err) from e
 
         try:
             run_command(["ip", "route", "add", f"{ip_address}/32", "dev", device])
@@ -336,14 +379,19 @@ class NetworkManager:
 
         logger.info("Cleaning up TAP device: %s", tap_name)
 
-        if HAS_NETLINK:
+        if _native_available():
             try:
                 native.delete_tap(tap_name)
+                return
             except OSError as e:
                 err = str(e)
-                if "Cannot find device" not in err and "No such device" not in err:
+                if "Cannot find device" in err or "No such device" in err:
+                    return
+                if _is_eperm(err):
+                    _mark_native_unprivileged()
+                else:
                     logger.warning("Failed to delete TAP %s: %s", tap_name, e)
-            return
+                    return
 
         try:
             run_command(["ip", "link", "delete", tap_name])
