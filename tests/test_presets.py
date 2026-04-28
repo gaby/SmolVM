@@ -26,6 +26,7 @@ from smolvm.presets import (
     CLAUDE_CODE_PRESET,
     CODEX_PRESET,
     GIT_HOST_CONFIGS,
+    PI_PRESET,
     HostConfigCopy,
     HostKeychainSecret,
     Preset,
@@ -67,13 +68,13 @@ def _isolate_home(
 class TestRegistry:
     """Built-in preset registration."""
 
-    def test_codex_and_claude_code_registered(self) -> None:
-        assert preset_names() == ["claude-code", "codex"]
+    def test_builtin_presets_registered(self) -> None:
+        assert preset_names() == ["claude-code", "codex", "pi"]
 
     def test_list_presets_sorted_by_name(self) -> None:
         names = [p.name for p in list_presets()]
         assert names == sorted(names)
-        assert {p.name for p in list_presets()} == {"codex", "claude-code"}
+        assert {p.name for p in list_presets()} == {"codex", "claude-code", "pi"}
 
     def test_get_preset_returns_codex(self) -> None:
         assert get_preset("codex") is CODEX_PRESET
@@ -81,8 +82,11 @@ class TestRegistry:
     def test_get_preset_returns_claude_code(self) -> None:
         assert get_preset("claude-code") is CLAUDE_CODE_PRESET
 
+    def test_get_preset_returns_pi(self) -> None:
+        assert get_preset("pi") is PI_PRESET
+
     def test_unknown_preset_lists_available(self) -> None:
-        with pytest.raises(KeyError, match="Available: claude-code, codex"):
+        with pytest.raises(KeyError, match="Available: claude-code, codex, pi"):
             get_preset("hermes")
 
 
@@ -115,12 +119,11 @@ class TestClaudeCodePreset:
         Claude Code on macOS keeps tokens in the keychain (not in
         ``~/.claude/.credentials.json``); without this entry the guest
         sees the user's profile but says "Not logged in"."""
-        assert CLAUDE_CODE_PRESET.host_keychain_secrets == (
-            HostKeychainSecret(
-                service="Claude Code-credentials",
-                guest_path="/root/.claude/.credentials.json",
-            ),
-        )
+        from smolvm.presets.claude_code import CLAUDE_CODE_KEYCHAIN_SECRET
+
+        assert CLAUDE_CODE_PRESET.host_keychain_secrets == (CLAUDE_CODE_KEYCHAIN_SECRET,)
+        assert CLAUDE_CODE_KEYCHAIN_SECRET.service == "Claude Code-credentials"
+        assert CLAUDE_CODE_KEYCHAIN_SECRET.guest_path == "/root/.claude/.credentials.json"
 
     def test_claude_code_install_runs_npm_install(self) -> None:
         assert "@anthropic-ai/claude-code" in CLAUDE_CODE_PRESET.install_script
@@ -152,9 +155,9 @@ class TestClaudeCodePreset:
 
         # Extract just the cleanup snippet (after the npm install line)
         # and rewrite the hard-coded /root/ path to our temp dir.
-        from smolvm.presets.claude_code import _RESET_INSTALL_METHOD
+        from smolvm.presets.claude_code import CLAUDE_RESET_INSTALL_METHOD
 
-        snippet = _RESET_INSTALL_METHOD.replace("/root/", f"{root}/")
+        snippet = CLAUDE_RESET_INSTALL_METHOD.replace("/root/", f"{root}/")
         completed = subprocess.run(
             ["bash", "-c", f"set -euo pipefail; {snippet}"],
             capture_output=True,
@@ -174,10 +177,10 @@ class TestClaudeCodePreset:
         copied (e.g. a fresh user with no host config)."""
         import subprocess
 
-        from smolvm.presets.claude_code import _RESET_INSTALL_METHOD
+        from smolvm.presets.claude_code import CLAUDE_RESET_INSTALL_METHOD
 
         # Point at an empty dir — the file does not exist.
-        snippet = _RESET_INSTALL_METHOD.replace("/root/", f"{tmp_path}/")
+        snippet = CLAUDE_RESET_INSTALL_METHOD.replace("/root/", f"{tmp_path}/")
         completed = subprocess.run(
             ["bash", "-c", f"set -euo pipefail; {snippet}"],
             capture_output=True,
@@ -185,6 +188,58 @@ class TestClaudeCodePreset:
             check=False,
         )
         assert completed.returncode == 0, completed.stderr
+
+
+class TestPiPreset:
+    """Pi preset wires up the right keys, paths, and install command."""
+
+    def test_pi_preset_shape(self) -> None:
+        assert PI_PRESET.name == "pi"
+        assert PI_PRESET.aliases == ()
+        assert PI_PRESET.launch_command == "pi"
+        assert PI_PRESET.host_env_vars == ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+    def test_pi_forwards_union_of_provider_credentials(self) -> None:
+        """Pi reuses on-disk credentials from codex and claude-code in
+        addition to its own ~/.pi config, so a prior `codex login` or
+        `claude login` on the host carries through into the guest.
+
+        Compared as an ordered list of (host, guest) pairs so a
+        duplicate ``HostConfigCopy`` cannot silently dedupe through a
+        dict-based assertion."""
+        pairs = [(cfg.host_path, cfg.guest_path) for cfg in PI_PRESET.host_configs]
+        assert pairs == [
+            ("~/.pi", "/root/.pi"),
+            ("~/.codex", "/root/.codex"),
+            ("~/.claude.json", "/root/.claude.json"),
+            ("~/.claude", "/root/.claude"),
+        ]
+
+    def test_pi_pulls_oauth_from_macos_keychain(self) -> None:
+        """Pi delegates Claude Pro/Max auth through Claude Code's
+        ~/.claude/.credentials.json, so it must reuse the same keychain
+        extraction."""
+        from smolvm.presets.claude_code import CLAUDE_CODE_KEYCHAIN_SECRET
+
+        assert PI_PRESET.host_keychain_secrets == (CLAUDE_CODE_KEYCHAIN_SECRET,)
+
+    def test_pi_install_runs_npm_install(self) -> None:
+        assert "@mariozechner/pi-coding-agent" in PI_PRESET.install_script
+        assert "npm install -g" in PI_PRESET.install_script
+
+    def test_pi_install_strips_claude_install_method(self) -> None:
+        """Pi forwards ~/.claude.json, so its install must append the
+        same installMethod cleanup that claude-code uses — otherwise
+        the host's ``installMethod`` value carries into the guest and
+        breaks claude/Pi's claude-subscription path on first launch."""
+        from smolvm.presets.claude_code import CLAUDE_RESET_INSTALL_METHOD
+
+        assert CLAUDE_RESET_INSTALL_METHOD in PI_PRESET.install_script
+
+    def test_pi_setup_uses_node20_bootstrap(self) -> None:
+        from smolvm.presets._scripts import NODE20_BOOTSTRAP
+
+        assert PI_PRESET.setup_script == NODE20_BOOTSTRAP
 
 
 class TestNpmInstallGlobalSafety:
