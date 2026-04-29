@@ -192,6 +192,34 @@ with SmolVM(mounts=["~/Projects/my-app"], writable_mounts=True) as vm:
     vm.run("echo hello > /workspace/from-sandbox.txt")
 ```
 
+## Upload a file
+
+You can copy one file into a running sandbox without mounting a whole folder.
+This is useful when an agent needs a config file, script, or small input file.
+
+```bash
+# Copy a file from your machine into the sandbox.
+smolvm file upload my-sandbox ./prompt.txt /tmp/prompt.txt
+
+# Open a shell in the sandbox to confirm the file is there.
+smolvm ssh my-sandbox
+# Then, inside the sandbox shell:
+cat /tmp/prompt.txt
+```
+
+The same works from Python:
+
+```python
+from smolvm import SmolVM
+
+vm = SmolVM.from_id("my-sandbox")
+vm.upload_file("./prompt.txt", "/tmp/prompt.txt")
+vm.close()
+```
+
+The destination must be an absolute path inside the sandbox (starting
+with `/`), and any existing file at that path is overwritten.
+
 
 ## Examples
 

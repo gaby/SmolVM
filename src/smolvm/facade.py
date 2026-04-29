@@ -343,6 +343,17 @@ def _parse_mount_specs(
     return mounts
 
 
+def _guest_parent_dir(path: str) -> str:
+    """Return the POSIX parent directory for a guest path, if it has one."""
+    normalized = path.rstrip("/")
+    if not normalized:
+        return ""
+    if "/" not in normalized:
+        return ""
+    parent = normalized.rsplit("/", 1)[0]
+    return parent or "/"
+
+
 def _build_auto_config_image_name(
     guest_os: GuestOS,
     *,
@@ -1228,6 +1239,68 @@ class SmolVM:
         ssh = self._ensure_ssh_for_env()
         return read_env_vars(ssh)
 
+    def upload_file(
+        self,
+        local_path: str | Path,
+        guest_path: str,
+        *,
+        make_dirs: bool = True,
+    ) -> str:
+        """Upload one local file into a running VM.
+
+        Overwrites the destination if it already exists.
+
+        Args:
+            local_path: File on the host machine.
+            guest_path: Absolute POSIX path inside the guest. If it ends
+                with ``/``, the local filename is appended.
+            make_dirs: Create the destination parent directory first.
+
+        Returns:
+            The resolved guest destination path.
+
+        Raises:
+            ValueError: If *local_path* is missing, is not a file, or if
+                *guest_path* is empty or not an absolute POSIX path.
+            SmolVMError: If the VM is not running or file transfer fails.
+        """
+        source = Path(local_path).expanduser()
+        if not source.exists():
+            raise ValueError(
+                f"Local file not found: {source}. Check the path and try again."
+            )
+        if not source.is_file():
+            raise ValueError(
+                f"Not a file: {source}. Pass a path to a single file, not a directory."
+            )
+        if not guest_path:
+            raise ValueError("Destination path in the sandbox cannot be empty.")
+        if not guest_path.startswith("/"):
+            raise ValueError(
+                f"Destination path in the sandbox must be absolute "
+                f"(start with '/'): {guest_path!r}."
+            )
+
+        destination = guest_path
+        if destination.endswith("/"):
+            destination = f"{destination}{source.name}"
+
+        ssh = self._ensure_ssh_for_file_transfer()
+        if make_dirs:
+            parent = _guest_parent_dir(destination)
+            if parent:
+                result = ssh.run(
+                    f"mkdir -p -- {shlex.quote(parent)}", timeout=30, shell="raw"
+                )
+                if result.exit_code != 0:
+                    stderr = result.stderr.strip()
+                    raise SmolVMError(
+                        f"Could not create directory {parent!r} in the sandbox: {stderr}",
+                        {"vm_id": self._vm_id, "guest_path": destination},
+                    )
+        ssh.put_file(source, destination)
+        return destination
+
     def wait_for_ssh(
         self,
         timeout: float = 60.0,
@@ -2014,13 +2087,22 @@ modprobe 9pnet_virtio""".strip()
         if hasattr(self, "_probed_endpoint"):
             self._probed_endpoint = None
 
+    def _ensure_ssh_for_file_transfer(self) -> SSHClient:
+        """Return a ready SSH client for file transfer operations."""
+        return self._ensure_ssh_for_operation(action="transfer files")
+
     def _ensure_ssh_for_env(self) -> SSHClient:
         """Return a ready SSH client for env operations on a running VM."""
+        return self._ensure_ssh_for_operation(action="manage environment variables")
+
+    def _ensure_ssh_for_operation(self, *, action: str) -> SSHClient:
+        """Return a ready SSH client for operations that need guest SSH."""
+        prefix = f"Cannot {action}"
         self._refresh_info()
 
         if self._info.status != VMState.RUNNING:
             raise SmolVMError(
-                f"Cannot manage environment variables: VM is {self._info.status.value}",
+                f"{prefix}: VM is {self._info.status.value}",
                 {"vm_id": self._vm_id},
             )
         if not self.can_run_commands():
@@ -2034,7 +2116,7 @@ modprobe 9pnet_virtio""".strip()
             )
         if self._info.network is None:
             raise SmolVMError(
-                "Cannot manage environment variables: VM has no network configuration",
+                f"{prefix}: VM has no network configuration",
                 {"vm_id": self._vm_id},
             )
 
@@ -2043,7 +2125,7 @@ modprobe 9pnet_virtio""".strip()
 
         if self._ssh is None:
             raise SmolVMError(
-                "Cannot manage environment variables: SSH client is not initialized",
+                f"{prefix}: SSH client is not initialized",
                 {"vm_id": self._vm_id},
             )
 
