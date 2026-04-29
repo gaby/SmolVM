@@ -12,26 +12,27 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-orange.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-orange.svg)](https://www.python.org/downloads/)
 
-[Quick start](#quickstart) • [Examples](#examples) • [Features](#features) • [Performance](#performance) • [Docs](https://docs.celesto.ai) • [Community Slack](https://join.slack.com/t/celestoai/shared_invite/zt-3qc7h8gno-Nb5_PElEWHDNnGqdVzC~4Q) 
+[Quick start](#quickstart) • [Examples](#examples) • [Features](https://docs.celesto.ai/smolvm/features) • [Performance](#performance) • [Docs](https://docs.celesto.ai) • [Community Slack](https://join.slack.com/t/celestoai/shared_invite/zt-3qc7h8gno-Nb5_PElEWHDNnGqdVzC~4Q) 
 
 </div>
 
 ---
 
 SmolVM gives AI agents their own disposable computer. 
-Each microVM boots in milliseconds, runs any code or software you throw at it, keeps state when you need it, and vanishes when you don't — nothing touches your host.
+Each microVM boots in milliseconds, runs any code or software you throw at it, persists files and state across sessions, and disappears when you're done — ready to handle thousands of sandboxes in production.
 
+<br>
 
-## Features
-
-- **Sub-second boot** — VMs ready in ~500 ms.
-- **Hardware isolation** — Stronger security than containers.
-- **Network controls** — Domain allowlists for egress filtering.
-- **Browser sessions** — Full browser agents can see and control.
-- **Host mounts** — Give sandboxes read access to local directories.
-- **Snapshots** — Save and restore VM state instantly.
-- **Coding agents** — Start enviornment with a pre-installed coding agent.
-- **OpenClaw** — GUI Linux apps inside a sandbox.
+| Feature | What it means for you |
+| :--- | :--- |
+| **[Sub-second boot](#performance)** | Your agent has a running VM before the API call returns (~500 ms). |
+| **[Hardware&nbsp;isolation](#security)** &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Each sandbox runs in its own virtual machine with hardware-level separation. Untrusted code can't escape or access your system. |
+| **[Network controls](#network-controls)** | Lock down egress to specific domains so agents can't call home. |
+| **[Browser sandbox](#browser-sandbox)** | Agents get a full browser they can see and control in real time. |
+| **[File sharing](#mount-host-directories)** | Share local directories with the sandbox, read-only or writable. |
+| **Snapshots** | Pause a sandbox and resume it later with everything intact. |
+| **[Coding agents](#coding-agents)** | One command to launch a sandbox with Claude Code, Codex, or Pi pre-installed. |
+| **[OpenClaw](examples/openclaw.py)** | Run GUI Linux apps (IDEs, browsers, tools) inside an isolated sandbox. |
 
 
 ## Use cases
@@ -65,9 +66,9 @@ On supported Linux and macOS systems, `pip install smolvm` also pulls in the mat
 
 Linux may prompt for `sudo` during setup so it can install host dependencies and configure runtime permissions.
 
-</details>
-
 For golden-AMI builds, two-stage deploys, pinning the Firecracker version, and other non-default install paths, see [docs/installation.md](docs/installation.md).
+
+</details>
 
 ### Start a sandbox in Python
 
@@ -116,7 +117,7 @@ smolvm pi start  # start a new environment with the Pi coding agent preinstalled
 ```
 
 
-## Browser sessions
+## Browser sandbox
 
 SmolVM can also start a full browser inside a sandbox. This is useful when agents need to navigate websites, fill out forms, or take screenshots.
 
