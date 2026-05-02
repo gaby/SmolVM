@@ -142,6 +142,7 @@ class StartPresetPayload(TypedDict):
     name: str
     copied_configs: list[str]
     injected_env_keys: list[str]
+    no_env_hint: str | None
 
 
 class StartPayload(TypedDict):
@@ -1794,7 +1795,6 @@ def _render_start_result(data: StartPayload) -> None:
         Text(str(vm_data["status"]), style=status_style(str(vm_data["status"]))),
     )
     details.add_row("OS", str(vm_data["os"]))
-    details.add_row("Backend", str(vm_data["backend"]))
     details.add_row("IP Address", str(vm_data["ip_address"] or "-"))
     details.add_row(
         "SSH Port",
@@ -1810,6 +1810,8 @@ def _render_start_result(data: StartPayload) -> None:
         ", ".join(preset["injected_env_keys"]) if preset["injected_env_keys"] else "-",
     )
     console.print(details)
+    if not preset["injected_env_keys"] and preset.get("no_env_hint"):
+        console.print(f"\n[yellow]{preset['no_env_hint']}[/yellow]")
     console.print(f"Next: [bold]{next_step['ssh_command']}[/bold]")
 
 
@@ -1907,6 +1909,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 "name": str(apply_summary["preset"]),
                 "copied_configs": list(apply_summary["copied_configs"]),  # type: ignore[arg-type]
                 "injected_env_keys": list(apply_summary["injected_env_keys"]),  # type: ignore[arg-type]
+                "no_env_hint": preset.no_env_hint,
             },
             "next": {
                 "ssh_command": f"smolvm ssh {vm.vm_id}",
