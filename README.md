@@ -108,6 +108,10 @@ It sucks to “press enter and accept changes” every few seconds while using c
 
 With a single command you get a claude/codex pre-installed sandbox ready with git credential to make you build a billion dollar business without making any mistake ;)
 
+Video tutorial:
+
+<a href="https://youtu.be/j1qyrTsI0Jw"><img src="https://img.youtube.com/vi/j1qyrTsI0Jw/maxresdefault.jpg" alt="Coding agents in a sandbox" width="480"></a>
+
 ```bash
 smolvm codex start  # start a new environment with codex preinstalled
 
