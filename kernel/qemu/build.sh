@@ -89,11 +89,29 @@ esac
 SMOLVM_ARCH="${SMOLVM_ARCH_OVERRIDE:-$SMOLVM_ARCH}"
 
 # SmolVM arch label → kernel ARCH= variable.
+#
+# We ship TWO artifacts per arch — same source build, different output formats:
+#   - vmlinux-<arch>.elf    The uncompressed ELF (kernel-source root).
+#                           Firecracker REQUIRES this; bzImage/Image fail
+#                           with `Kernel Loader: Invalid Elf magic number`.
+#   - vmlinux-<arch>.image  The boot wrapper (bzImage on x86, Image on
+#                           arm64). QEMU's `-machine virt -kernel` empirically
+#                           refuses to boot a Linux ELF on aarch64 (silent
+#                           hang, no console output), but boots Image fine.
+#                           QEMU on x86 accepts either; we standardise on
+#                           the boot wrapper for consistency.
+# The `make $KMAKE_TARGET` step builds both as a side effect — the wrapper
+# depends on the ELF — so producing two artifacts costs nothing extra.
 case "$SMOLVM_ARCH" in
-    amd64)  KARCH=x86_64; KIMAGE_REL=arch/x86/boot/bzImage; DEFCONFIG=x86_64_defconfig ;;
-    arm64)  KARCH=arm64;  KIMAGE_REL=arch/arm64/boot/Image; DEFCONFIG=defconfig ;;
+    amd64)  KARCH=x86_64; KMAKE_TARGET=bzImage; DEFCONFIG=x86_64_defconfig ;;
+    arm64)  KARCH=arm64;  KMAKE_TARGET=Image;   DEFCONFIG=defconfig ;;
     *) echo "internal error: unhandled SMOLVM_ARCH $SMOLVM_ARCH" >&2; exit 2 ;;
 esac
+case "$SMOLVM_ARCH" in
+    amd64)  IMAGE_REL=arch/x86/boot/bzImage ;;
+    arm64)  IMAGE_REL=arch/arm64/boot/Image ;;
+esac
+ELF_REL=vmlinux  # ELF, root of the kernel source tree
 
 ARCH_FRAGMENT="$SCRIPT_DIR/config.$SMOLVM_ARCH.fragment"
 if [ ! -f "$ARCH_FRAGMENT" ]; then
@@ -105,13 +123,15 @@ OUT_DIR="${OUT_DIR:-$PWD}"
 WORK_DIR="${WORK_DIR:-$(mktemp -d)}"
 TARBALL="$WORK_DIR/linux-$LINUX_VERSION.tar.xz"
 SRC_DIR="$WORK_DIR/linux-$LINUX_VERSION"
-ARTIFACT="$OUT_DIR/vmlinux-$SMOLVM_ARCH-qemu.bin"
+ELF_ARTIFACT="$OUT_DIR/vmlinux-$SMOLVM_ARCH.elf"
+IMAGE_ARTIFACT="$OUT_DIR/vmlinux-$SMOLVM_ARCH.image"
 JOBS="$(job_count)"
 
 echo "==> Linux $LINUX_VERSION → $SMOLVM_ARCH (kernel ARCH=$KARCH)"
-echo "    work dir: $WORK_DIR"
-echo "    output:   $ARTIFACT"
-echo "    make:     $MAKE_BIN ($MAKE_VERSION)"
+echo "    work dir:    $WORK_DIR"
+echo "    elf out:     $ELF_ARTIFACT"
+echo "    image out:   $IMAGE_ARTIFACT"
+echo "    make:        $MAKE_BIN ($MAKE_VERSION)"
 
 # 1. Download the tarball and verify against our pinned SHA.
 if [ ! -f "$TARBALL" ]; then
@@ -205,14 +225,40 @@ case "$(printf '%s' "${SMOLVM_VERIFY_ONLY:-}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 # 5. Build the kernel image.
+# Invoking the boot-wrapper target (bzImage/Image) drives a full link, so the
+# ELF `vmlinux` is produced as a prerequisite. We then ship both: the wrapper
+# for QEMU, the ELF for Firecracker.
 echo "==> Building kernel ($JOBS jobs)"
-"$MAKE_BIN" ARCH="$KARCH" -j"$JOBS" "$(basename "$KIMAGE_REL")"
+"$MAKE_BIN" ARCH="$KARCH" -j"$JOBS" "$KMAKE_TARGET"
 
-# 6. Stage the artifact + record the resolved config (debugging aid).
+# 6. Stage the artifacts + record the resolved config (debugging aid).
 mkdir -p "$OUT_DIR"
-cp "$KIMAGE_REL" "$ARTIFACT"
-cp .config "$OUT_DIR/vmlinux-$SMOLVM_ARCH-qemu.config"
+cp "$IMAGE_REL" "$IMAGE_ARTIFACT"
+cp "$ELF_REL" "$ELF_ARTIFACT"
+cp .config "$OUT_DIR/vmlinux-$SMOLVM_ARCH.config"
+
+# Strip the ELF: with the default kernel build it's ~290 MB on arm64
+# (debug_info + symbols). Firecracker doesn't need any of that. Keep
+# `--strip-debug` (not `--strip-all`) — preserves the symbol table for
+# tooling like crash dumps. Cuts the artifact by ~3x.
+strip --strip-debug "$ELF_ARTIFACT"
+
+# Sanity checks:
+#   ELF magic (7f 45 4c 46) on the .elf — Firecracker requires this.
+elf_magic=$(head -c 4 "$ELF_ARTIFACT" | od -An -tx1 | tr -d ' ')
+if [ "$elf_magic" != "7f454c46" ]; then
+    echo "==> ERROR: $ELF_ARTIFACT is not an ELF binary (got magic $elf_magic)" >&2
+    exit 1
+fi
+#   Image must NOT be ELF — QEMU on aarch64 virt empirically refuses to boot
+#   a Linux ELF kernel and just hangs silently. Catch it early.
+img_magic=$(head -c 4 "$IMAGE_ARTIFACT" | od -An -tx1 | tr -d ' ')
+if [ "$img_magic" = "7f454c46" ]; then
+    echo "==> ERROR: $IMAGE_ARTIFACT is unexpectedly ELF (QEMU/virt won't boot)" >&2
+    exit 1
+fi
 
 echo "==> Done."
-echo "    $ARTIFACT  ($(wc -c <"$ARTIFACT" | tr -d ' ') bytes)"
-echo "    $OUT_DIR/vmlinux-$SMOLVM_ARCH-qemu.config"
+echo "    $ELF_ARTIFACT    ($(wc -c <"$ELF_ARTIFACT" | tr -d ' ') bytes, ELF for Firecracker)"
+echo "    $IMAGE_ARTIFACT  ($(wc -c <"$IMAGE_ARTIFACT" | tr -d ' ') bytes, ${KMAKE_TARGET} for QEMU)"
+echo "    $OUT_DIR/vmlinux-$SMOLVM_ARCH.config"

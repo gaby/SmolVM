@@ -56,9 +56,14 @@ from smolvm.images.cloud_init import (
     default_user_data,
     seed_cache_key,
 )
-from smolvm.images.manager import ImageManager, ImageSource
+from smolvm.images.manager import ImageManager
 from smolvm.runtime.backends import BACKEND_LIBKRUN, BACKEND_QEMU, resolve_backend
-from smolvm.runtime.boot_profiles import KernelBootProfile, get_boot_profile_spec
+from smolvm.runtime.boot_profiles import (
+    KernelBootProfile,
+    get_boot_profile_spec,
+    normalize_arch,
+    to_published_arch,
+)
 from smolvm.ssh import SSHClient
 from smolvm.types import (
     CommandResult,
@@ -90,42 +95,18 @@ _AUTO_CONFIG_DEFAULT_DISK_SIZE_MIB = {
     GuestOS.UBUNTU: 2048,
 }
 _UBUNTU_CURRENT_RELEASE_DATE = "20260406"
-_QEMU_UBUNTU_AUTO_IMAGES: dict[str, ImageSource] = {
-    "ubuntu-noble-minimal-qemu-x86_64": ImageSource(
-        name="ubuntu-noble-minimal-qemu-x86_64",
-        kernel_url=(
-            "https://cloud-images.ubuntu.com/noble/current/unpacked/"
-            "noble-server-cloudimg-amd64-vmlinuz-generic"
-        ),
-        kernel_filename="vmlinuz",
-        initrd_url=(
-            "https://cloud-images.ubuntu.com/noble/current/unpacked/"
-            "noble-server-cloudimg-amd64-initrd-generic"
-        ),
-        initrd_filename="initrd",
-        rootfs_url=(
-            "https://cloud-images.ubuntu.com/minimal/releases/noble/release/"
-            "ubuntu-24.04-minimal-cloudimg-amd64.img"
-        ),
-        rootfs_filename="rootfs.qcow2",
+# Ubuntu cloud-images rootfs URLs. Post-0.0.14a0 we no longer fetch Ubuntu's
+# vmlinuz/initrd alongside — the SmolVM-built base kernel boots the rootfs
+# directly (CONFIG_ISO9660_FS=y enables the cloud-init NoCloud seed). Only
+# the qcow2 rootfs is fetched from cloud-images.ubuntu.com.
+_QEMU_UBUNTU_AUTO_IMAGES: dict[str, str] = {
+    "ubuntu-noble-minimal-qemu-x86_64": (
+        "https://cloud-images.ubuntu.com/minimal/releases/noble/release/"
+        "ubuntu-24.04-minimal-cloudimg-amd64.img"
     ),
-    "ubuntu-noble-minimal-qemu-aarch64": ImageSource(
-        name="ubuntu-noble-minimal-qemu-aarch64",
-        kernel_url=(
-            "https://cloud-images.ubuntu.com/noble/current/unpacked/"
-            "noble-server-cloudimg-arm64-vmlinuz-generic"
-        ),
-        kernel_filename="vmlinuz",
-        initrd_url=(
-            "https://cloud-images.ubuntu.com/noble/current/unpacked/"
-            "noble-server-cloudimg-arm64-initrd-generic"
-        ),
-        initrd_filename="initrd",
-        rootfs_url=(
-            "https://cloud-images.ubuntu.com/minimal/releases/noble/release/"
-            "ubuntu-24.04-minimal-cloudimg-arm64.img"
-        ),
-        rootfs_filename="rootfs.qcow2",
+    "ubuntu-noble-minimal-qemu-aarch64": (
+        "https://cloud-images.ubuntu.com/minimal/releases/noble/release/"
+        "ubuntu-24.04-minimal-cloudimg-arm64.img"
     ),
 }
 
@@ -495,31 +476,54 @@ def _build_auto_config(
                 f"ubuntu auto-config requires disk_size_mib >= {default_disk_size_mib} "
                 f"(got {resolved_disk_size_mib})"
             )
+        from smolvm.images.published import ensure_base_kernel
+
         image_name = _qemu_auto_config_image_name(GuestOS.UBUNTU)
-        image_manager = ImageManager(registry=_QEMU_UBUNTU_AUTO_IMAGES)
-        image = image_manager.ensure_image(image_name, on_download=on_download)
-        if image.initrd_path is None:
+        rootfs_url = _QEMU_UBUNTU_AUTO_IMAGES.get(image_name)
+        if rootfs_url is None:
             raise SmolVMError(
-                "Prebuilt QEMU auto-config image is missing an initrd",
+                "No prebuilt Ubuntu rootfs registered for this host architecture",
                 {"image_name": image_name},
             )
+        image_manager = ImageManager()
+        pristine_rootfs = image_manager.ensure_rootfs_only(
+            image_name,
+            url=rootfs_url,
+            filename="rootfs.qcow2",
+            on_download=on_download,
+        )
+        # Pull the SmolVM-built base kernel — Image format for QEMU
+        # (Firecracker would use the ELF; this branch is QEMU-only).
+        host_arch = platform.machine()
+        kernel_path = ensure_base_kernel(
+            to_published_arch(host_arch),
+            "image",
+            cache_dir=image_manager.cache_dir,
+        )
 
         if resolved_disk_size_mib > default_disk_size_mib:
             rootfs_path, _resolved_size = _prepare_sized_qcow2(
                 cache_dir=image_manager.cache_dir,
                 base_image_name=image_name,
-                source_qcow2=image.rootfs_path,
+                source_qcow2=pristine_rootfs,
                 target_mib=resolved_disk_size_mib,
             )
         else:
-            rootfs_path = image.rootfs_path
+            rootfs_path = pristine_rootfs
 
-        boot_profile = KernelBootProfile.QEMU_DESKTOP_INITRAMFS
-        boot_args = get_boot_profile_spec(boot_profile).base_boot_args_for_backend(
-            resolved_backend,
-            platform.machine(),
-        )
-        boot_args = f"{boot_args} root=LABEL=cloudimg-rootfs rw"
+        # Direct kernel boot, no initrd. Ubuntu's cloud qcow2 has a 3-partition
+        # GPT layout (vda1=rootfs, vda15=ESP, vda16=/boot); without an initrd
+        # to resolve `LABEL=cloudimg-rootfs` we point at the partition directly.
+        # cloud-init userspace then reads the seed ISO at /dev/vdb
+        # (CONFIG_ISO9660_FS=y) and provisions sshd.
+        #
+        # We deliberately don't use the MICROVM_DIRECT boot-profile string here
+        # because it bakes in `init=/init` (the SmolVM-built Alpine/Debian images
+        # ship a custom /init shell script). Ubuntu's rootfs has no /init —
+        # init lives at /sbin/init (systemd). Letting the kernel pick its
+        # default search path lands on systemd, which kicks cloud-init.
+        console = "ttyAMA0" if normalize_arch(host_arch) == "aarch64" else "ttyS0"
+        boot_args = f"console={console} reboot=k panic=1 root=/dev/vda1 rw"
 
         user_data = default_user_data(public_key_value)
         seed_key = seed_cache_key(
@@ -545,8 +549,7 @@ def _build_auto_config(
             vm_id=resolved_vm_name,
             vcpu_count=1,
             memory=resolved_memory,
-            kernel_path=image.kernel_path,
-            initrd_path=image.initrd_path,
+            kernel_path=kernel_path,
             rootfs_path=rootfs_path,
             extra_drives=[seed_path],
             boot_args=boot_args,
@@ -648,12 +651,20 @@ def _build_auto_config(
         disk_size_mib=resolved_disk_size_mib,
     )
 
+    # Pick the kernel format the runtime backend requires. Same kernel source,
+    # different container: ``elf`` for Firecracker / libkrun, ``image`` for QEMU.
+    from smolvm.images.published import BASE_KERNELS, _kernel_format_for_vmm
+
+    kernel_fmt = _kernel_format_for_vmm(resolved_backend)  # type: ignore[arg-type]
+    base_kernel_url = BASE_KERNELS[to_published_arch(platform.machine())].url_for(kernel_fmt)
+
     if resolved_os is GuestOS.DEBIAN:
         kernel, rootfs = builder.build_debian_ssh_key(
             public_key_path,
             name=image_name,
             rootfs_size_mb=resolved_disk_size_mib,
             kernel_profile=kernel_profile,
+            kernel_url=base_kernel_url,
         )
     else:
         kernel, rootfs = builder.build_alpine_ssh_key(
@@ -661,6 +672,7 @@ def _build_auto_config(
             name=image_name,
             rootfs_size_mb=resolved_disk_size_mib,
             kernel_profile=kernel_profile,
+            kernel_url=base_kernel_url,
         )
 
     resolved_vm_name = _resolve_vm_name(vm_name, prefix=name_prefix)

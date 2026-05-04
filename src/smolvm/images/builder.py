@@ -34,10 +34,8 @@ from pathlib import Path
 
 from smolvm.exceptions import ImageError, SmolVMError
 from smolvm.runtime.boot_profiles import (
-    QEMU_DESKTOP_KERNEL_URLS,
     KernelBootProfile,
     normalize_arch,
-    resolve_kernel_url,
 )
 from smolvm.utils import RUNTIME_PRIVILEGE_SETUP_HINT, run_command
 
@@ -50,8 +48,6 @@ SSH_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/i
 # vCPU exits on /dev/ttyS0 writes, which become a measurable host CPU tax at
 # 200+ VMs.  No console= since we don't need serial output in production.
 OPENCLAW_BOOT_ARGS = "reboot=k panic=1 pci=off init=/init 8250.nr_uarts=0"
-
-QEMU_KERNEL_URLS = QEMU_DESKTOP_KERNEL_URLS
 
 LOOPFS_HELPER_PATH = Path("/usr/local/libexec/smolvm-loopfs-helper")
 
@@ -1330,22 +1326,42 @@ echo "Device-approver running with PID=${DEVICE_APPROVER_PID}"
             raise ImageError(str(exc)) from exc
 
     def _kernel_url_for_host(self) -> str:
-        """Return a Firecracker-compatible kernel URL for the current host arch."""
+        """Return the SmolVM-built base kernel URL for the current host arch.
+
+        Defaults to the ELF format (Firecracker-compatible). Callers that
+        need the Image format must pass an explicit ``kernel_url`` override.
+        """
         return self._resolve_kernel_url(KernelBootProfile.MICROVM_DIRECT)
 
     def qemu_kernel_url_for_host(self) -> str:
-        """Return the future desktop/initramfs QEMU kernel URL for the host arch."""
-        return self._resolve_kernel_url(KernelBootProfile.QEMU_DESKTOP_INITRAMFS)
+        """Return the SmolVM-built Image-format base kernel URL.
+
+        Retained for back-compat with callers that branched on boot profile;
+        returns the ``.image`` artifact (QEMU-compatible).
+        """
+        from smolvm.images.published import BASE_KERNELS
+
+        smolvm_arch = "amd64" if self._host_arch_key() == "x86_64" else "arm64"
+        return BASE_KERNELS[smolvm_arch].image_url
 
     def _resolve_kernel_url(
         self,
-        kernel_profile: KernelBootProfile,
+        kernel_profile: KernelBootProfile,  # noqa: ARG002 (kept for back-compat)
         kernel_url: str | None = None,
     ) -> str:
-        """Return the effective kernel URL for an image build."""
+        """Return the effective kernel URL for an image build.
+
+        Defaults to the ELF artifact (Firecracker-compatible). Callers wanting
+        the Image format pass it explicitly via ``kernel_url`` — typically
+        derived in ``_build_auto_config`` from ``BASE_KERNELS[arch].url_for(fmt)``
+        based on the resolved backend.
+        """
         if kernel_url is not None:
             return kernel_url
-        return resolve_kernel_url(kernel_profile, self._host_arch_key())
+        from smolvm.images.published import BASE_KERNELS
+
+        smolvm_arch = "amd64" if self._host_arch_key() == "x86_64" else "arm64"
+        return BASE_KERNELS[smolvm_arch].elf_url
 
     def _fingerprint_with_content(
         self,
@@ -1392,7 +1408,28 @@ echo "Device-approver running with PID=${DEVICE_APPROVER_PID}"
         return hashlib.sha256(json_str.encode("utf-8")).hexdigest()
 
     def _download_kernel(self, url: str, dest: Path) -> None:
-        """Download kernel image to *dest* without external wget dependency."""
+        """Download kernel image to *dest*.
+
+        For SmolVM's published base kernel (the default path) we route through
+        :func:`smolvm.images.published.ensure_base_kernel`, which downloads to
+        a shared cache and SHA-256-verifies the artifact. Custom override URLs
+        fall back to a direct urllib fetch (no SHA — the override is the
+        caller's responsibility).
+        """
+        from smolvm.images.published import BASE_KERNELS, ensure_base_kernel
+
+        # Recognise our own published kernel URLs (either format) and use the
+        # SHA-verified cached path.
+        for arch, entry in BASE_KERNELS.items():
+            if url == entry.elf_url:
+                cached = ensure_base_kernel(arch, "elf")
+                shutil.copy2(cached, dest)
+                return
+            if url == entry.image_url:
+                cached = ensure_base_kernel(arch, "image")
+                shutil.copy2(cached, dest)
+                return
+
         try:
             with (
                 urllib.request.urlopen(url, timeout=180) as response,
