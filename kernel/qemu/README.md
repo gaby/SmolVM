@@ -24,7 +24,9 @@ QEMU or libkrun need a kernel built for that hardware.
 |---|---|
 | `linux.version` | Single line: the upstream Linux release we build (e.g. `6.12.10`). LTS-line for stability. |
 | `linux.sha256` | One `sha256sum -c` line for the tarball at `cdn.kernel.org`. |
-| `config.fragment` | Our deltas vs `microvm_defconfig` (x86) / `defconfig` (arm64). Every line carries an inline `# why:` comment — that's the source of truth for "why is this in our kernel." |
+| `config.fragment` | Common deltas vs `x86_64_defconfig` (x86) / `defconfig` (arm64) — symbols that exist on both archs. Every line carries an inline `# why:` comment — that's the source of truth for "why is this in our kernel." |
+| `config.amd64.fragment` | x86-only deltas (8250 console). Merged on top of `config.fragment` for amd64 builds. |
+| `config.arm64.fragment` | arm64-only deltas (PCI host-generic, PL011 console). Merged on top of `config.fragment` for arm64 builds. |
 | `build.sh` | The exact recipe CI runs. Also runnable locally — see below. |
 
 ## Building locally
@@ -49,6 +51,35 @@ SMOLVM_ARCH_OVERRIDE=arm64 ARCH=arm64 \
     CROSS_COMPILE=aarch64-linux-gnu- \
     bash build.sh
 ```
+
+### Validating in Docker
+
+`make defconfig` itself needs GNU `ld`, which macOS doesn't ship. Easiest
+path on a Mac is to run the build in an Ubuntu container — same toolchain
+CI uses. On Apple Silicon, **always pass `--platform`** (Docker silently
+selects amd64 otherwise, then emulates, and the kernel build dies on
+mismatched gcc flags):
+
+```sh
+# Quick: stop after fragment verification (~30 s, no kernel compile).
+docker run --rm --platform=linux/arm64 \
+    -v "$PWD":/src:ro -e SMOLVM_VERIFY_ONLY=1 \
+    -e SMOLVM_ARCH_OVERRIDE=arm64 ubuntu:24.04 \
+    bash -c 'apt-get update -qq && \
+        apt-get install -y --no-install-recommends \
+        build-essential bc bison flex libssl-dev libelf-dev \
+        xz-utils curl ca-certificates kmod cpio python3 >/dev/null && \
+        cp -r /src/kernel /tmp/kernel && \
+        cd /tmp/kernel/qemu && bash build.sh'
+
+# Full: produces a real vmlinux in /tmp/out (~5–8 min on M-series).
+mkdir -p /tmp/out && docker run --rm --platform=linux/arm64 \
+    -v "$PWD":/src:ro -v /tmp/out:/out -e OUT_DIR=/out \
+    -e SMOLVM_ARCH_OVERRIDE=arm64 ubuntu:24.04 \
+    bash -c '<same setup as above, drop SMOLVM_VERIFY_ONLY>'
+```
+
+Swap `--platform=linux/amd64` + `SMOLVM_ARCH_OVERRIDE=amd64` for the x86 build.
 
 ## Smoke-testing locally
 
@@ -118,7 +149,7 @@ older Firecracker naming is a future task.
   needed at boot is `=y` (in-kernel). Without modules we don't need an
   initrd, which keeps the image set simple. Cost: any future preset that
   needs a kernel module (zfs, btrfs, NFS, etc.) requires adding the symbol
-  to `config.fragment` as `=y`.
+  to `config.fragment` (or the per-arch fragment) as `=y`.
 - **Maintenance burden.** Bumping Linux means re-running `build.sh` once
   to verify the fragment still applies, then committing. CI cache by input
   hash means the rebuild is free until inputs change.
