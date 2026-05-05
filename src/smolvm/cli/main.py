@@ -1837,12 +1837,20 @@ def _render_start_result(data: StartPayload) -> None:
 # Boot args for the published-image launch path, keyed by (preset, vmm).
 # Firecracker uses MMIO virtio + 8250 silenced (no PCI); QEMU/libkrun use
 # PCI virtio with an arch-specific console (added by _boot_args_for).
-# When we add per-preset bake builders, this can move onto the Preset
-# itself; for now openclaw is the only published preset.
+#
+# Every published preset bakes a SmolVM init script at /init that reads
+# smolvm.authorized_key_b64=<base64> from the cmdline for pubkey injection
+# — openclaw via build_openclaw_rootfs(), the layered presets via
+# scripts/ci/preset-init.sh baked by build-preset.sh.
+_PUBLISHED_BOOT_ARGS_BY_VMM: dict[Vmm, str] = {
+    "firecracker": "reboot=k panic=1 pci=off init=/init 8250.nr_uarts=0",
+    "qemu": "reboot=k panic=1 init=/init",
+    "libkrun": "reboot=k panic=1 init=/init",
+}
 _PUBLISHED_IMAGE_BOOT_ARGS: dict[tuple[str, Vmm], str] = {
-    ("openclaw", "firecracker"): "reboot=k panic=1 pci=off init=/init 8250.nr_uarts=0",
-    ("openclaw", "qemu"): "reboot=k panic=1 init=/init",
-    ("openclaw", "libkrun"): "reboot=k panic=1 init=/init",
+    (preset, vmm): args
+    for preset in ("openclaw", "codex", "claude-code", "hermes", "pi")
+    for vmm, args in _PUBLISHED_BOOT_ARGS_BY_VMM.items()
 }
 
 # vmm → SmolVM runtime backend. libkrun ships a Firecracker-API-compatible
@@ -1853,6 +1861,17 @@ _VMM_TO_BACKEND: dict[Vmm, str] = {
     "firecracker": "firecracker",
     "qemu": "qemu",
     "libkrun": "qemu",
+}
+
+# Preset → base OS string used in the start-result envelope.
+# openclaw bakes from node:22.12.0-bookworm-slim (Debian 12);
+# codex/claude-code/hermes/pi layer on Ubuntu 24.04 via build-preset.sh.
+_PRESET_OS_LABEL: dict[str, str] = {
+    "openclaw": "debian-bookworm",
+    "codex": "ubuntu-24.04",
+    "claude-code": "ubuntu-24.04",
+    "hermes": "ubuntu-24.04",
+    "pi": "ubuntu-24.04",
 }
 
 
@@ -1990,7 +2009,7 @@ def _run_start_with_published_image(args: argparse.Namespace, preset: object) ->
                         if isinstance(vm.info.status, VMState)
                         else VMState.RUNNING.value
                     ),
-                    "os": "debian-bookworm",
+                    "os": _PRESET_OS_LABEL.get(_preset.name, "unknown"),
                     "backend": backend,
                     "ip_address": network.guest_ip if network else None,
                     "ssh_port": network.ssh_host_port if network else None,
