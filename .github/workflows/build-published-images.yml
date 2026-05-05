@@ -33,7 +33,7 @@ on:
       release_tag:
         description: >-
           Release tag (e.g. images-v0.0.13). Created as draft if missing.
-          Leave empty to derive from the project version in pyproject.toml.
+          Leave empty to use IMAGES_RELEASE_TAG from published.py.
         type: string
         default: ""
 
@@ -151,8 +151,8 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             tag="$INPUT_TAG"
           else
-            version=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-            tag="images-v${version}"
+            # Single source of truth — published.py::IMAGES_RELEASE_TAG.
+            tag=$(uv run python -c 'from smolvm.images.published import IMAGES_RELEASE_TAG; print(IMAGES_RELEASE_TAG)')
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Release tag: ${tag}"
@@ -222,6 +222,11 @@ jobs:
               || echo "Draft already exists (race with another matrix cell), continuing."
           fi
 
+          # --clobber overwrites any prior asset with the same name, so
+          # re-runs of the workflow for the same tag replace existing
+          # artifacts. NOTE: this allows silent SHA drift relative to the
+          # manifest. Catching that requires a smoke test that verifies
+          # live bytes against recorded SHAs — tracked separately.
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
@@ -294,8 +299,8 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             tag="$INPUT_TAG"
           else
-            version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-            tag="images-v${version}"
+            # Single source of truth — published.py::IMAGES_RELEASE_TAG.
+            tag=$(uv run python -c 'from smolvm.images.published import IMAGES_RELEASE_TAG; print(IMAGES_RELEASE_TAG)')
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Release tag: ${tag}"
@@ -322,6 +327,11 @@ jobs:
 
           sudo ARCH="$ARCH" bash scripts/ci/build-preset.sh \
             "$PRESET" /tmp/base/base-rootfs.ext4 /tmp/out "$SIZE"
+
+          # build-preset.sh ran under sudo (mount + chroot need root), so
+          # /tmp/out is owned by root. Chown to the runner user so the
+          # subsequent zstd `--rm` step can delete the source file.
+          sudo chown -R "$(id -u):$(id -g)" /tmp/out
 
           name="${PRESET}-${ARCH}"
           rootfs="/tmp/out/${name}-rootfs.ext4"
@@ -368,6 +378,11 @@ jobs:
               || echo "Draft already exists (race with another matrix cell), continuing."
           fi
 
+          # --clobber overwrites any prior asset with the same name, so
+          # re-runs of the workflow for the same tag replace existing
+          # artifacts. NOTE: this allows silent SHA drift relative to the
+          # manifest. Catching that requires a smoke test that verifies
+          # live bytes against recorded SHAs — tracked separately.
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \
