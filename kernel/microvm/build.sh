@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build the SmolVM QEMU/libkrun-tuned Linux kernel from upstream source.
 #
-# Inputs (alongside this script in kernel/qemu/):
+# Inputs (alongside this script in kernel/microvm/):
 #   linux.version    Pinned tarball version (e.g. "6.12.10")
 #   linux.sha256     SHA-256 line for `sha256sum -c`
 #   config.fragment  Our deltas merged onto x86_64_defconfig (x86) or
 #                    defconfig (arm64)
 #
-# Output: vmlinux-<arch>-qemu.bin in $OUT_DIR (default: $PWD).
+# Output: vmlinux-<arch>.elf and vmlinux-<arch>.image in $OUT_DIR (default: $PWD),
+#         plus vmlinux-<arch>.config for debugging.
 #
 # Usage:
 #   bash build.sh                                # builds for host arch

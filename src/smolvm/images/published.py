@@ -72,7 +72,7 @@ class PublishedImage(BaseModel):
 class BaseKernel(BaseModel):
     """Per-arch SmolVM-built microvm kernels — two formats from one build.
 
-    The ``kernel/qemu/build.sh`` recipe produces both an ELF and a boot-wrapper
+    The ``kernel/microvm/build.sh`` recipe produces both an ELF and a boot-wrapper
     artifact in a single make invocation. We ship both because:
 
     - Firecracker requires the ELF (``elf_url``) — its kernel loader rejects
@@ -140,7 +140,7 @@ def _release_kernel_url(arch: Arch, fmt: KernelFormat, version: str) -> str:
     """URL for a preset-independent kernel artifact.
 
     Asset naming: ``vmlinux-<arch>.{elf|image}``. Same Linux source build
-    produces both formats (see ``kernel/qemu/build.sh``); the runtime picks
+    produces both formats (see ``kernel/microvm/build.sh``); the runtime picks
     by backend (Firecracker→elf, QEMU→image).
     """
     return (
@@ -162,13 +162,9 @@ _MANIFEST_VERSION = "0.0.14a0"
 # these entries via ``url_for(format)`` / ``sha256_for(format)``, so adding
 # a future preset can't drift kernel SHAs across rows.
 #
-# SHAs come from the build-qemu-kernel.yml CI run that publishes
+# SHAs come from the build-microvm-kernel.yml CI run that publishes
 # ``vmlinux-<arch>.{elf,image}`` to release tag ``images-v<_MANIFEST_VERSION>``;
 # they're also visible in that workflow's step summary.
-#
-# Placeholder zeros are filled in by the next CI run after build.sh changes
-# the artifact split. Until then, downloads will fail SHA verification —
-# which is the right failure mode (we don't want to ship stale SHAs).
 BASE_KERNELS: dict[Arch, BaseKernel] = {
     "amd64": BaseKernel(
         arch="amd64",
@@ -230,6 +226,18 @@ MANIFEST: dict[tuple[Preset, Arch, Vmm], PublishedImage] = {
     ("openclaw", "arm64", "qemu"): _manifest_row(
         "openclaw", "arm64", "qemu", _OPENCLAW_ARM64_ROOTFS_SHA
     ),
+    # libkrun is Firecracker-API-compatible (same ELF kernel, same boot
+    # protocol). These rows are stubs: the CLI's _vmm_for_host() doesn't
+    # return "libkrun" until the libkrun runtime spike succeeds. Adding
+    # them now means the libkrun PR can be a one-line plumbing change
+    # rather than a manifest migration. Same rootfs as the firecracker
+    # rows on the same arch.
+    ("openclaw", "amd64", "libkrun"): _manifest_row(
+        "openclaw", "amd64", "libkrun", _OPENCLAW_AMD64_ROOTFS_SHA
+    ),
+    ("openclaw", "arm64", "libkrun"): _manifest_row(
+        "openclaw", "arm64", "libkrun", _OPENCLAW_ARM64_ROOTFS_SHA
+    ),
 }
 
 
@@ -250,6 +258,24 @@ def lookup(
             f"vmm '{vmm}' (available: {available})."
         )
     return entry
+
+
+def is_preset_published(
+    preset: str,
+    arch: Arch,
+    vmm: Vmm,
+    *,
+    manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage] | None = None,
+) -> bool:
+    """Return whether a published image is registered for ``(preset, arch, vmm)``.
+
+    Used by the CLI dispatch to decide whether to take the fast published-image
+    path or fall back to install-at-boot. Accepts an arbitrary preset string so
+    callers don't need to coerce against the ``Preset`` literal — presets that
+    don't appear in the manifest just return ``False``.
+    """
+    catalog = MANIFEST if manifest is None else manifest
+    return (preset, arch, vmm) in catalog  # type: ignore[comparison-overlap]
 
 
 def to_image_source(entry: PublishedImage, version: str = __version__) -> ImageSource:
@@ -325,10 +351,19 @@ def ensure_published_image(
     if not source.rootfs_filename.endswith(".zst"):
         return local
 
-    # Decompress alongside, only on cache miss for the decompressed file.
+    # Decompress alongside. We invalidate the decompressed file when the
+    # source ``.zst`` SHA changes (e.g. between a manifest version bump or
+    # an in-place rootfs republish) by stamping the source SHA into a
+    # sidecar file. Without this, a refreshed ``.zst`` was silently served
+    # alongside a stale ``.ext4`` from the previous SHA — first surfaced
+    # while diagnosing the openclaw uid bake regression.
     decompressed_path = local.rootfs_path.with_suffix("")
-    if not decompressed_path.is_file():
+    sidecar_path = decompressed_path.with_name(decompressed_path.name + ".from-sha256")
+    expected_sha = entry.rootfs_sha256
+    sidecar_sha = sidecar_path.read_text().strip() if sidecar_path.is_file() else None
+    if not decompressed_path.is_file() or sidecar_sha != expected_sha:
         _decompress_zstd(local.rootfs_path, decompressed_path)
+        sidecar_path.write_text(expected_sha)
 
     return local.model_copy(update={"rootfs_path": decompressed_path})
 

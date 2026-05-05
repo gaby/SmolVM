@@ -36,6 +36,7 @@ from smolvm.images.published import (
     cache_name,
     ensure_base_kernel,
     ensure_published_image,
+    is_preset_published,
     lookup,
     release_tag,
     to_image_source,
@@ -139,6 +140,58 @@ class TestLookup:
         # And one that's guaranteed not to:
         with pytest.raises(ImageError, match="No published image"):
             lookup("hermes", "arm64", "firecracker")  # type: ignore[arg-type]
+
+
+class TestIsPresetPublished:
+    def test_true_for_registered_entry(
+        self,
+        sample_manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage],
+    ) -> None:
+        assert is_preset_published("codex", "amd64", "firecracker", manifest=sample_manifest)
+
+    def test_false_for_missing_arch(
+        self,
+        sample_manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage],
+    ) -> None:
+        assert not is_preset_published("codex", "arm64", "firecracker", manifest=sample_manifest)
+
+    def test_false_for_missing_vmm(
+        self,
+        sample_manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage],
+    ) -> None:
+        assert not is_preset_published("codex", "amd64", "qemu", manifest=sample_manifest)
+
+    def test_false_for_unknown_preset(
+        self,
+        sample_manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage],
+    ) -> None:
+        # Accepts arbitrary preset strings so the CLI doesn't need to coerce
+        # against the Preset literal before dispatching.
+        assert not is_preset_published(
+            "claude-code", "amd64", "firecracker", manifest=sample_manifest
+        )
+
+    def test_accepts_arbitrary_preset_string(
+        self,
+        sample_manifest: dict[tuple[Preset, Arch, Vmm], PublishedImage],
+    ) -> None:
+        # Presets that aren't in the Preset literal must just return False, not
+        # raise — the CLI passes user-typed preset names straight through.
+        assert not is_preset_published(
+            "totally-made-up", "amd64", "firecracker", manifest=sample_manifest
+        )
+
+    def test_empty_manifest_returns_false(self) -> None:
+        assert not is_preset_published("codex", "amd64", "firecracker", manifest={})
+
+    def test_default_manifest_used_when_not_overridden(self) -> None:
+        # Cross-check against the bundled MANIFEST: at least one of its entries
+        # must report True, and a guaranteed-missing tuple must report False.
+        if not MANIFEST:
+            pytest.skip("default manifest is empty in this release")
+        preset, arch, vmm = next(iter(MANIFEST))
+        assert is_preset_published(preset, arch, vmm)
+        assert not is_preset_published("definitely-not-a-real-preset", arch, vmm)
 
 
 class TestToImageSource:
@@ -376,12 +429,17 @@ class TestZstdDecompression:
         entry, kernel_bytes, rootfs_zst, rootfs_plain = compressed_entry
         manifest = {(entry.preset, entry.arch, entry.vmm): entry}
 
-        # Pre-populate the cache: compressed file + decompressed sibling.
+        # Pre-populate the cache: compressed file + decompressed sibling +
+        # the SHA sidecar that keys the decompressed file to the .zst's
+        # SHA. Without the sidecar matching the manifest's rootfs_sha256,
+        # ensure_published_image re-decompresses (intended behavior — see
+        # the cache-invalidation comment in published.py).
         image_dir = tmp_path / cache_name(entry.preset, entry.arch, entry.vmm, "0.0.13")
         image_dir.mkdir(parents=True)
         (image_dir / "vmlinux.bin").write_bytes(kernel_bytes)
         (image_dir / "rootfs.ext4.zst").write_bytes(rootfs_zst)
         (image_dir / "rootfs.ext4").write_bytes(rootfs_plain)
+        (image_dir / "rootfs.ext4.from-sha256").write_text(entry.rootfs_sha256)
 
         with patch("smolvm.images.published._decompress_zstd") as mock_decompress:
             local = ensure_published_image(
@@ -396,6 +454,42 @@ class TestZstdDecompression:
             mock_get.assert_not_called()
 
         assert local.rootfs_path.read_bytes() == rootfs_plain
+
+    @patch("smolvm.images.manager.requests.get")
+    def test_decompression_reruns_when_zst_sha_changes(
+        self,
+        mock_get: MagicMock,
+        compressed_entry: tuple[PublishedImage, bytes, bytes, bytes],
+        tmp_path: Path,
+    ) -> None:
+        """A refreshed .zst (different SHA) must re-decompress, not silently
+        serve the stale .ext4 from the previous SHA. The bug this guards
+        against: the openclaw rootfs uid bake regression hid behind a
+        cached decompressed .ext4 even after the .zst was re-fetched."""
+        entry, kernel_bytes, rootfs_zst, rootfs_plain = compressed_entry
+        manifest = {(entry.preset, entry.arch, entry.vmm): entry}
+
+        image_dir = tmp_path / cache_name(entry.preset, entry.arch, entry.vmm, "0.0.13")
+        image_dir.mkdir(parents=True)
+        (image_dir / "vmlinux.bin").write_bytes(kernel_bytes)
+        (image_dir / "rootfs.ext4.zst").write_bytes(rootfs_zst)
+        (image_dir / "rootfs.ext4").write_bytes(rootfs_plain)
+        # Sidecar from a PREVIOUS rootfs SHA (not the one in `entry`).
+        (image_dir / "rootfs.ext4.from-sha256").write_text("0" * 64)
+
+        with patch("smolvm.images.published._decompress_zstd") as mock_decompress:
+            ensure_published_image(
+                entry.preset,
+                entry.arch,
+                entry.vmm,
+                cache_dir=tmp_path,
+                manifest=manifest,
+                version="0.0.13",
+            )
+            mock_decompress.assert_called_once()
+            mock_get.assert_not_called()
+
+        assert (image_dir / "rootfs.ext4.from-sha256").read_text().strip() == entry.rootfs_sha256
 
     @patch("smolvm.images.manager.requests.get")
     def test_uncompressed_rootfs_url_skips_decompression_path(

@@ -30,7 +30,13 @@ on:
         type: string
         default: ""
   workflow_run:
-    workflows: ["Build QEMU Kernel", "Build Published Images"]
+    # NB: these are matched by the upstream workflow's `name:` field (the
+    # display name), NOT the YAML filename. Keep them in sync with
+    # build-microvm-kernel.yml (`name: Build microvm Kernel`) and
+    # build-published-images.yml (`name: Build Published Images`). Renaming
+    # either workflow's display name without updating this list silently
+    # disables the smoke gate.
+    workflows: ["Build microvm Kernel", "Build Published Images"]
     types:
       - completed
     branches:
@@ -92,7 +98,7 @@ jobs:
           mkdir -p smoke
           gh release download "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --pattern "vmlinux-${ARCH}-qemu.bin" \
+              --pattern "vmlinux-${ARCH}.image" \
               -D smoke
 
       - name: Download rootfs (openclaw)
@@ -161,7 +167,7 @@ jobs:
           fi
           sudo $QEMU \
               $MACHINE -smp 2 -m 2048 \
-              -kernel smoke/vmlinux-${ARCH}-qemu.bin \
+              -kernel smoke/vmlinux-${ARCH}.image \
               -drive file=smoke/rootfs.raw,if=none,id=root,format=raw \
               -device virtio-blk-pci,drive=root \
               -drive file=smoke/seed.iso,if=none,id=seed,format=raw,readonly=on \
