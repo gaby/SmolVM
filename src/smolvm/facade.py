@@ -42,6 +42,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from smolvm._naming import generate_sandbox_name
 from smolvm.env import inject_env_vars, read_env_vars, remove_env_vars
@@ -87,10 +88,13 @@ _LOCAL_FORWARD_MAX_PORT_ATTEMPTS = 10
 _AUTO_CONFIG_DEFAULT_MEM_SIZE_MIB = {
     GuestOS.ALPINE: 512,
     GuestOS.UBUNTU: 1024,
+    GuestOS.WINDOWS: 4096,
 }
 _AUTO_CONFIG_DEFAULT_DISK_SIZE_MIB = {
     GuestOS.ALPINE: 512,
     GuestOS.UBUNTU: 2048,
+    # WINDOWS: not used. The Windows path always supplies a pre-built
+    # qcow2 in Phase 1, so we don't size or grow a disk for it.
 }
 _UBUNTU_CURRENT_RELEASE_DATE = "20260406"
 # Ubuntu cloud-images rootfs URLs. Post-0.0.14a0 we no longer fetch Ubuntu's
@@ -315,6 +319,106 @@ def _build_auto_config_image_name(
     return image_name
 
 
+def _is_local_image(image: str) -> bool:
+    """Return True when *image* points at a host filesystem path.
+
+    Locals are absolute paths (``/abs/...``), tilde-relative paths
+    (``~/...``), bare relative paths, and ``file://`` URIs. Anything
+    with a non-file scheme (``s3://``, ``http(s)://``, etc.) is remote.
+    """
+    parsed = urlparse(image)
+    if parsed.scheme == "":
+        return True
+    return parsed.scheme == "file"
+
+
+def _build_local_image_config(
+    *,
+    image: str,
+    os_input: GuestOS | str | None,
+    backend: str | None,
+    memory: int | None,
+    ssh_key_path: str | None,
+    vm_name: str | None = None,
+    name_prefix: str = "sbx",
+) -> tuple[VMConfig, str | None]:
+    """Build a VMConfig from a host filesystem image (path or ``file://``).
+
+    Required when *os_input* is set — the file alone doesn't tell us
+    which OS is inside. For Phase 1, only Windows is meaningfully
+    supported on this path; Linux users still go through auto-config
+    or S3.
+
+    The qcow2 is used **shared** (no per-VM overlay clone), so concurrent
+    ``SmolVM(image=...)`` calls against the same baseline corrupt each
+    other. Document loudly when surfacing this path. Phase 2 introduces
+    qcow2 overlay cloning for Windows base images.
+    """
+    if os_input is None:
+        raise ValueError(
+            'Local images need os= (e.g. SmolVM(os="windows", image="..."))'
+            " so SmolVM knows which operating system is inside the file."
+        )
+    guest_os = _normalize_guest_os(os_input)
+    if guest_os is not GuestOS.WINDOWS:
+        raise ValueError(
+            f"Local images currently only support os='windows' (got "
+            f"os={guest_os.value!r}); use auto-config or an S3 image for Linux."
+        )
+
+    parsed = urlparse(image)
+    raw_path = parsed.path if parsed.scheme == "file" else image
+    local_path = Path(raw_path).expanduser().resolve()
+    if not local_path.is_file():
+        raise ValueError(
+            f"Local image {local_path} does not exist; pass image= as an "
+            "absolute path or file:// URI to an existing qcow2 file."
+        )
+
+    if backend is not None:
+        try:
+            resolved_backend = resolve_backend(backend)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if resolved_backend != BACKEND_QEMU:
+            raise ValueError(
+                f"Windows guests only run on the QEMU backend; drop "
+                f'backend={backend!r} or pass backend="qemu".'
+            )
+
+    if ssh_key_path is None:
+        from smolvm.utils import ensure_ssh_key
+
+        private_key, _ = ensure_ssh_key()
+        ssh_key_path = str(private_key)
+
+    resolved_vm_name = _resolve_vm_name(vm_name, prefix=name_prefix)
+
+    # Memory defaults follow the deep-dive recommendation: 4 GiB for
+    # Windows 11 (it runs at 2 GiB minimum but Edge + Defender want more).
+    default_mem_mib = _AUTO_CONFIG_DEFAULT_MEM_SIZE_MIB.get(GuestOS.WINDOWS, 4096)
+
+    config = VMConfig(
+        vm_id=resolved_vm_name,
+        vcpu_count=4,
+        memory=memory if memory is not None else default_mem_mib,
+        guest_os=GuestOS.WINDOWS,
+        kernel_path=None,
+        rootfs_path=local_path,
+        backend=BACKEND_QEMU,
+        boot_mode="firmware",
+        boot_args="",  # ignored in firmware mode
+        ssh_capable=False,  # Phase 1: SSH-into-Windows is Phase 2
+        disk_mode="shared",  # Phase 1: no overlay cloning for Windows qcow2s
+    )
+    logger.info(
+        "Configured Windows VM from local image: %s (image=%s)",
+        resolved_vm_name,
+        local_path,
+    )
+    return config, ssh_key_path
+
+
 def _build_s3_image_config(
     *,
     image: str,
@@ -421,6 +525,15 @@ def _build_auto_config(
 
     resolved_backend = resolve_backend(backend)
     resolved_os = _normalize_guest_os(os or _default_guest_os_for_backend(resolved_backend))
+    if resolved_os is GuestOS.WINDOWS:
+        # Auto-config builds a Linux SSH-ready VM from a built or downloaded
+        # base image; Windows has no equivalent path because we don't ship a
+        # base qcow2. The user must supply their own pre-installed image.
+        raise ValueError(
+            "Windows guests need a pre-installed disk image; pass "
+            'image="/path/to/win11.qcow2" (see '
+            "docs/deep-dive/windows-guest-qemu.md to build one)."
+        )
     resolved_ssh_key_path, public_key_path = _resolve_auto_config_public_key(ssh_key_path)
     public_key_value = public_key_path.read_text().strip()
 
@@ -654,19 +767,43 @@ class SmolVM:
         if image is not None and (config is not None or vm_id is not None):
             raise ValueError("image cannot be combined with config or vm_id.")
 
-        if image is not None and os is not None:
+        # Local images (file:// URIs and absolute / ~ paths) need os= to be
+        # set since the file alone doesn't self-identify. S3 images carry
+        # their own OS info in the manifest, so os= would conflict.
+        if image is not None and os is not None and not _is_local_image(image):
             raise ValueError(
-                "image and os are mutually exclusive — the image already "
-                "defines the operating system."
+                "image and os are mutually exclusive for S3 images (the "
+                "manifest already names the OS); drop one of them."
             )
 
         if (config is not None or vm_id is not None) and (
             memory is not None or disk_size is not None or os is not None
         ):
             raise ValueError(
-                "memory, disk_size, and os can only be set when both "
-                "config and vm_id are omitted (auto-config mode)."
+                "memory, disk_size, and os only apply in auto-config mode; "
+                "drop them or drop config=/vm_id=."
             )
+
+        # Phase 1 Windows guest scope locks. Each is intentionally narrow
+        # so misconfigurations fail fast with a plain-English message
+        # before we burn time materializing rootfs / firmware.
+        if os is not None and _normalize_guest_os(os) is GuestOS.WINDOWS:
+            if image is None:
+                raise ValueError(
+                    "Windows guests need a pre-installed disk image; pass "
+                    'image="/path/to/win11.qcow2" (see '
+                    "docs/deep-dive/windows-guest-qemu.md to build one)."
+                )
+            if mounts:
+                raise ValueError(
+                    "Workspace mounts (mounts=) are not yet supported for "
+                    "Windows guests in this release; drop the mounts= arg."
+                )
+            if internet_settings is not None:
+                raise ValueError(
+                    "Egress controls (internet_settings=) are not yet "
+                    "supported for Windows guests; drop the internet_settings= arg."
+                )
 
         # Workspace mounts currently require the QEMU backend (virtio-9p).
         # When no backend was pinned and mounts were requested — either via
@@ -684,14 +821,26 @@ class SmolVM:
             backend = BACKEND_QEMU
 
         if image is not None:
-            # S3 image mode
-            logger.info("Resolving image from %s...", image)
-            config, ssh_key_path = _build_s3_image_config(
-                image=image,
-                backend=backend,
-                memory=memory,
-                ssh_key_path=ssh_key_path,
-            )
+            if _is_local_image(image):
+                # Local image mode (file:// or path) — needs os= to
+                # disambiguate; the file alone doesn't self-identify.
+                logger.info("Resolving local image at %s...", image)
+                config, ssh_key_path = _build_local_image_config(
+                    image=image,
+                    os_input=os,
+                    backend=backend,
+                    memory=memory,
+                    ssh_key_path=ssh_key_path,
+                )
+            else:
+                # S3 image mode
+                logger.info("Resolving image from %s...", image)
+                config, ssh_key_path = _build_s3_image_config(
+                    image=image,
+                    backend=backend,
+                    memory=memory,
+                    ssh_key_path=ssh_key_path,
+                )
         elif config is None and vm_id is None:
             # Auto-configuration mode
             logger.info("No config provided; auto-configuring standard SSH VM...")
