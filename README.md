@@ -23,16 +23,56 @@ Each microVM boots in milliseconds, runs any code or software you throw at it, p
 
 <br>
 
-| Feature | What it means for you |
-| :--- | :--- |
-| **[Sub-second boot](#performance)** | Your agent has a running VM before the API call returns (~500 ms). |
-| **[Hardware&nbsp;isolation](#security)** &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Each sandbox runs in its own virtual machine with hardware-level separation. Untrusted code can't escape or access your system. |
-| **[Network controls](#network-controls)** | Lock down egress to specific domains so agents can't call home. |
-| **[Browser sandbox](#browser-sandbox)** | Agents get a full browser they can see and control in real time. |
-| **[File sharing](#mount-host-directories)** | Share local directories with the sandbox, read-only or writable. |
-| **Snapshots** | Pause a sandbox and resume it later with everything intact. |
-| **[Coding agents](#coding-agents)** | One command to launch a sandbox with Claude Code, Codex, or Pi pre-installed. |
-| **[OpenClaw](examples/openclaw.py)** | Run GUI Linux apps (IDEs, browsers, tools) inside an isolated sandbox. |
+<table>
+<tr>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/zap.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Sub-second boot</strong></p>
+<p>Your agent has a running VM before the API call returns (~500&nbsp;ms). No waiting for provisioning or image pulls.</p>
+<p><a href="#performance">Read more →</a></p>
+</td>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/shield.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Hardware isolation</strong></p>
+<p>Each sandbox runs in its own virtual machine with hardware-level separation. Untrusted code can't escape or access your host.</p>
+<p><a href="#security">Read more →</a></p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/network.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Network controls</strong></p>
+<p>Lock down egress to specific domains so agents can't call home or exfiltrate data.</p>
+<p><a href="#network-controls">Read more →</a></p>
+</td>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/monitor.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Browser sandbox</strong></p>
+<p>Give agents a full browser inside the sandbox. Navigate, click, fill forms, and watch it live in your own browser.</p>
+<p><a href="#browser-sandbox">Read more →</a></p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/folder.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>File sharing</strong></p>
+<p>Share local directories with the sandbox, read-only or writable. Agents work on your real codebase without copying files around.</p>
+<p><a href="#mount-host-directories">Read more →</a></p>
+</td>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/camera.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Snapshots</strong></p>
+<p>Pause a sandbox and resume it later with everything intact — memory, disk, and running processes.</p>
+<p><a href="https://docs.celesto.ai/smolvm/features/snapshots">Read more →</a></p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/bot.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>Coding agents</strong></p>
+<p>One command to launch a sandbox with Claude Code, Codex, or Pi pre-installed and git credentials forwarded.</p>
+<p><a href="#coding-agents">Read more →</a></p>
+</td>
+<td width="50%" valign="top">
+<p><img src="https://api.iconify.design/lucide/app-window-mac.svg?color=%236e7681" width="24" height="24" align="absmiddle" alt=""> <strong>OpenClaw</strong></p>
+<p>Run GUI Linux apps — IDEs, browsers, design tools — inside an isolated sandbox you can stream to your screen.</p>
+<p><a href="examples/openclaw.py">See the example →</a></p>
+</td>
+</tr>
+</table>
 
 
 ## Use cases
