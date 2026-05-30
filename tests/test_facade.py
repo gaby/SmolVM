@@ -221,7 +221,6 @@ class TestVMInit:
         created_config = mock_sdk.create.call_args[0][0]
         assert created_config.ssh_public_key == pubkey_value
 
-
     @patch("smolvm.utils.ensure_ssh_key")
     def test_autoconfigure_ubuntu_rejects_undersized_disk(
         self,
@@ -243,6 +242,101 @@ class TestVMInit:
 
         with pytest.raises(ValueError, match="disk_size_mib >= 2048"):
             _build_auto_config(os="ubuntu", backend="qemu", disk_size_mib=512)
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.images.published.is_preset_published", return_value=True)
+    @patch("smolvm.utils.ensure_ssh_key")
+    def test_autoconfigure_ubuntu_firecracker_uses_published_rootfs(
+        self,
+        mock_ensure_ssh_key: MagicMock,
+        _mock_is_published: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Ubuntu on firecracker pulls the published raw-ext4 image and boots
+        it direct-kernel (no qcow2, no cloud-init seed)."""
+        from smolvm.images.manager import LocalImage
+
+        priv = tmp_path / "id_ed25519"
+        pub = tmp_path / "id_ed25519.pub"
+        priv.touch()
+        pub.write_text("ssh-ed25519 AAAAExampleKey test@host\n")
+        mock_ensure_ssh_key.return_value = (priv, pub)
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_ensure_published.return_value = LocalImage(
+            name="ubuntu-fc", kernel_path=kernel, rootfs_path=rootfs
+        )
+
+        config, _ = _build_auto_config(os="ubuntu", backend="firecracker")
+
+        # Resolved the bare-Ubuntu published image for the firecracker vmm.
+        preset, _arch, vmm, os_ = mock_ensure_published.call_args.args
+        assert (preset, vmm, os_) == ("ubuntu", "firecracker", "ubuntu")
+
+        # Raw-ext4 direct-kernel boot, SSH key via cmdline, no cloud-init seed.
+        assert config.backend == "firecracker"
+        assert config.rootfs_path == rootfs
+        assert config.kernel_path == kernel
+        assert config.boot_mode == "direct_kernel"
+        assert "init=/init" in config.boot_args
+        assert config.ssh_public_key == "ssh-ed25519 AAAAExampleKey test@host"
+        assert not config.extra_drives
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.images.published.is_preset_published", return_value=False)
+    @patch("smolvm.utils.ensure_ssh_key")
+    def test_autoconfigure_ubuntu_firecracker_unpublished_is_clear(
+        self,
+        mock_ensure_ssh_key: MagicMock,
+        _mock_is_published: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """When no bare-Ubuntu row is published, fail with a single-line recovery
+        command that names the sandbox — without invoking the downloader, so
+        genuine download/integrity errors stay a separate signal."""
+        from smolvm.exceptions import SmolVMError
+
+        priv = tmp_path / "id_ed25519"
+        pub = tmp_path / "id_ed25519.pub"
+        priv.touch()
+        pub.write_text("ssh-ed25519 AAAAExampleKey test@host\n")
+        mock_ensure_ssh_key.return_value = (priv, pub)
+
+        with pytest.raises(
+            SmolVMError,
+            match="smolvm create --name myvm --os ubuntu --backend qemu",
+        ):
+            _build_auto_config(os="ubuntu", backend="firecracker", vm_name="myvm")
+        mock_ensure_published.assert_not_called()
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.images.published.is_preset_published", return_value=True)
+    @patch("smolvm.utils.ensure_ssh_key")
+    def test_autoconfigure_ubuntu_firecracker_download_error_propagates(
+        self,
+        mock_ensure_ssh_key: MagicMock,
+        _mock_is_published: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A published-but-broken image (download / SHA-256 failure) surfaces as
+        the original ImageError, not the friendly 'not published' message."""
+        from smolvm.exceptions import ImageError
+
+        priv = tmp_path / "id_ed25519"
+        pub = tmp_path / "id_ed25519.pub"
+        priv.touch()
+        pub.write_text("ssh-ed25519 AAAAExampleKey test@host\n")
+        mock_ensure_ssh_key.return_value = (priv, pub)
+
+        mock_ensure_published.side_effect = ImageError("rootfs SHA-256 mismatch")
+        with pytest.raises(ImageError, match="SHA-256 mismatch"):
+            _build_auto_config(os="ubuntu", backend="firecracker")
 
     def test_firmware_boot_vmconfig_rejects_non_qemu_backend(
         self,
@@ -629,16 +723,14 @@ class TestVMLocalImageParam:
         """Workspace mounts on Windows guests are Phase 2 scope."""
         disk = tmp_path / "win11.qcow2"
         disk.touch()
-        with pytest.raises(ValueError, match="mounts.* not yet supported for Windows"):
+        with pytest.raises(ValueError, match=r"mounts.* not yet supported for Windows"):
             SmolVM(os="windows", image=str(disk), mounts=["/host/path"])
 
     def test_windows_with_internet_settings_rejected(self, tmp_path: Path) -> None:
         """Egress allowlist on Windows guests is Phase 2 scope."""
         disk = tmp_path / "win11.qcow2"
         disk.touch()
-        with pytest.raises(
-            ValueError, match="internet_settings.* not yet supported for Windows"
-        ):
+        with pytest.raises(ValueError, match=r"internet_settings.* not yet supported for Windows"):
             SmolVM(
                 os="windows",
                 image=str(disk),
@@ -698,9 +790,7 @@ class TestVMLocalImageParam:
         assert call_kwargs["os_input"] == "windows"
         assert vm.vm_id == "vm-win"
 
-    def test_build_local_image_config_produces_windows_vmconfig(
-        self, tmp_path: Path
-    ) -> None:
+    def test_build_local_image_config_produces_windows_vmconfig(self, tmp_path: Path) -> None:
         """_build_local_image_config returns a properly-shaped Windows VMConfig."""
         from smolvm.facade import _build_local_image_config
 
@@ -729,9 +819,7 @@ class TestVMLocalImageParam:
         assert config.memory == 4096  # Windows default
         assert ssh_key == str(key)
 
-    def test_build_local_image_config_rejects_non_qemu_backend(
-        self, tmp_path: Path
-    ) -> None:
+    def test_build_local_image_config_rejects_non_qemu_backend(self, tmp_path: Path) -> None:
         """Firecracker + Windows = clear error before VMConfig validation."""
         from smolvm.facade import _build_local_image_config
 
@@ -952,8 +1040,7 @@ class TestVMUploadDownloadWindows:
         assert guest_path == "C:\\Users\\celesto\\hello.ps1"
 
         ssh.run.assert_called_once_with(
-            "New-Item -ItemType Directory -Force -Path "
-            "'C:\\Users\\celesto' | Out-Null",
+            "New-Item -ItemType Directory -Force -Path 'C:\\Users\\celesto' | Out-Null",
             timeout=30,
             shell="login",  # SSHClient wraps with powershell.exe -NoProfile -Command
         )
