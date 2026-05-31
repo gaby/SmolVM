@@ -27,6 +27,7 @@ from smolvm.types import (
     NetworkConfig,
     SnapshotArtifacts,
     SnapshotInfo,
+    SnapshotType,
     VMConfig,
     VMInfo,
     VMState,
@@ -384,9 +385,7 @@ def test_delete_qemu_snapshot_rejects_active_restored_vm(
         qemu_smol_vm.delete_snapshot("snap-001")
 
 
-def test_snapshot_rejected_for_windows_guests(
-    qemu_smol_vm: SmolVMManager, tmp_path: Path
-) -> None:
+def test_snapshot_rejected_for_windows_guests(qemu_smol_vm: SmolVMManager, tmp_path: Path) -> None:
     """Windows snapshot/restore is locked out in Phase 1 with a clear message."""
     rootfs = tmp_path / "win11.qcow2"
     rootfs.touch()
@@ -412,3 +411,49 @@ def test_snapshot_rejected_for_windows_guests(
     )
     with pytest.raises(SmolVMError, match="Windows guests"):
         qemu_smol_vm._ensure_snapshot_supported(vm_info)
+
+
+def test_create_qemu_snapshot_defaults_to_full_type(
+    qemu_smol_vm: SmolVMManager,
+    qemu_config: VMConfig,
+    tmp_path: Path,
+) -> None:
+    """QEMU snapshots default to full for self-contained restore."""
+    _running_qemu_vm(qemu_smol_vm, qemu_config, tmp_path)
+
+    with patch("smolvm.runtime.qemu.QMPClient") as mock_client_cls:
+        mock_client = _mock_qmp_client()
+        mock_client_cls.return_value = mock_client
+        snapshot = qemu_smol_vm.create_snapshot("vm001", snapshot_id="snap-full")
+
+    assert snapshot.snapshot_type is SnapshotType.FULL
+    assert qemu_smol_vm.state.get_snapshot("snap-full").snapshot_type is SnapshotType.FULL
+
+
+def test_create_qemu_diff_snapshot_records_type(
+    qemu_smol_vm: SmolVMManager,
+    qemu_config: VMConfig,
+    tmp_path: Path,
+) -> None:
+    """A diff QEMU snapshot records its type and takes the overlay copy path."""
+    _running_qemu_vm(qemu_smol_vm, qemu_config, tmp_path)
+
+    with (
+        patch("smolvm.runtime.qemu.QMPClient") as mock_client_cls,
+        patch.object(
+            QemuRuntimeAdapter,
+            "_copy_disk_overlay",
+            side_effect=lambda source, dest: dest.write_text(Path(source).read_text()),
+        ) as mock_overlay,
+    ):
+        mock_client = _mock_qmp_client()
+        mock_client_cls.return_value = mock_client
+        snapshot = qemu_smol_vm.create_snapshot(
+            "vm001", snapshot_id="snap-diff", snapshot_type=SnapshotType.DIFF
+        )
+
+    mock_overlay.assert_called_once()
+    persisted = qemu_smol_vm.state.get_snapshot("snap-diff")
+    assert snapshot.snapshot_type is SnapshotType.DIFF
+    assert persisted.snapshot_type is SnapshotType.DIFF
+    assert persisted.artifacts.disk_path.read_text() == "managed-qcow2"
