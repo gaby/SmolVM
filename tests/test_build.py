@@ -202,6 +202,91 @@ class TestImageBuilderLoopFs:
         assert mock_run_command.call_count == 3
 
 
+def _apk_installs_python3(dockerfile: str) -> bool:
+    """Return True if python3 is an actual `apk add` package, not just text.
+
+    Joins backslash-continued lines so a multi-line `apk add ... \\ python3`
+    counts, but a bare comment mentioning python3 does not.
+    """
+    joined = dockerfile.replace("\\\n", " ")
+    for line in joined.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "apk add" in stripped and "python3" in stripped.split("apk add", 1)[1]:
+            return True
+    return False
+
+
+class TestAgentRuntimeBakedIntoImages:
+    """Every SSH-capable recipe must install python3.
+
+    The vsock guest agent (baked into every image by ``_do_build``) is a
+    python3 script that ``/init`` only launches ``if command -v python3``.
+    A recipe that omits python3 silently disables the agent, which makes the
+    host pay the full ``_VSOCK_AUTO_PROBE_TIMEOUT`` before falling back to SSH.
+    This locks the runtime in so the two recipes can't drift again.
+    """
+
+    @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
+    @patch.object(ImageBuilder, "check_docker", return_value=True)
+    @patch.object(ImageBuilder, "_do_build")
+    def test_build_alpine_ssh_key_installs_python3(
+        self,
+        mock_do_build: MagicMock,
+        _mock_check_docker: MagicMock,
+        _mock_host_arch_key: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        builder = ImageBuilder(cache_dir=tmp_path / "images")
+
+        def _fake_do_build(
+            name: str,
+            dockerfile_content: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            assert _apk_installs_python3(dockerfile_content), (
+                "build_alpine_ssh_key must install python3 (in an apk add) so "
+                "the vsock guest agent can run; without it the host pays an 8s "
+                "vsock probe."
+            )
+            args[2].touch()  # kernel_path
+            args[3].touch()  # rootfs_path
+
+        mock_do_build.side_effect = _fake_do_build
+
+        builder.build_alpine_ssh_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test"
+        )
+
+    @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
+    @patch.object(ImageBuilder, "check_docker", return_value=True)
+    @patch.object(ImageBuilder, "_do_build")
+    def test_build_alpine_ssh_installs_python3(
+        self,
+        mock_do_build: MagicMock,
+        _mock_check_docker: MagicMock,
+        _mock_host_arch_key: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        builder = ImageBuilder(cache_dir=tmp_path / "images")
+
+        def _fake_do_build(
+            name: str,
+            dockerfile_content: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            assert _apk_installs_python3(dockerfile_content)
+            args[2].touch()
+            args[3].touch()
+
+        mock_do_build.side_effect = _fake_do_build
+
+        builder.build_alpine_ssh()
+
+
 class TestBrowserImageBuilder:
     """Tests for browser image builder entrypoints."""
 
