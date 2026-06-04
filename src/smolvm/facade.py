@@ -2901,8 +2901,17 @@ modprobe 9pnet_virtio""".strip()
             "-L",
             f"127.0.0.1:{host_port}:127.0.0.1:{guest_port}",
         ]
-        if self._ssh_key_path:
-            cmd.extend(["-i", self._ssh_key_path])
+        key_path = self._ssh_key_path
+        if key_path is None:
+            from smolvm.utils import ensure_ssh_key
+
+            try:
+                default_key, _ = ensure_ssh_key()
+                key_path = str(default_key)
+            except Exception:
+                pass
+        if key_path:
+            cmd.extend(["-i", key_path])
         cmd.append(f"{self._ssh_user}@{ssh_host}")
 
         try:
@@ -2911,6 +2920,7 @@ modprobe 9pnet_virtio""".strip()
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
         except FileNotFoundError:
             raise SmolVMError(
