@@ -28,6 +28,7 @@ from smolvm.facade import SmolVM, _build_auto_config
 from smolvm.images import BootImage, DirectKernelBoot, FirmwareBoot
 from smolvm.images.cloud_init import seed_cache_key
 from smolvm.types import GuestOS, PortForwardConfig, VMConfig, VMState, VsockConfig
+from smolvm.vm import SmolVMManager
 
 
 @pytest.fixture
@@ -649,6 +650,7 @@ class TestFromBootImage:
         assert created_config.vcpu_count == 2
         assert created_config.memory == 2048
         assert created_config.backend == "qemu"
+        assert created_config.rootfs_format == "raw-ext4"
         assert created_config.qemu_network == "tap"
         assert created_config.comm_channel == "vsock"
         assert created_config.vsock == VsockConfig(guest_cid=5)
@@ -765,11 +767,19 @@ class TestFromBootImage:
         with pytest.raises(ValueError, match="smolvm create --name vm-mismatch --help"):
             SmolVM.from_image(image, vm_id="vm-mismatch", backend="firecracker")
 
-    def test_from_image_rejects_resize_knobs_until_phase_five(self, tmp_path: Path) -> None:
+    @patch("smolvm.facade.SmolVMManager")
+    def test_from_image_passes_resize_knobs(
+        self,
+        mock_sdk_cls: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         rootfs = tmp_path / "rootfs.ext4"
         kernel = tmp_path / "vmlinux.image"
         rootfs.touch()
         kernel.touch()
+        mock_sdk = MagicMock()
+        mock_sdk.create.return_value = MagicMock(vm_id="vm-resize", status=VMState.CREATED)
+        mock_sdk_cls.return_value = mock_sdk
         image = BootImage(
             name="resize",
             rootfs_path=rootfs,
@@ -778,10 +788,55 @@ class TestFromBootImage:
             boot_args="console=ttyS0 root=/dev/vda rw",
         )
 
-        with pytest.raises(SmolVMError, match="disk resizing is not implemented"):
-            SmolVM.from_image(image, vm_id="vm-resize", disk_size_mb=4096)
-        with pytest.raises(SmolVMError, match="disk resizing is not implemented"):
-            SmolVM.from_image(image, vm_id="vm-grow", grow_filesystem=True)
+        SmolVM.from_image(
+            image,
+            vm_id="vm-resize",
+            disk_size_mb=4096,
+            grow_filesystem=True,
+        )
+
+        created_config = mock_sdk.create.call_args.args[0]
+        assert created_config.rootfs_format == "raw-ext4"
+        assert created_config.disk_size_mib == 4096
+        assert created_config.grow_filesystem is True
+
+    def test_from_image_qemu_raw_grow_uses_raw_managed_disk(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """from_image should drive the QEMU raw-ext4 grow materialization path."""
+        rootfs = tmp_path / "rootfs.img"
+        kernel = tmp_path / "vmlinux.image"
+        rootfs.write_bytes(b"\0" * (1024 * 1024))
+        kernel.touch()
+        image = BootImage(
+            name="raw-grow",
+            rootfs_path=rootfs,
+            rootfs_format="raw-ext4",
+            kernel_path=kernel,
+            boot_args="console=ttyS0 root=/dev/vda rw",
+            backend="qemu",
+        )
+        data_dir = tmp_path / "data"
+
+        with patch.object(SmolVMManager, "_grow_raw_ext4_filesystem") as mock_grow:
+            vm = SmolVM.from_image(
+                image,
+                vm_id="vm-from-image-grow",
+                data_dir=data_dir,
+                backend="qemu",
+                disk_size_mb=2,
+                grow_filesystem=True,
+            )
+
+        try:
+            expected_disk = data_dir / "disks" / "vm-from-image-grow.ext4"
+            assert vm.info.config.rootfs_path == expected_disk
+            assert vm.info.config.rootfs_format == "raw-ext4"
+            assert expected_disk.stat().st_size == 2 * 1024 * 1024
+            mock_grow.assert_called_once_with(expected_disk, "vm-from-image-grow")
+        finally:
+            vm.delete()
 
     def test_from_image_rejects_tap_port_forwards(self, tmp_path: Path) -> None:
         rootfs = tmp_path / "rootfs.ext4"

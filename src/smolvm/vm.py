@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import platform
@@ -32,7 +33,8 @@ import signal
 import socket
 import subprocess
 import time
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -44,6 +46,7 @@ from smolvm.exceptions import (
     SmolVMError,
     SnapshotAlreadyExistsError,
     SnapshotNotFoundError,
+    VMAlreadyExistsError,
     VMNotFoundError,
 )
 from smolvm.host.manager import HostCapability, HostManager
@@ -70,6 +73,7 @@ from smolvm.storage import (
 from smolvm.types import (
     GuestOS,
     NetworkConfig,
+    RootfsFormat,
     SnapshotInfo,
     SnapshotType,
     VMConfig,
@@ -88,6 +92,7 @@ DEFAULT_SOCKET_DIR = Path("/tmp")
 
 # Backend-specific defaults
 QEMU_GUEST_IP = "10.0.2.15"
+_MIB = 1024 * 1024
 
 
 def _linux_os_release_ids(os_release_path: Path = Path("/etc/os-release")) -> set[str]:
@@ -433,10 +438,148 @@ class SmolVMManager:
         """Resolve the runtime adapter for a persisted snapshot."""
         return self._runtime_adapter_for_backend(snapshot.backend)
 
-    def _instance_disk_path(self, vm_id: str, backend: str) -> Path:
-        """Return the backend-specific managed isolated disk path for a VM ID."""
-        suffix = ".qcow2" if backend == BACKEND_QEMU else ".ext4"
+    def _instance_disk_path(
+        self,
+        vm_id: str,
+        backend: str,
+        rootfs_format: RootfsFormat | None = None,
+    ) -> Path:
+        """Return the managed isolated disk path for a VM ID and disk format."""
+        suffix = ".qcow2" if backend == BACKEND_QEMU and rootfs_format != "raw-ext4" else ".ext4"
         return self.disk_dir / f"{vm_id}{suffix}"
+
+    @staticmethod
+    def _qemu_materialized_rootfs_format(config: VMConfig) -> RootfsFormat:
+        """Return the on-disk format QEMU should create for an isolated rootfs."""
+        if config.effective_rootfs_format == "raw-ext4" and config.grow_filesystem:
+            return "raw-ext4"
+        return "qcow2"
+
+    def _materialized_rootfs_format(self, config: VMConfig, backend: str) -> RootfsFormat:
+        """Return the format of the per-VM disk after materialization."""
+        if backend == BACKEND_QEMU:
+            return self._qemu_materialized_rootfs_format(config)
+        return config.effective_rootfs_format
+
+    def _managed_disk_path_for_create(self, config: VMConfig, backend: str) -> Path | None:
+        """Return the deterministic managed disk path a create may materialize."""
+        if config.disk_mode == "shared":
+            return None
+        return self._instance_disk_path(
+            config.vm_id,
+            backend,
+            self._materialized_rootfs_format(config, backend),
+        )
+
+    def _cleanup_unpersisted_managed_disk(
+        self,
+        managed_disk_path: Path | None,
+        *,
+        existed_before: bool,
+    ) -> None:
+        """Remove a managed disk created before the VM row was persisted."""
+        if managed_disk_path is None or existed_before:
+            return
+        if not (managed_disk_path.is_file() or managed_disk_path.is_symlink()):
+            return
+        try:
+            managed_disk_path.relative_to(self.disk_dir)
+        except ValueError:
+            logger.warning(
+                "Refusing to clean up managed disk outside disk dir: %s",
+                managed_disk_path,
+            )
+            return
+        with suppress(OSError):
+            managed_disk_path.unlink()
+
+    def _cleanup_unpersisted_firmware(self, vm_id: str, *, existed_before: bool) -> None:
+        """Remove firmware state created before the VM row was persisted."""
+        if existed_before:
+            return
+        firmware_state = self.data_dir / "firmware" / vm_id
+        if firmware_state.exists():
+            with suppress(OSError, shutil.Error):
+                shutil.rmtree(firmware_state)
+
+    def _backup_existing_managed_disk(self, managed_disk_path: Path) -> list[tuple[Path, Path]]:
+        """Copy an existing managed disk so failed create-time resize can roll back."""
+        paths = [managed_disk_path, *self._managed_disk_backing_sidecars(managed_disk_path)]
+        backups: list[tuple[Path, Path]] = []
+        for path in paths:
+            if not path.exists():
+                continue
+            backup_path = path.with_name(f"{path.name}.create-backup-{uuid4().hex}")
+            self._copy_with_reflink(path, backup_path)
+            backups.append((path, backup_path))
+        return backups
+
+    @staticmethod
+    def _restore_existing_managed_disk_backup(backups: list[tuple[Path, Path]]) -> None:
+        """Restore managed disk backups created by :meth:`_backup_existing_managed_disk`."""
+        for original_path, backup_path in backups:
+            if backup_path.exists():
+                os.replace(backup_path, original_path)
+
+    @staticmethod
+    def _discard_existing_managed_disk_backup(backups: list[tuple[Path, Path]]) -> None:
+        """Remove no-longer-needed managed disk backups."""
+        for _original_path, backup_path in backups:
+            with suppress(OSError):
+                backup_path.unlink()
+
+    def _ensure_vm_id_available(self, vm_id: str) -> None:
+        """Fail before disk work if a VM with this ID already exists."""
+        try:
+            self.state.get_vm(vm_id)
+        except VMNotFoundError:
+            return
+        raise VMAlreadyExistsError(vm_id)
+
+    def _acquire_vm_create_lock(self, vm_id: str) -> tuple[Any | None, TextIO | None]:
+        """Acquire the create-time disk lock for one VM ID."""
+        try:
+            import fcntl
+        except ImportError:
+            # SmolVM currently targets POSIX hosts. If fcntl is unavailable,
+            # keep the old single-process behavior rather than failing import.
+            return None, None
+
+        lock_dir = self.data_dir / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = (lock_dir / f"{vm_id}.create.lock").open("w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        return fcntl, lock_file
+
+    @staticmethod
+    def _release_vm_create_lock(lock: tuple[Any | None, TextIO | None]) -> None:
+        """Release a lock acquired by :meth:`_acquire_vm_create_lock`."""
+        fcntl_module, lock_file = lock
+        if lock_file is None:
+            return
+        try:
+            if fcntl_module is not None:
+                fcntl_module.flock(lock_file.fileno(), fcntl_module.LOCK_UN)
+        finally:
+            lock_file.close()
+
+    @contextmanager
+    def _vm_create_lock(self, vm_id: str) -> Iterator[None]:
+        """Serialize create-time disk mutation for one VM ID."""
+        lock = self._acquire_vm_create_lock(vm_id)
+        try:
+            yield
+        finally:
+            self._release_vm_create_lock(lock)
+
+    @asynccontextmanager
+    async def _async_vm_create_lock(self, vm_id: str) -> Iterator[None]:
+        """Async wrapper that acquires the file lock off the event loop."""
+        lock = await asyncio.to_thread(self._acquire_vm_create_lock, vm_id)
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(self._release_vm_create_lock, lock)
 
     @staticmethod
     def _restore_staging_disk_path(managed_disk_path: Path) -> Path:
@@ -452,13 +595,19 @@ class SmolVMManager:
         """Find an available ``qemu-img`` binary."""
         return which("qemu-img")
 
-    def _convert_qemu_managed_disk(self, source_path: Path, target_path: Path) -> None:
+    def _convert_qemu_managed_disk(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        source_format: str | None = None,
+    ) -> None:
         """Create a managed qcow2 disk for the QEMU backend (full copy)."""
         qemu_img = self._find_qemu_img_binary()
         if qemu_img is None:
             raise SmolVMError("QEMU backend requires qemu-img to materialize managed disks")
 
-        source_format = "qcow2" if source_path.suffix == ".qcow2" else "raw"
+        source_format = source_format or ("qcow2" if source_path.suffix == ".qcow2" else "raw")
         result = subprocess.run(
             [
                 str(qemu_img),
@@ -484,7 +633,13 @@ class SmolVMManager:
                 },
             )
 
-    def _create_qemu_overlay_disk(self, base_path: Path, overlay_path: Path) -> None:
+    def _create_qemu_overlay_disk(
+        self,
+        base_path: Path,
+        overlay_path: Path,
+        *,
+        backing_format: str | None = None,
+    ) -> None:
         """Create a thin qcow2 overlay backed by a shared base image.
 
         The overlay file is near-instant to create and consumes negligible disk
@@ -495,7 +650,7 @@ class SmolVMManager:
         if qemu_img is None:
             raise SmolVMError("QEMU backend requires qemu-img to create overlay disks")
 
-        base_format = "qcow2" if base_path.suffix == ".qcow2" else "raw"
+        base_format = backing_format or ("qcow2" if base_path.suffix == ".qcow2" else "raw")
         result = subprocess.run(
             [
                 str(qemu_img),
@@ -545,6 +700,181 @@ class SmolVMManager:
             # (e.g. macOS cp doesn't have this flag).
             shutil.copy2(source_path, target_path)
 
+    @staticmethod
+    def _ceil_mib(size_bytes: int) -> int:
+        """Return bytes rounded up to MiB."""
+        return (size_bytes + _MIB - 1) // _MIB
+
+    @staticmethod
+    def _resize_recovery(vm_id: str) -> str:
+        """Return a cleanup command for disk resize errors."""
+        return f"smolvm delete {vm_id}"
+
+    @staticmethod
+    def _ensure_disk_can_be_resized(config: VMConfig) -> None:
+        """Reject requests that would mutate a shared base image."""
+        if (config.disk_size_mib is not None or config.grow_filesystem) and (
+            config.disk_mode == "shared"
+        ):
+            raise SmolVMError(
+                f"Disk resizing needs an isolated disk for sandbox '{config.vm_id}'; set "
+                f"disk_mode='isolated', or run '{SmolVMManager._resize_recovery(config.vm_id)}'."
+            )
+
+    def _resize_materialized_rootfs(self, config: VMConfig) -> VMConfig:
+        """Resize/grow the materialized per-VM disk before boot."""
+        self._ensure_disk_can_be_resized(config)
+        if config.disk_size_mib is None and not config.grow_filesystem:
+            return config
+
+        if config.effective_rootfs_format == "qcow2":
+            if config.grow_filesystem:
+                raise SmolVMError(
+                    f"Filesystem growth for qcow2 disks is not supported for sandbox "
+                    f"'{config.vm_id}'; omit grow_filesystem, or run "
+                    f"'{self._resize_recovery(config.vm_id)}'."
+                )
+            if config.disk_size_mib is not None:
+                self._resize_qcow2_disk(config.rootfs_path, config.disk_size_mib, config.vm_id)
+            return config
+
+        self._resize_raw_ext4_disk(
+            config.rootfs_path,
+            target_mib=config.disk_size_mib,
+            grow_filesystem=config.grow_filesystem,
+            vm_id=config.vm_id,
+        )
+        return config
+
+    def _resize_raw_ext4_disk(
+        self,
+        disk_path: Path,
+        *,
+        target_mib: int | None,
+        grow_filesystem: bool,
+        vm_id: str,
+    ) -> None:
+        """Resize a raw ext4 disk file and optionally grow its filesystem."""
+        current_bytes = disk_path.stat().st_size
+        if target_mib is not None:
+            target_bytes = target_mib * _MIB
+            if target_bytes < current_bytes:
+                current_mib = self._ceil_mib(current_bytes)
+                raise SmolVMError(
+                    f"Requested disk size is smaller than the current disk for sandbox "
+                    f"'{vm_id}'; choose at least {current_mib} MiB, or run "
+                    f"'{self._resize_recovery(vm_id)}'."
+                )
+            if target_bytes > current_bytes:
+                logger.info(
+                    "Resizing raw ext4 disk for VM %s: %d -> %d MiB",
+                    vm_id,
+                    self._ceil_mib(current_bytes),
+                    target_mib,
+                )
+                with disk_path.open("r+b") as disk_file:
+                    disk_file.truncate(target_bytes)
+
+        if grow_filesystem:
+            self._grow_raw_ext4_filesystem(disk_path, vm_id)
+
+    def _grow_raw_ext4_filesystem(self, disk_path: Path, vm_id: str) -> None:
+        """Run e2fsck + resize2fs on a raw ext4 disk file."""
+        e2fsck = which("e2fsck")
+        resize2fs = which("resize2fs")
+        if e2fsck is None or resize2fs is None:
+            raise SmolVMError(
+                f"e2fsck and resize2fs are needed to grow the disk for sandbox '{vm_id}'; "
+                f"install e2fsprogs, or run '{self._resize_recovery(vm_id)}'."
+            )
+        self._run_resize_tool(
+            [str(e2fsck), "-fy", str(disk_path)],
+            "e2fsck",
+            vm_id,
+            allowed_returncodes={0, 1, 2, 3},
+        )
+        self._run_resize_tool([str(resize2fs), str(disk_path)], "resize2fs", vm_id)
+
+    def _run_resize_tool(
+        self,
+        command: list[str],
+        tool_name: str,
+        vm_id: str,
+        *,
+        allowed_returncodes: set[int] | None = None,
+    ) -> None:
+        """Run one resize helper and convert failures to SmolVMError."""
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        allowed = allowed_returncodes or {0}
+        if result.returncode not in allowed:
+            stderr = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise SmolVMError(
+                f"{tool_name} failed while resizing the disk for sandbox '{vm_id}'; run "
+                f"'{self._resize_recovery(vm_id)}'.",
+                {"stderr": stderr, "returncode": result.returncode},
+            )
+
+    def _qcow2_virtual_size_bytes(self, disk_path: Path, vm_id: str) -> int:
+        """Return qemu-img's virtual size for a qcow2/raw-backed overlay."""
+        qemu_img = self._find_qemu_img_binary()
+        if qemu_img is None:
+            raise SmolVMError(
+                f"qemu-img is needed to resize the disk for sandbox '{vm_id}'; "
+                f"{_qemu_install_hint()}"
+            )
+        result = subprocess.run(
+            [str(qemu_img), "info", "--output=json", str(disk_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SmolVMError(
+                f"qemu-img could not inspect the disk for sandbox '{vm_id}'; run "
+                f"'{self._resize_recovery(vm_id)}'.",
+                {"stderr": result.stderr.strip()},
+            )
+        try:
+            info = json.loads(result.stdout)
+            return int(info["virtual-size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SmolVMError(
+                f"qemu-img returned invalid disk info for sandbox '{vm_id}'; run "
+                f"'{self._resize_recovery(vm_id)}'."
+            ) from exc
+
+    def _resize_qcow2_disk(self, disk_path: Path, target_mib: int, vm_id: str) -> None:
+        """Resize a qcow2 disk's virtual size."""
+        qemu_img = self._find_qemu_img_binary()
+        if qemu_img is None:
+            raise SmolVMError(
+                f"qemu-img is needed to resize the disk for sandbox '{vm_id}'; "
+                f"{_qemu_install_hint()}"
+            )
+        current_bytes = self._qcow2_virtual_size_bytes(disk_path, vm_id)
+        target_bytes = target_mib * _MIB
+        if target_bytes < current_bytes:
+            current_mib = self._ceil_mib(current_bytes)
+            raise SmolVMError(
+                f"Requested disk size is smaller than the current disk for sandbox "
+                f"'{vm_id}'; choose at least {current_mib} MiB, or run "
+                f"'{self._resize_recovery(vm_id)}'."
+            )
+        if target_bytes == current_bytes:
+            return
+        result = subprocess.run(
+            [str(qemu_img), "resize", str(disk_path), f"{target_mib}M"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SmolVMError(
+                f"qemu-img failed while resizing the disk for sandbox '{vm_id}'; run "
+                f"'{self._resize_recovery(vm_id)}'.",
+                {"stderr": result.stderr.strip()},
+            )
+
     def _materialize_rootfs(self, config: VMConfig) -> VMConfig:
         """Materialize the effective rootfs path for a VM create request.
 
@@ -565,7 +895,8 @@ class SmolVMManager:
             return config
 
         backend = self._backend_for_config(config)
-        instance_rootfs = self._instance_disk_path(config.vm_id, backend)
+        materialized_format = self._materialized_rootfs_format(config, backend)
+        instance_rootfs = self._instance_disk_path(config.vm_id, backend, materialized_format)
         if not instance_rootfs.exists():
             logger.info(
                 "Creating isolated disk for VM %s from %s -> %s",
@@ -573,8 +904,12 @@ class SmolVMManager:
                 config.rootfs_path,
                 instance_rootfs,
             )
-            if backend == BACKEND_QEMU:
-                self._create_qemu_overlay_disk(config.rootfs_path, instance_rootfs)
+            if backend == BACKEND_QEMU and materialized_format == "qcow2":
+                self._create_qemu_overlay_disk(
+                    config.rootfs_path,
+                    instance_rootfs,
+                    backing_format=config.qemu_rootfs_format,
+                )
             else:
                 self._copy_with_reflink(config.rootfs_path, instance_rootfs)
         else:
@@ -584,7 +919,9 @@ class SmolVMManager:
                 instance_rootfs,
             )
 
-        return config.model_copy(update={"rootfs_path": instance_rootfs})
+        return config.model_copy(
+            update={"rootfs_path": instance_rootfs, "rootfs_format": materialized_format}
+        )
 
     def _materialize_firmware(self, config: VMConfig) -> None:
         """Create the per-VM OVMF NVRAM file for UEFI-firmware guests.
@@ -650,11 +987,51 @@ class SmolVMManager:
         if vm_info.config.disk_mode != "isolated":
             return None
 
-        expected = self._instance_disk_path(vm_info.vm_id, self._backend_for_vm(vm_info)).resolve()
+        expected = self._instance_disk_path(
+            vm_info.vm_id,
+            self._backend_for_vm(vm_info),
+            vm_info.config.effective_rootfs_format,
+        ).resolve()
         actual = vm_info.config.rootfs_path.resolve()
         if actual != expected:
             return None
         return expected
+
+    @staticmethod
+    def _managed_disk_sidecars_for_root(root_path: Path) -> list[Path]:
+        """Return sidecar backing files created for a managed disk root."""
+        return sorted(root_path.parent.glob(f"{root_path.name}.backing-*"))
+
+    @staticmethod
+    def _is_managed_disk_sidecar(managed_disk: Path, candidate: Path) -> bool:
+        """Return whether *candidate* is a sidecar for *managed_disk*."""
+        name = candidate.name
+        return name.startswith(f"{managed_disk.name}.backing-") or (
+            name.startswith(f"{managed_disk.name}.restore-") and ".backing-" in name
+        )
+
+    def _managed_disk_backing_sidecars(self, managed_disk: Path) -> list[Path]:
+        """Return local backing files that should be removed with a managed disk."""
+        sidecars: list[Path] = []
+        seen: set[Path] = set()
+        current = managed_disk
+        disk_dir = self.disk_dir.resolve()
+        while True:
+            backing = QemuRuntimeAdapter._qcow2_backing_file(current)
+            if backing is None:
+                return sidecars
+            resolved = backing.resolve()
+            if resolved in seen:
+                return sidecars
+            seen.add(resolved)
+            try:
+                resolved.relative_to(disk_dir)
+            except ValueError:
+                return sidecars
+            if not self._is_managed_disk_sidecar(managed_disk, resolved):
+                return sidecars
+            sidecars.append(resolved)
+            current = resolved
 
     def _check_workspace_mounts(self, vm_info: VMInfo) -> None:
         """Verify each workspace mount's host folder is still usable.
@@ -697,6 +1074,15 @@ class SmolVMManager:
             )
         if vm_info.config.disk_mode != "isolated":
             raise SmolVMError("Snapshotting currently supports only isolated-disk VMs")
+        if (
+            self._backend_for_vm(vm_info) == BACKEND_QEMU
+            and vm_info.config.effective_rootfs_format != "qcow2"
+        ):
+            raise SmolVMError(
+                f"Snapshots are not supported for raw QEMU disks in sandbox "
+                f"'{vm_info.vm_id}'; create it without grow_filesystem, or run "
+                f"'smolvm delete {vm_info.vm_id}'."
+            )
         if vm_info.config.extra_drives:
             raise SmolVMError("Snapshotting currently supports only VMs without extra drives")
         if vm_info.config.workspace_mounts:
@@ -920,14 +1306,13 @@ class SmolVMManager:
         return errors
 
     def _maybe_enable_vsock(self, config: VMConfig, backend: str, vm_info: VMInfo) -> VMInfo:
-        """Reserve a vsock CID and persist ``config.vsock`` when the VM should
-        use the vsock control channel.
+        """Reserve a vsock CID and persist ``config.vsock`` when needed.
 
-        No-op unless the resolved channel is vsock (QEMU on a Linux host with
-        ``/dev/vhost-vsock``). The CID is reserved after the VM row exists (the
-        ``vsock_cids`` foreign key requires it) and written back to the config
-        so ``build_qemu_argv`` wires the ``vhost-vsock`` device at boot.
-        Returns the possibly-updated :class:`VMInfo`.
+        Auto/explicit vsock control channels need a reserved CID. An explicit
+        QEMU vsock device also needs reservation even when the control channel
+        is SSH, otherwise two guests could be configured with the same CID.
+        The reservation happens after the VM row exists because ``vsock_cids``
+        references it.
         """
         resolution = resolve_comm_channel(
             requested=None,
@@ -935,11 +1320,27 @@ class SmolVMManager:
             backend=backend,
             guest_os=config.guest_os,
         )
-        if resolution.kind != "vsock":
+        requested_vsock = config.vsock
+        should_reserve_device = backend == BACKEND_QEMU and requested_vsock is not None
+        if resolution.kind != "vsock" and not should_reserve_device:
             return vm_info
-        cid = self.state.reserve_vsock_cid(config.vm_id)
-        updated = config.model_copy(update={"vsock": VsockConfig(guest_cid=cid)})
-        logger.info("VM %s will use vsock control channel (CID %d)", config.vm_id, cid)
+
+        cid = self.state.reserve_vsock_cid(
+            config.vm_id,
+            requested_vsock.guest_cid if requested_vsock is not None else None,
+        )
+        updated = config.model_copy(
+            update={
+                "vsock": VsockConfig(
+                    guest_cid=cid,
+                    uds_path=requested_vsock.uds_path if requested_vsock is not None else None,
+                )
+            }
+        )
+        if resolution.kind == "vsock":
+            logger.info("VM %s will use vsock control channel (CID %d)", config.vm_id, cid)
+        else:
+            logger.info("VM %s reserved explicit vsock CID %d", config.vm_id, cid)
         return self.state.update_vm(config.vm_id, config=updated)
 
     @staticmethod
@@ -1064,18 +1465,53 @@ class SmolVMManager:
                 {"vm_id": effective_config.vm_id, "backend": backend},
             )
 
-        effective_config = self._materialize_rootfs(effective_config)
-        self._materialize_firmware(effective_config)
+        with self._vm_create_lock(effective_config.vm_id):
+            self._ensure_vm_id_available(effective_config.vm_id)
+            managed_disk_path = self._managed_disk_path_for_create(effective_config, backend)
+            managed_disk_existed = (
+                managed_disk_path.exists() if managed_disk_path is not None else False
+            )
+            firmware_state = self.data_dir / "firmware" / effective_config.vm_id
+            firmware_existed = firmware_state.exists()
+            vm_record_created = False
+            managed_disk_backup: list[tuple[Path, Path]] = []
+            if managed_disk_existed and (
+                effective_config.disk_size_mib is not None or effective_config.grow_filesystem
+            ):
+                managed_disk_backup = self._backup_existing_managed_disk(managed_disk_path)
+            try:
+                effective_config = self._materialize_rootfs(effective_config)
 
-        logger.info(
-            "Creating VM: %s (backend=%s, disk_mode=%s)",
-            effective_config.vm_id,
-            backend,
-            effective_config.disk_mode,
-        )
+                logger.info(
+                    "Creating VM: %s (backend=%s, disk_mode=%s)",
+                    effective_config.vm_id,
+                    backend,
+                    effective_config.disk_mode,
+                )
 
-        # Create VM record
-        vm_info = self.state.create_vm(effective_config)
+                # Create VM record while still holding the create lock so a
+                # concurrent same-ID create cannot resize the same disk first.
+                # Resize/grow after persistence so a persistence failure cannot
+                # mutate a retained managed disk without a VM row.
+                self.state.create_vm(effective_config)
+                vm_record_created = True
+                effective_config = self._resize_materialized_rootfs(effective_config)
+                self._materialize_firmware(effective_config)
+                self._discard_existing_managed_disk_backup(managed_disk_backup)
+            except Exception:
+                self._restore_existing_managed_disk_backup(managed_disk_backup)
+                if vm_record_created:
+                    with suppress(Exception):
+                        self.state.delete_vm(effective_config.vm_id)
+                self._cleanup_unpersisted_managed_disk(
+                    managed_disk_path,
+                    existed_before=managed_disk_existed,
+                )
+                self._cleanup_unpersisted_firmware(
+                    effective_config.vm_id,
+                    existed_before=firmware_existed,
+                )
+                raise
 
         try:
             ssh_host_port = self._reserve_available_ssh_port(effective_config.vm_id)
@@ -1178,7 +1614,10 @@ class SmolVMManager:
         except Exception as e:
             # Rollback on failure
             logger.error("Failed to create VM %s: %s", effective_config.vm_id, e)
-            self._cleanup_resources(effective_config.vm_id)
+            self._cleanup_resources(
+                effective_config.vm_id,
+                preserve_managed_disk=managed_disk_existed,
+            )
             # Delete the VM record that was created
             with suppress(Exception):
                 self.state.delete_vm(effective_config.vm_id)
@@ -1508,10 +1947,6 @@ class SmolVMManager:
                 {"snapshot_id": snapshot_id, "vm_id": restore_vm_id},
             )
 
-        if existing_vm is not None and existing_vm.status in (VMState.RUNNING, VMState.PAUSED):
-            self.stop(restore_vm_id)
-            existing_vm = self.state.get_vm(restore_vm_id)
-
         if (
             snapshot.vm_config.kernel_path is not None
             and not snapshot.vm_config.kernel_path.exists()
@@ -1542,10 +1977,19 @@ class SmolVMManager:
                     {"snapshot_id": snapshot_id, label: str(required_path)},
                 )
 
-        managed_disk_path = self._instance_disk_path(restore_vm_id, snapshot.backend)
+        if existing_vm is not None and existing_vm.status in (VMState.RUNNING, VMState.PAUSED):
+            self.stop(restore_vm_id)
+            existing_vm = self.state.get_vm(restore_vm_id)
+
+        managed_disk_path = self._instance_disk_path(
+            restore_vm_id,
+            snapshot.backend,
+            snapshot.vm_config.effective_rootfs_format,
+        )
         persisted_vm_config = snapshot.vm_config.model_copy(
             update={
                 "rootfs_path": managed_disk_path,
+                "rootfs_format": snapshot.vm_config.effective_rootfs_format,
                 "backend": snapshot.backend,
             }
         )
@@ -1561,19 +2005,24 @@ class SmolVMManager:
         adapter = self._runtime_adapter_for_snapshot(effective_snapshot)
         created_vm_record = False
         existing_disk_backup_path: Path | None = None
+        existing_disk_sidecars: list[Path] = []
+        created_managed_placeholder = False
         launch = None
 
-        managed_disk_path.parent.mkdir(parents=True, exist_ok=True)
-        if restore_disk_path != managed_disk_path:
-            restore_disk_path.parent.mkdir(parents=True, exist_ok=True)
-            if restore_disk_path.exists():
-                restore_disk_path.unlink()
-        if managed_disk_path.exists():
-            existing_disk_backup_path = self._restore_backup_disk_path(managed_disk_path)
-            os.replace(managed_disk_path, existing_disk_backup_path)
-        managed_disk_path.touch(exist_ok=True)
-
         try:
+            managed_disk_path.parent.mkdir(parents=True, exist_ok=True)
+            if restore_disk_path != managed_disk_path:
+                restore_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                if restore_disk_path.exists():
+                    restore_disk_path.unlink()
+            if managed_disk_path.exists():
+                existing_disk_sidecars = self._managed_disk_backing_sidecars(managed_disk_path)
+                existing_disk_backup_path = self._restore_backup_disk_path(managed_disk_path)
+                os.replace(managed_disk_path, existing_disk_backup_path)
+            else:
+                created_managed_placeholder = True
+            managed_disk_path.touch(exist_ok=True)
+
             if existing_vm is None:
                 self.state.create_vm(persisted_vm_config)
                 created_vm_record = True
@@ -1588,6 +2037,18 @@ class SmolVMManager:
                     restore_vm_id,
                     host_port=effective_snapshot.network_config.ssh_host_port,
                 )
+            if effective_snapshot.backend == BACKEND_QEMU and persisted_vm_config.vsock is not None:
+                try:
+                    self.state.reserve_vsock_cid(
+                        restore_vm_id,
+                        guest_cid=persisted_vm_config.vsock.guest_cid,
+                    )
+                except NetworkError as exc:
+                    raise NetworkError(
+                        f"Vsock CID {persisted_vm_config.vsock.guest_cid} is already in use; "
+                        f"stop the sandbox using that CID, or run "
+                        f"'smolvm delete {restore_vm_id}'."
+                    ) from exc
             self.state.update_vm(restore_vm_id, network=effective_snapshot.network_config)
             if effective_snapshot.backend == BACKEND_FIRECRACKER:
                 self._ensure_firecracker_network_for_restore(
@@ -1617,6 +2078,9 @@ class SmolVMManager:
             if existing_disk_backup_path is not None and existing_disk_backup_path.exists():
                 with suppress(Exception):
                     existing_disk_backup_path.unlink()
+            for sidecar in existing_disk_sidecars:
+                with suppress(Exception):
+                    sidecar.unlink()
             return vm_info
         except Exception:
             if launch is not None:
@@ -1638,12 +2102,13 @@ class SmolVMManager:
                 with suppress(Exception):
                     self.state.delete_vm(restore_vm_id)
             elif existing_vm is not None:
-                self.state.update_vm(
-                    restore_vm_id,
-                    status=VMState.ERROR,
-                    clear_pid=True,
-                    clear_socket_path=True,
-                )
+                with suppress(Exception):
+                    self.state.update_vm(
+                        restore_vm_id,
+                        status=VMState.ERROR,
+                        clear_pid=True,
+                        clear_socket_path=True,
+                    )
                 self._close_runtime_log(
                     restore_vm_id,
                     effective_snapshot.backend,
@@ -1652,6 +2117,12 @@ class SmolVMManager:
             if restore_disk_path != managed_disk_path and restore_disk_path.exists():
                 with suppress(Exception):
                     restore_disk_path.unlink()
+            for sidecar in self._managed_disk_sidecars_for_root(restore_disk_path):
+                with suppress(Exception):
+                    sidecar.unlink()
+            if created_managed_placeholder and managed_disk_path.exists():
+                with suppress(Exception):
+                    managed_disk_path.unlink()
             if existing_disk_backup_path is not None and existing_disk_backup_path.exists():
                 with suppress(Exception):
                     if managed_disk_path.exists():
@@ -2170,11 +2641,13 @@ class SmolVMManager:
         )
         return f"{args} {ip_arg}".strip()
 
-    def _cleanup_resources(self, vm_id: str) -> None:
+    def _cleanup_resources(self, vm_id: str, *, preserve_managed_disk: bool = False) -> None:
         """Clean up resources for a VM.
 
         Args:
             vm_id: The VM identifier.
+            preserve_managed_disk: Keep the managed disk during create rollback
+                when it existed before this create attempt.
         """
         try:
             vm_info = None
@@ -2249,16 +2722,25 @@ class SmolVMManager:
 
             managed_disk = self._managed_disk_for_vm(vm_info)
             if managed_disk and managed_disk.exists():
-                if vm_info.config.retain_disk_on_delete:
+                if preserve_managed_disk or vm_info.config.retain_disk_on_delete:
                     logger.info(
                         "Retaining isolated disk for VM %s at %s",
                         vm_id,
                         managed_disk,
                     )
                 else:
+                    managed_sidecars = self._managed_disk_backing_sidecars(managed_disk)
                     with suppress(Exception):
                         managed_disk.unlink()
                         logger.info("Removed isolated disk for VM %s: %s", vm_id, managed_disk)
+                    for sidecar in managed_sidecars:
+                        with suppress(Exception):
+                            sidecar.unlink()
+                            logger.info(
+                                "Removed isolated disk sidecar for VM %s: %s",
+                                vm_id,
+                                sidecar,
+                            )
 
             # Per-VM firmware state (OVMF NVRAM + swtpm). Coupled to the
             # disk lifecycle — kept iff retain_disk_on_delete is set so
@@ -2302,18 +2784,71 @@ class SmolVMManager:
         if effective_config.backend != backend:
             effective_config = effective_config.model_copy(update={"backend": backend})
 
-        effective_config = await self._async_materialize_rootfs(effective_config)
-        # Firmware materialization is a small file copy — synchronous is fine.
-        self._materialize_firmware(effective_config)
+        if effective_config.workspace_mounts and backend != BACKEND_QEMU:
+            raise SmolVMError(
+                "Workspace mounts (virtio-9p) are only supported with the "
+                f"QEMU backend (got backend={backend!r}). Re-run without "
+                "--backend (SmolVM will auto-select QEMU when --mount is "
+                "used) or pass --backend qemu explicitly.",
+                {"vm_id": effective_config.vm_id, "backend": backend},
+            )
 
-        logger.info(
-            "Creating VM (async): %s (backend=%s, disk_mode=%s)",
-            effective_config.vm_id,
-            backend,
-            effective_config.disk_mode,
-        )
+        async with self._async_vm_create_lock(effective_config.vm_id):
+            self._ensure_vm_id_available(effective_config.vm_id)
+            managed_disk_path = self._managed_disk_path_for_create(effective_config, backend)
+            managed_disk_existed = (
+                managed_disk_path.exists() if managed_disk_path is not None else False
+            )
+            firmware_state = self.data_dir / "firmware" / effective_config.vm_id
+            firmware_existed = firmware_state.exists()
+            vm_record_created = False
+            managed_disk_backup: list[tuple[Path, Path]] = []
+            if managed_disk_existed and (
+                effective_config.disk_size_mib is not None or effective_config.grow_filesystem
+            ):
+                managed_disk_backup = await asyncio.to_thread(
+                    self._backup_existing_managed_disk,
+                    managed_disk_path,
+                )
+            try:
+                effective_config = await self._async_materialize_rootfs(effective_config)
 
-        self.state.create_vm(effective_config)
+                logger.info(
+                    "Creating VM (async): %s (backend=%s, disk_mode=%s)",
+                    effective_config.vm_id,
+                    backend,
+                    effective_config.disk_mode,
+                )
+
+                self.state.create_vm(effective_config)
+                vm_record_created = True
+                effective_config = await asyncio.to_thread(
+                    self._resize_materialized_rootfs,
+                    effective_config,
+                )
+                # Firmware materialization is a small file copy — synchronous is fine.
+                self._materialize_firmware(effective_config)
+                await asyncio.to_thread(
+                    self._discard_existing_managed_disk_backup,
+                    managed_disk_backup,
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    self._restore_existing_managed_disk_backup,
+                    managed_disk_backup,
+                )
+                if vm_record_created:
+                    with suppress(Exception):
+                        self.state.delete_vm(effective_config.vm_id)
+                self._cleanup_unpersisted_managed_disk(
+                    managed_disk_path,
+                    existed_before=managed_disk_existed,
+                )
+                self._cleanup_unpersisted_firmware(
+                    effective_config.vm_id,
+                    existed_before=firmware_existed,
+                )
+                raise
 
         try:
             ssh_host_port = self._reserve_available_ssh_port(effective_config.vm_id)
@@ -2389,7 +2924,10 @@ class SmolVMManager:
 
         except Exception as e:
             logger.error("Failed to create VM %s: %s", effective_config.vm_id, e)
-            await self._async_cleanup_resources(effective_config.vm_id)
+            await self._async_cleanup_resources(
+                effective_config.vm_id,
+                preserve_managed_disk=managed_disk_existed,
+            )
             with suppress(Exception):
                 self.state.delete_vm(effective_config.vm_id)
             raise
@@ -2506,7 +3044,8 @@ class SmolVMManager:
             return config
 
         backend = self._backend_for_config(config)
-        instance_rootfs = self._instance_disk_path(config.vm_id, backend)
+        materialized_format = self._materialized_rootfs_format(config, backend)
+        instance_rootfs = self._instance_disk_path(config.vm_id, backend, materialized_format)
         if not instance_rootfs.exists():
             logger.info(
                 "Creating isolated disk (async) for VM %s from %s -> %s",
@@ -2514,14 +3053,26 @@ class SmolVMManager:
                 config.rootfs_path,
                 instance_rootfs,
             )
-            if backend == BACKEND_QEMU:
-                await self._async_create_qemu_overlay_disk(config.rootfs_path, instance_rootfs)
+            if backend == BACKEND_QEMU and materialized_format == "qcow2":
+                await self._async_create_qemu_overlay_disk(
+                    config.rootfs_path,
+                    instance_rootfs,
+                    backing_format=config.qemu_rootfs_format,
+                )
             else:
                 await self._async_copy_with_reflink(config.rootfs_path, instance_rootfs)
 
-        return config.model_copy(update={"rootfs_path": instance_rootfs})
+        return config.model_copy(
+            update={"rootfs_path": instance_rootfs, "rootfs_format": materialized_format}
+        )
 
-    async def _async_create_qemu_overlay_disk(self, base_path: Path, overlay_path: Path) -> None:
+    async def _async_create_qemu_overlay_disk(
+        self,
+        base_path: Path,
+        overlay_path: Path,
+        *,
+        backing_format: str | None = None,
+    ) -> None:
         """Async version of :meth:`_create_qemu_overlay_disk`."""
         from smolvm.utils import async_run_command
 
@@ -2530,7 +3081,7 @@ class SmolVMManager:
             raise SmolVMError("QEMU backend requires qemu-img to create overlay disks")
 
         overlay_path.parent.mkdir(parents=True, exist_ok=True)
-        base_format = "qcow2" if base_path.suffix == ".qcow2" else "raw"
+        base_format = backing_format or ("qcow2" if base_path.suffix == ".qcow2" else "raw")
         await async_run_command(
             [
                 str(qemu_img),
@@ -2642,7 +3193,12 @@ class SmolVMManager:
         task.add_done_callback(self._background_tasks.discard)
         return process
 
-    async def _async_cleanup_resources(self, vm_id: str) -> None:
+    async def _async_cleanup_resources(
+        self,
+        vm_id: str,
+        *,
+        preserve_managed_disk: bool = False,
+    ) -> None:
         """Async version of :meth:`_cleanup_resources`."""
         try:
             vm_info = None
@@ -2709,12 +3265,24 @@ class SmolVMManager:
 
             managed_disk = self._managed_disk_for_vm(vm_info)
             if managed_disk and managed_disk.exists():
-                if vm_info.config.retain_disk_on_delete:
+                if preserve_managed_disk or vm_info.config.retain_disk_on_delete:
                     logger.info("Retaining isolated disk for VM %s at %s", vm_id, managed_disk)
                 else:
+                    managed_sidecars = await asyncio.to_thread(
+                        self._managed_disk_backing_sidecars,
+                        managed_disk,
+                    )
                     with suppress(Exception):
                         managed_disk.unlink()
                         logger.info("Removed isolated disk for VM %s: %s", vm_id, managed_disk)
+                    for sidecar in managed_sidecars:
+                        with suppress(Exception):
+                            sidecar.unlink()
+                            logger.info(
+                                "Removed isolated disk sidecar for VM %s: %s",
+                                vm_id,
+                                sidecar,
+                            )
 
             # Per-VM firmware state (OVMF NVRAM + swtpm). Mirrors the sync
             # _cleanup_resources path so async_delete() doesn't leave

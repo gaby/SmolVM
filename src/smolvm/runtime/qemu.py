@@ -49,6 +49,16 @@ logger = logging.getLogger(__name__)
 QEMU_ROOT_NODE_NAME = "rootdisk0"
 
 
+def _qemu_img_install_hint() -> str:
+    """Return a short recovery hint for missing or broken qemu-img."""
+    return (
+        "Install it with 'sudo apt-get install -y qemu-utils' on Debian/Ubuntu, "
+        "'sudo dnf install -y qemu-img' or 'sudo yum install -y qemu-img' "
+        "on Fedora/RHEL, or 'sudo pacman -S --needed qemu-base' on Arch; "
+        "then verify 'qemu-img' is on PATH."
+    )
+
+
 class _SwtpmSidecar:
     """Per-VM swtpm (software TPM 2.0) process.
 
@@ -394,9 +404,8 @@ class QemuRuntimeAdapter(RuntimeAdapter):
         )
 
         request.managed_disk_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snapshot.artifacts.disk_path, request.managed_disk_path)
-
         if snapshot.snapshot_type == SnapshotType.DIFF:
+            shutil.copy2(snapshot.artifacts.disk_path, request.managed_disk_path)
             backing = self._qcow2_backing_file(request.managed_disk_path)
             if backing is not None and not backing.exists():
                 raise SmolVMError(
@@ -406,6 +415,8 @@ class QemuRuntimeAdapter(RuntimeAdapter):
                     "a full snapshot next time with '--snapshot-type full'.",
                     {"snapshot_id": snapshot.snapshot_id, "backing_file": str(backing)},
                 )
+        else:
+            self._copy_disk_standalone(snapshot.artifacts.disk_path, request.managed_disk_path)
 
         control_socket_path = self._control_socket_path(snapshot.vm_id)
         if control_socket_path.exists():
@@ -499,53 +510,98 @@ class QemuRuntimeAdapter(RuntimeAdapter):
         return self._context.socket_dir / f"qmp-{vm_id}.sock"
 
     @staticmethod
-    def _copy_disk_standalone(source: Path, dest: Path) -> None:
-        """Copy a qcow2 disk, flattening any backing-file chain.
+    def _local_backing_copy_path(root: Path, backing: Path, depth: int) -> Path:
+        """Return a sidecar path for a copied backing file."""
+        return root.with_name(f"{root.name}.backing-{depth}{backing.suffix or '.img'}")
 
-        If the source has a backing file (i.e. it's a thin overlay), uses
-        ``qemu-img convert`` to produce a self-contained qcow2. Otherwise
-        falls back to a simple file copy.
-        """
+    @staticmethod
+    def _qcow2_backing_file_required(disk: Path) -> Path | None:
+        """Return backing path, raising when qemu-img cannot inspect the disk."""
         qemu_img = which("qemu-img")
-        if qemu_img is not None:
-            # Check if the source has a backing file
-            info_result = subprocess.run(
-                [str(qemu_img), "info", "--output=json", str(source)],
-                capture_output=True,
-                text=True,
-                check=False,
+        if qemu_img is None:
+            raise SmolVMError(
+                "QEMU snapshots need qemu-img to inspect qcow2 disks. "
+                f"{_qemu_img_install_hint()}"
             )
-            has_backing = info_result.returncode == 0 and "backing-filename" in info_result.stdout
+        info = subprocess.run(
+            [str(qemu_img), "info", "--output=json", str(disk)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if info.returncode != 0:
+            raise SmolVMError(
+                "qemu-img could not inspect the QEMU disk while creating a full snapshot. "
+                f"Confirm the disk is valid, or reinstall qemu-img. {_qemu_img_install_hint()}",
+                {"disk_path": str(disk), "stderr": info.stderr.strip()},
+            )
+        try:
+            data = json.loads(info.stdout)
+        except (ValueError, TypeError) as exc:
+            raise SmolVMError(
+                "qemu-img returned invalid disk info while creating a full QEMU snapshot. "
+                f"Update or reinstall qemu-img. {_qemu_img_install_hint()}",
+                {"disk_path": str(disk)},
+            ) from exc
+        backing = data.get("full-backing-filename") or data.get("backing-filename")
+        return Path(backing) if backing else None
 
-            if has_backing:
-                logger.info(
-                    "Flattening overlay qcow2 for snapshot: %s -> %s",
-                    source,
-                    dest,
-                )
-                convert_result = subprocess.run(
-                    [
-                        str(qemu_img),
-                        "convert",
-                        "-f",
-                        "qcow2",
-                        "-O",
-                        "qcow2",
-                        str(source),
-                        str(dest),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if convert_result.returncode == 0:
-                    return
-                logger.warning(
-                    "qemu-img convert failed during snapshot, falling back to copy: %s",
-                    convert_result.stderr.strip(),
-                )
+    @staticmethod
+    def _copy_disk_standalone(source: Path, dest: Path, *, _depth: int = 0) -> None:
+        """Copy a qcow2 disk with a local backing chain.
+
+        QEMU full snapshots store VM state as an internal qcow2 snapshot on the
+        active disk. ``qemu-img convert`` would flatten an overlay, but it also
+        drops those internal snapshot tags. Instead, copy the active overlay as
+        is and re-point it at copied backing files next to *dest*. Restores then
+        depend only on files under the managed disk directory, not on the
+        snapshot directory.
+        """
+        backing = QemuRuntimeAdapter._qcow2_backing_file_required(source)
+        if backing is None:
+            shutil.copy2(source, dest)
+            return
+        if not backing.exists():
+            raise SmolVMError(
+                "Full snapshot needs the disk's base image, but that file is missing: "
+                f"'{backing}'. Restore it, or take a diff snapshot instead."
+            )
 
         shutil.copy2(source, dest)
+        backing_dest = QemuRuntimeAdapter._local_backing_copy_path(dest, backing, _depth)
+        QemuRuntimeAdapter._copy_disk_standalone(backing, backing_dest, _depth=_depth + 1)
+
+        qemu_img = which("qemu-img")
+        if qemu_img is None:
+            raise SmolVMError(
+                "QEMU snapshots need qemu-img to rebase copied qcow2 backing files. "
+                f"{_qemu_img_install_hint()}"
+            )
+        backing_fmt = QemuRuntimeAdapter._qcow2_disk_format(backing_dest) or (
+            "qcow2" if backing_dest.suffix == ".qcow2" else "raw"
+        )
+        rebase = subprocess.run(
+            [
+                str(qemu_img),
+                "rebase",
+                "-u",
+                "-b",
+                str(backing_dest.resolve()),
+                "-F",
+                backing_fmt,
+                str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rebase.returncode != 0:
+            raise SmolVMError(
+                "qemu-img rebase failed while creating a full QEMU snapshot. "
+                "Confirm qemu-img is usable and the backing image exists. "
+                f"{_qemu_img_install_hint()}",
+                {"stderr": rebase.stderr.strip()},
+            )
 
     @staticmethod
     def _qcow2_backing_file(disk: Path) -> Path | None:

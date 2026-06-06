@@ -1292,12 +1292,6 @@ class SmolVM:
         the normal SmolVM lifecycle.
         """
         resolved_vm_id = _resolve_vm_name(vm_id, prefix=name_prefix)
-        if disk_size_mb is not None or grow_filesystem:
-            raise SmolVMError(
-                f"Custom image disk resizing is not implemented yet for sandbox "
-                f"'{resolved_vm_id}'; omit disk_size_mb and grow_filesystem, then run "
-                f"`{_from_image_config_help(resolved_vm_id)}`."
-            )
 
         resolved_backend = _normalize_from_image_backend(image, backend, resolved_vm_id)
         resolved_arch = _normalize_from_image_arch(image, arch, resolved_vm_id)
@@ -1326,11 +1320,14 @@ class SmolVM:
             kernel_path=kernel_path,
             initrd_path=image.initrd_path,
             rootfs_path=image.rootfs_path,
+            rootfs_format=image.rootfs_format,
             boot_args=image.render_boot_args(backend=resolved_backend, arch=resolved_arch),
             ssh_capable=image.ssh_capable,
             backend=resolved_backend,
             qemu_network=qemu_network,
             disk_mode=disk_mode,
+            disk_size_mib=disk_size_mb,
+            grow_filesystem=grow_filesystem,
             port_forwards=normalized_forwards,
             vsock=_normalize_vsock_config(vsock),
         )

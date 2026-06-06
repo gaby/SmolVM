@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smolvm.exceptions import SmolVMError
-from smolvm.types import NetworkConfig, PortForwardConfig, VMConfig, VMInfo, VMState
+from smolvm.types import NetworkConfig, PortForwardConfig, VMConfig, VMInfo, VMState, VsockConfig
 from smolvm.vm import SmolVMManager
 
 
@@ -89,7 +89,7 @@ def test_create_qemu_skips_local_ssh_port_that_is_already_in_use(tmp_path: Path)
             side_effect=lambda port: port != 2200,
         ),
     ):
-        mock_overlay.side_effect = lambda _source, target: target.touch()
+        mock_overlay.side_effect = lambda _source, target, **_kwargs: target.touch()
         vm_info = sdk.create(config)
 
     assert vm_info.network is not None
@@ -176,7 +176,7 @@ def test_start_qemu_includes_configured_hostfwd_rules(
 
     sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
     with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
-        mock_convert.side_effect = lambda source, target: target.touch()
+        mock_convert.side_effect = lambda source, target, **_kwargs: target.touch()
         vm_info = sdk.create(config)
 
     proc = MagicMock()
@@ -220,7 +220,7 @@ def test_start_qemu_uses_distinct_block_backend_and_node_names(
 
     sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
     with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
-        mock_convert.side_effect = lambda source, target: target.touch()
+        mock_convert.side_effect = lambda source, target, **_kwargs: target.touch()
         vm_info = sdk.create(config)
 
     proc = MagicMock()
@@ -241,6 +241,125 @@ def test_start_qemu_uses_distinct_block_backend_and_node_names(
     assert blk_devs[-1] == "virtio-blk-device,drive=rootdisk0-drive"
 
 
+def test_create_qemu_preserves_requested_vsock_cid(tmp_path: Path) -> None:
+    """Explicit QEMU vsock config should reserve and persist the requested CID."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+
+    config = VMConfig(
+        vm_id="vm-qemu-vsock",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        backend="qemu",
+        comm_channel="vsock",
+        vsock=VsockConfig(guest_cid=42, uds_path="/tmp/vm-qemu-vsock.sock"),
+    )
+    sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
+
+    with (
+        patch("smolvm.comm.select.host_supports_vsock", return_value=True),
+        patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay,
+    ):
+        mock_overlay.side_effect = lambda source, target, **_kwargs: target.write_text("overlay")
+        vm_info = sdk.create(config)
+
+    assert vm_info.config.vsock == VsockConfig(
+        guest_cid=42,
+        uds_path="/tmp/vm-qemu-vsock.sock",
+    )
+    assert sdk.state.get_vsock_cid("vm-qemu-vsock") == 42
+
+
+def test_create_qemu_reserves_vsock_even_when_control_channel_is_ssh(tmp_path: Path) -> None:
+    """A QEMU vsock device still needs collision-safe CID reservation with SSH control."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.ext4"
+    kernel.touch()
+    rootfs.touch()
+
+    config = VMConfig(
+        vm_id="vm-qemu-vsock-ssh",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        backend="qemu",
+        comm_channel="ssh",
+        vsock=VsockConfig(guest_cid=43),
+    )
+    sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
+
+    with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay:
+        mock_overlay.side_effect = lambda source, target, **_kwargs: target.write_text("overlay")
+        vm_info = sdk.create(config)
+
+    assert vm_info.config.vsock == VsockConfig(guest_cid=43)
+    assert sdk.state.get_vsock_cid("vm-qemu-vsock-ssh") == 43
+
+
+def test_create_qemu_uses_declared_backing_format_with_misleading_suffix(
+    tmp_path: Path,
+) -> None:
+    """QEMU overlay creation should trust rootfs_format over the filename."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "raw-rootfs.qcow2"
+    kernel.touch()
+    rootfs.write_text("raw-ext4-data")
+
+    config = VMConfig(
+        vm_id="vm-qemu-raw-suffix",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        rootfs_format="raw-ext4",
+        backend="qemu",
+    )
+    sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
+
+    with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay:
+        mock_overlay.side_effect = lambda source, target, **_kwargs: target.write_text("overlay")
+        vm_info = sdk.create(config)
+
+    assert vm_info.config.rootfs_path == sdk.data_dir / "disks" / "vm-qemu-raw-suffix.qcow2"
+    assert vm_info.config.rootfs_format == "qcow2"
+    assert mock_overlay.call_args.kwargs["backing_format"] == "raw"
+
+
+def test_create_qemu_raw_grow_uses_managed_raw_disk(tmp_path: Path) -> None:
+    """QEMU raw-ext4 grow creates a growable raw disk instead of a qcow2 overlay."""
+    kernel = tmp_path / "vmlinux"
+    rootfs = tmp_path / "rootfs.img"
+    kernel.touch()
+    rootfs.write_bytes(b"\0" * (1024 * 1024))
+
+    config = VMConfig(
+        vm_id="vm-qemu-grow",
+        kernel_path=kernel,
+        rootfs_path=rootfs,
+        rootfs_format="raw-ext4",
+        backend="qemu",
+        disk_size_mib=2,
+        grow_filesystem=True,
+    )
+    sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
+
+    def _copy(source: Path, target: Path) -> None:
+        target.write_bytes(source.read_bytes())
+
+    with (
+        patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay,
+        patch.object(SmolVMManager, "_copy_with_reflink", side_effect=_copy),
+        patch.object(sdk, "_grow_raw_ext4_filesystem") as mock_grow,
+    ):
+        vm_info = sdk.create(config)
+
+    expected_disk = sdk.data_dir / "disks" / "vm-qemu-grow.ext4"
+    assert vm_info.config.rootfs_path == expected_disk
+    assert vm_info.config.rootfs_format == "raw-ext4"
+    assert expected_disk.stat().st_size == 2 * 1024 * 1024
+    mock_overlay.assert_not_called()
+    mock_grow.assert_called_once_with(expected_disk, "vm-qemu-grow")
+
+
 def test_create_qemu_uses_managed_qcow2_disk(tmp_path: Path) -> None:
     """QEMU isolated disks should be materialized as managed qcow2 files."""
     kernel = tmp_path / "vmlinux"
@@ -258,7 +377,9 @@ def test_create_qemu_uses_managed_qcow2_disk(tmp_path: Path) -> None:
 
     sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
     with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
-        mock_convert.side_effect = lambda source, target: target.write_text("managed-qcow2")
+        mock_convert.side_effect = (
+            lambda source, target, **_kwargs: target.write_text("managed-qcow2")
+        )
         vm_info = sdk.create(config)
 
     expected_disk = sdk.data_dir / "disks" / "vm-qemu2.qcow2"
@@ -403,7 +524,9 @@ def test_windows_local_image_uses_per_vm_overlay_disk(tmp_path: Path) -> None:
         patch("smolvm.vm.platform.machine", return_value="x86_64"),
         patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay,
     ):
-        mock_overlay.side_effect = lambda source, target: target.write_text("overlay-bytes")
+        mock_overlay.side_effect = (
+            lambda source, target, **_kwargs: target.write_text("overlay-bytes")
+        )
         vm_info = sdk.create(config)
 
     expected_overlay = sdk.data_dir / "disks" / "vm-win-iso.qcow2"
@@ -461,7 +584,7 @@ def test_two_windows_vms_from_same_baseline_get_distinct_overlays(
         patch("smolvm.vm.platform.machine", return_value="x86_64"),
         patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_overlay,
     ):
-        mock_overlay.side_effect = lambda source, target: target.write_text(target.name)
+        mock_overlay.side_effect = lambda source, target, **_kwargs: target.write_text(target.name)
         vm_alpha = sdk.create(_windows_config("vm-win-alpha"))
         vm_beta = sdk.create(_windows_config("vm-win-beta"))
 
@@ -492,7 +615,9 @@ def test_delete_qemu_retains_isolated_disk_when_enabled(tmp_path: Path) -> None:
 
     sdk = SmolVMManager(data_dir=tmp_path / "data", socket_dir=tmp_path / "sockets", backend="qemu")
     with patch.object(SmolVMManager, "_create_qemu_overlay_disk") as mock_convert:
-        mock_convert.side_effect = lambda source, target: target.write_text("managed-qcow2")
+        mock_convert.side_effect = (
+            lambda source, target, **_kwargs: target.write_text("managed-qcow2")
+        )
         sdk.create(config)
 
     disk_path = sdk.data_dir / "disks" / "vm-qemu3.qcow2"
