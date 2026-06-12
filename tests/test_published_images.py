@@ -15,6 +15,7 @@
 """Tests for the published-image manifest and resolution path."""
 
 import hashlib
+import re
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smolvm.exceptions import ImageError
+from smolvm.images import published as published_module
 from smolvm.images.manager import LocalImage
 from smolvm.images.published import (
     BASE_KERNELS,
@@ -91,9 +93,23 @@ def sample_manifest(
 
 class TestNaming:
     def test_release_tag_constant_format(self) -> None:
-        # Sanity: the tag still resembles a release identifier so any
-        # downstream tooling that parses it doesn't break silently.
-        assert IMAGES_RELEASE_TAG.startswith("images-v")
+        # Image/rootfs releases use CalVer because they are content snapshots,
+        # not SmolVM package releases.
+        assert re.fullmatch(r"images-\d{4}\.\d{2}\.\d{2}\.\d+", IMAGES_RELEASE_TAG)
+
+    def test_release_url_uses_env_override_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SMOLVM_IMAGES_RELEASE_TAG", "images-v0.0.16")
+
+        assert published_module._images_release_tag() == "images-v0.0.16"
+        assert "/images-v0.0.16/" in published_module._release_kernel_url("amd64", "elf")
+        assert "/images-v0.0.16/" in published_module._release_asset_url(
+            "openclaw", "amd64", "rootfs.ext4.zst"
+        )
+
+    def test_empty_release_tag_env_uses_pinned_tag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SMOLVM_IMAGES_RELEASE_TAG", "")
+
+        assert published_module._images_release_tag() == IMAGES_RELEASE_TAG
 
     def test_cache_name_includes_preset_version_arch_vmm(self) -> None:
         assert (
@@ -638,7 +654,7 @@ class TestBaseKernels:
         assert len(entry.image_sha256) == 64
         assert entry.elf_url.endswith("vmlinux-amd64.elf")
         assert entry.image_url.endswith("vmlinux-amd64.image")
-        assert "images-v" in entry.elf_url
+        assert "images-" in entry.elf_url
 
     def test_arm64_entry_shape(self) -> None:
         entry = BASE_KERNELS.get("arm64")
@@ -743,7 +759,7 @@ class TestBundledManifest:
         assert entry.rootfs_url.endswith("openclaw-amd64-rootfs.ext4.zst")
         # Firecracker rows get the ELF-format kernel.
         assert entry.kernel_url.endswith("vmlinux-amd64.elf")
-        assert "images-v" in entry.rootfs_url
+        assert "images-" in entry.rootfs_url
 
     def test_openclaw_arm64_firecracker_entry_shape(self) -> None:
         entry = MANIFEST.get(("openclaw", "arm64", "firecracker", "ubuntu"))
