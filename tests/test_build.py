@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smolvm.exceptions import ImageError, SmolVMError
+from smolvm.images import builder as builder_mod
 from smolvm.images.builder import ImageBuilder
 from smolvm.images.published import BASE_KERNELS
 from smolvm.runtime.boot_profiles import KernelBootProfile
@@ -33,6 +34,28 @@ def _ok_subprocess_run(
     if cmd[:2] == ["docker", "create"]:
         return subprocess.CompletedProcess(cmd, 0, stdout="container-id\n", stderr="")
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+def _fake_guest_agent_binary(tmp_path: Path) -> Path:
+    binary = tmp_path / "smolvm-guest-agent"
+    binary.write_bytes(b"rust-agent")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_cargo_binary_uses_cargo_home_when_path_is_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cargo = tmp_path / "cargo-home" / "bin" / "cargo"
+    cargo.parent.mkdir(parents=True)
+    cargo.write_text("#!/bin/sh\n")
+    cargo.chmod(0o755)
+
+    monkeypatch.delenv("CARGO", raising=False)
+    monkeypatch.setenv("CARGO_HOME", str(cargo.parent.parent))
+    monkeypatch.setattr(builder_mod.shutil, "which", lambda _name: None)
+
+    assert builder_mod._cargo_binary() == str(cargo)
 
 
 def test_base_init_script_uses_cmdline_netmask_and_gateway_dns() -> None:
@@ -188,6 +211,10 @@ class TestImageBuilderLoopFs:
                 return_value=Path("/usr/local/libexec/smolvm-loopfs-helper"),
             ),
             patch.object(ImageBuilder, "_download_kernel"),
+            patch(
+                "smolvm.images.builder._guest_agent_binary",
+                return_value=_fake_guest_agent_binary(tmp_path),
+            ),
         ):
             builder._do_build(
                 name="demo",
@@ -219,19 +246,12 @@ def _apk_installs_python3(dockerfile: str) -> bool:
 
 
 class TestAgentRuntimeBakedIntoImages:
-    """Every SSH-capable recipe must install python3.
-
-    The vsock guest agent (baked into every image by ``_do_build``) is a
-    python3 script that ``/init`` only launches ``if command -v python3``.
-    A recipe that omits python3 silently disables the agent, which makes the
-    host pay the full ``_VSOCK_AUTO_PROBE_TIMEOUT`` before falling back to SSH.
-    This locks the runtime in so the two recipes can't drift again.
-    """
+    """Every SSH-capable recipe must start the standalone Rust guest agent."""
 
     @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
     @patch.object(ImageBuilder, "check_docker", return_value=True)
     @patch.object(ImageBuilder, "_do_build")
-    def test_build_alpine_ssh_key_installs_python3(
+    def test_build_alpine_ssh_key_starts_rust_guest_agent(
         self,
         mock_do_build: MagicMock,
         _mock_check_docker: MagicMock,
@@ -246,24 +266,20 @@ class TestAgentRuntimeBakedIntoImages:
             *args: object,
             **kwargs: object,
         ) -> None:
-            assert _apk_installs_python3(dockerfile_content), (
-                "build_alpine_ssh_key must install python3 (in an apk add) so "
-                "the vsock guest agent can run; without it the host pays an 8s "
-                "vsock probe."
-            )
+            init_script = str(args[0])
+            assert "/usr/local/bin/smolvm-guest-agent --listen vsock://1024" in init_script
+            assert "python3 /usr/local/bin/smolvm-guest-agent" not in init_script
             args[2].touch()  # kernel_path
             args[3].touch()  # rootfs_path
 
         mock_do_build.side_effect = _fake_do_build
 
-        builder.build_alpine_ssh_key(
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test"
-        )
+        builder.build_alpine_ssh_key("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKey user@test")
 
     @patch.object(ImageBuilder, "_host_arch_key", return_value="x86_64")
     @patch.object(ImageBuilder, "check_docker", return_value=True)
     @patch.object(ImageBuilder, "_do_build")
-    def test_build_alpine_ssh_installs_python3(
+    def test_build_alpine_ssh_starts_rust_guest_agent(
         self,
         mock_do_build: MagicMock,
         _mock_check_docker: MagicMock,
@@ -278,7 +294,9 @@ class TestAgentRuntimeBakedIntoImages:
             *args: object,
             **kwargs: object,
         ) -> None:
-            assert _apk_installs_python3(dockerfile_content)
+            init_script = str(args[0])
+            assert "/usr/local/bin/smolvm-guest-agent --listen vsock://1024" in init_script
+            assert "python3 /usr/local/bin/smolvm-guest-agent" not in init_script
             args[2].touch()
             args[3].touch()
 
@@ -427,6 +445,10 @@ class TestBrowserImageBuilder:
                 return_value="https://example.invalid/vmlinux",
             ),
             patch.object(ImageBuilder, "_download_kernel"),
+            patch(
+                "smolvm.images.builder._guest_agent_binary",
+                return_value=_fake_guest_agent_binary(tmp_path),
+            ),
         ):
             builder._do_build(
                 name="demo",
@@ -483,6 +505,10 @@ class TestBrowserImageBuilder:
                 ImageBuilder,
                 "_loopfs_helper_path",
                 return_value=Path("/usr/local/libexec/smolvm-loopfs-helper"),
+            ),
+            patch(
+                "smolvm.images.builder._guest_agent_binary",
+                return_value=_fake_guest_agent_binary(tmp_path),
             ),
             pytest.raises(ImageError, match="extract"),
         ):

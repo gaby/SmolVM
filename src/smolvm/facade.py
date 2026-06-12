@@ -48,9 +48,9 @@ from pydantic import ValidationError as PydanticValidationError
 
 from smolvm._naming import generate_sandbox_name
 from smolvm.callbacks import Callback, CallbackDispatcher, RunContext
-from smolvm.comm import VsockChannel
-from smolvm.comm.base import CommChannelKind
-from smolvm.comm.select import ChannelResolution, resolve_comm_channel
+from smolvm.comm import LegacyFramedVsockChannel, RustHttpVsockChannel
+from smolvm.comm.base import CommChannel, CommChannelKind
+from smolvm.comm.select import ChannelResolution, VsockNotSupportedError, resolve_comm_channel
 from smolvm.env import inject_env_vars, read_env_vars, remove_env_vars
 from smolvm.env_windows import (
     inject_env_vars as inject_env_vars_windows,
@@ -154,6 +154,14 @@ _QEMU_UBUNTU_AUTO_IMAGES: dict[str, str] = {
         "ubuntu-24.04-minimal-cloudimg-arm64.img"
     ),
 }
+
+
+def _vsock_not_supported_message(vm_id: str, error: VsockNotSupportedError) -> str:
+    """Format a user-facing explicit-vsock failure at the VM boundary."""
+    return (
+        f"Cannot use vsock for sandbox '{vm_id}': {error.reason}; "
+        "create or reconnect with comm_channel='ssh'."
+    )
 
 
 def _normalize_guest_os(os: GuestOS | str | None) -> GuestOS:
@@ -926,8 +934,7 @@ def _normalize_from_image_network(
         return "slirp"
     if network not in {"tap", "slirp"}:
         raise ValueError(
-            f"network must be 'tap' or 'slirp'; to fix, run "
-            f"`{_from_image_config_help(vm_id)}`."
+            f"network must be 'tap' or 'slirp'; to fix, run `{_from_image_config_help(vm_id)}`."
         )
     if backend != BACKEND_QEMU and network == "slirp":
         raise ValueError(
@@ -1279,6 +1286,8 @@ class SmolVM:
             self._vm_id = vm_id
             self._owns_vm = False
 
+        self._control_channel: CommChannel | None = None
+        self._control_ready = False
         self._ssh: SSHClient | None = None
         self._ssh_ready = False
         self._local_forwards: dict[tuple[int, int], _LocalForward] = {}
@@ -1719,15 +1728,9 @@ class SmolVM:
                     "the rootfs at build time.",
                     {"vm_id": self._vm_id},
                 )
-            self.wait_for_ssh(timeout=boot_timeout, on_progress=on_progress)
-            if self._ssh is None:
-                self._ssh = self._new_ssh_client(
-                    host=self._info.network.guest_ip,
-                    key_path=self._ssh_key_path,
-                )
-                self._ssh_ready = True
+            ssh = self._ensure_ssh_for_env(timeout=boot_timeout)
             injector = inject_env_vars_windows if self._is_windows_guest() else inject_env_vars
-            injected = injector(self._ssh, env_vars)
+            injected = injector(ssh, env_vars)
             logger.info(
                 "VM %s: injected %d env var(s): %s",
                 self._vm_id,
@@ -1744,13 +1747,9 @@ class SmolVM:
                     {"vm_id": self._vm_id},
                 )
             if not self._ssh_ready:
-                self.wait_for_ssh(timeout=boot_timeout, on_progress=on_progress)
-            if self._ssh is None:
-                self._ssh = self._new_ssh_client(
-                    host=self._info.network.guest_ip,
-                    key_path=self._ssh_key_path,
-                )
-                self._ssh_ready = True
+                if on_progress is not None:
+                    on_progress("Waiting for SSH...")
+                self._wait_for_ssh_over_network(timeout=boot_timeout)
             count = len(workspace_mounts)
             notify("Mounting workspace..." if count == 1 else f"Mounting {count} workspaces...")
             self._mount_workspaces()
@@ -1812,6 +1811,8 @@ class SmolVM:
             raise ValueError(
                 f"snapshot_type must be one of {allowed}; got {snapshot_type!r}"
             ) from exc
+        if resolved_snapshot_type == SnapshotType.DISK:
+            self._sync_guest_for_disk_snapshot()
         snapshot_info = self._sdk.create_snapshot(
             self._vm_id,
             snapshot_id=snapshot_id,
@@ -1821,6 +1822,20 @@ class SmolVM:
         self._refresh_info()
         self._reset_runtime_state()
         return snapshot_info
+
+    def _sync_guest_for_disk_snapshot(self) -> None:
+        """Flush guest filesystem buffers before copying a disk-only snapshot."""
+        self._refresh_info()
+        if self._info.status != VMState.RUNNING:
+            return
+        channel = self._ensure_control_for_operation(action="create a disk snapshot", timeout=10.0)
+        result = channel.run("sync", timeout=10, shell="raw")
+        if result.exit_code != 0:
+            raise SmolVMError(
+                f"Cannot create disk snapshot for sandbox '{self._vm_id}' because syncing "
+                f"files inside it failed; retry with 'smolvm snapshot create {self._vm_id} "
+                "--snapshot-type disk'."
+            )
 
     def delete(self) -> None:
         """Delete the VM and release all resources."""
@@ -1863,10 +1878,11 @@ class SmolVM:
 
         if self._info.status != VMState.RUNNING:
             raise SmolVMError(
-                "VM is not running. Start the VM using vm.start() before "
-                f"running commands (current state: {self._info.status.value})",
+                f"Start sandbox '{self._vm_id}' before running commands by running "
+                f"'smolvm start {self._vm_id}' (current state: {self._info.status.value}).",
                 {"vm_id": self._vm_id},
             )
+        resolution = self._resolve_channel()
         if not self.can_run_commands():
             raise CommandExecutionUnavailableError(
                 vm_id=self._vm_id,
@@ -1876,25 +1892,31 @@ class SmolVM:
                 ),
                 remediation=self._command_exec_remediation(),
             )
-        if self._info.network is None:
+        if resolution.kind == "ssh" and self._info.network is None:
             raise SmolVMError(
-                "Cannot run command: VM has no network configuration",
+                f"Cannot run command in sandbox '{self._vm_id}' over SSH because it has "
+                f"no network; remove it with 'smolvm delete {self._vm_id}' and create it again.",
                 {"vm_id": self._vm_id},
             )
 
-        if not self._ssh_ready:
+        self._ensure_control_cache_attrs()
+        if not self._control_ready:
             try:
-                self._wait_for_ssh(timeout=_DEFAULT_RUN_READY_TIMEOUT)
+                self._wait_for_ready(timeout=_DEFAULT_RUN_READY_TIMEOUT)
             except OperationTimeoutError as e:
+                reason = "The guest control channel did not become ready."
+                with suppress(Exception):
+                    if self._resolve_channel().kind == "ssh":
+                        reason = "SSH did not become ready on the guest."
                 raise CommandExecutionUnavailableError(
                     vm_id=self._vm_id,
-                    reason="SSH did not become ready on the guest.",
+                    reason=reason,
                     remediation=self._command_exec_remediation(),
                 ) from e
 
-        if self._ssh is None:
+        if self._control_channel is None:
             raise SmolVMError(
-                "Cannot run command: SSH client is not initialized",
+                "Cannot run command: control channel is not initialized",
                 {"vm_id": self._vm_id},
             )
 
@@ -1909,7 +1931,7 @@ class SmolVM:
         self._callbacks.fire("on_pre_run", ctx, propagate=True)
 
         try:
-            result = self._ssh.run(command, timeout=timeout, shell=shell)
+            result = self._control_channel.run(command, timeout=timeout, shell=shell)
         except Exception as exc:
             ctx.error = exc
             self._callbacks.fire("on_run_error", ctx, propagate=False)
@@ -2038,7 +2060,7 @@ class SmolVM:
             sep = "\\" if destination.endswith("\\") else "/"
             destination = f"{destination.rstrip(chr(92) + '/')}{sep}{source.name}"
 
-        ssh = self._ensure_ssh_for_file_transfer()
+        channel = self._ensure_control_for_file_transfer()
         if make_dirs:
             if is_windows_path:
                 parent = _windows_guest_parent_dir(destination)
@@ -2053,7 +2075,7 @@ class SmolVM:
                     ps_parent = _windows_path_for_powershell(parent)
                     safe_parent = ps_parent.replace("'", "''")
                     cmd = f"New-Item -ItemType Directory -Force -Path '{safe_parent}' | Out-Null"
-                    result = ssh.run(cmd, timeout=30, shell="login")
+                    result = channel.run(cmd, timeout=30, shell="login")
                     if result.exit_code != 0:
                         stderr = result.stderr.strip()
                         raise SmolVMError(
@@ -2063,7 +2085,7 @@ class SmolVM:
             else:
                 parent = _guest_parent_dir(destination)
                 if parent:
-                    result = ssh.run(
+                    result = channel.run(
                         f"mkdir -p -- {shlex.quote(parent)}",
                         timeout=30,
                         shell="raw",
@@ -2074,7 +2096,7 @@ class SmolVM:
                             f"Could not create directory {parent!r} in the sandbox: {stderr}",
                             {"vm_id": self._vm_id, "guest_path": destination},
                         )
-        ssh.put_file(source, destination)
+        channel.put_file(source, destination)
         return destination
 
     def download_file(
@@ -2135,9 +2157,52 @@ class SmolVM:
                 {"vm_id": self._vm_id, "local_path": str(destination)},
             )
 
-        ssh = self._ensure_ssh_for_file_transfer()
-        ssh.get_file(guest_path, destination)
+        channel = self._ensure_control_for_file_transfer()
+        channel.get_file(guest_path, destination)
         return str(destination)
+
+    def wait_for_ready(
+        self,
+        timeout: float = 60.0,
+        *,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> SmolVM:
+        """Wait for the resolved guest control channel to become available.
+
+        Args:
+            timeout: Maximum seconds to wait.
+            on_progress: Optional callback invoked with the phase label
+                ``"Waiting for sandbox..."`` when an actual wait is needed.
+                Skipped when the control channel is already ready, so the CLI doesn't
+                flash a misleading label for a no-op call.
+
+        Returns:
+            ``self`` for method chaining.
+
+        Raises:
+            OperationTimeoutError: If SSH is not available in time.
+            SmolVMError: If the VM is not running.
+        """
+        self._refresh_info()
+
+        if self._info.status != VMState.RUNNING:
+            raise SmolVMError(
+                f"Start sandbox '{self._vm_id}' before waiting for it by running "
+                f"'smolvm start {self._vm_id}' (current state: {self._info.status.value}).",
+                {"vm_id": self._vm_id},
+            )
+        if self._resolve_channel().kind == "ssh" and self._info.network is None:
+            raise SmolVMError(
+                f"Cannot wait for sandbox '{self._vm_id}' over SSH because it has no network; "
+                f"remove it with 'smolvm delete {self._vm_id}' and create it again.",
+                {"vm_id": self._vm_id},
+            )
+
+        self._ensure_control_cache_attrs()
+        if on_progress is not None and not self._control_ready:
+            on_progress("Waiting for sandbox...")
+        self._wait_for_ready(timeout=timeout)
+        return self
 
     def wait_for_ssh(
         self,
@@ -2147,19 +2212,8 @@ class SmolVM:
     ) -> SmolVM:
         """Wait for SSH to become available on the guest.
 
-        Args:
-            timeout: Maximum seconds to wait.
-            on_progress: Optional callback invoked with the phase label
-                ``"Waiting for SSH..."`` when an actual wait is needed.
-                Skipped when SSH is already ready, so the CLI doesn't
-                flash a misleading label for a no-op call.
-
-        Returns:
-            ``self`` for method chaining.
-
-        Raises:
-            OperationTimeoutError: If SSH is not available in time.
-            SmolVMError: If the VM is not running.
+        Use :meth:`wait_for_ready` when you only need the resolved command
+        control channel, which may be vsock.
         """
         self._refresh_info()
 
@@ -2177,7 +2231,7 @@ class SmolVM:
 
         if on_progress is not None and not self._ssh_ready:
             on_progress("Waiting for SSH...")
-        self._wait_for_ssh(timeout=timeout)
+        self._wait_for_ssh_over_network(timeout=timeout)
         return self
 
     def ssh_commands(
@@ -2484,10 +2538,11 @@ class SmolVM:
         return self
 
     def can_run_commands(self) -> bool:
-        """Whether this VM config supports command execution via SSH.
+        """Whether this VM config supports command execution.
 
-        Command execution requires a boot path that is expected to
-        bring up SSH inside the guest. Three shapes qualify:
+        Explicit or auto-selected vsock is command-capable because it uses the
+        guest agent. SSH command execution requires a boot path that is
+        expected to bring up SSH inside the guest. Three SSH shapes qualify:
 
         1. ``ssh_capable=True`` — the caller has explicitly declared the
            boot path brings up SSH (used by prebuilt cloud images, S3
@@ -2496,6 +2551,8 @@ class SmolVM:
            command line (the alpine docker-build path).
         3. A legacy initrd-backed boot with ``ssh_capable`` implicitly set.
         """
+        if self._resolve_channel().kind == "vsock":
+            return True
         config = self._info.config
         ssh_capable = getattr(config, "ssh_capable", False)
         if ssh_capable is True:
@@ -2533,15 +2590,9 @@ class SmolVM:
                     "Cannot inject environment variables: VM image does not support SSH.",
                     {"vm_id": self._vm_id},
                 )
-            await self.async_wait_for_ssh(timeout=boot_timeout)
-            if self._ssh is None:
-                self._ssh = self._new_ssh_client(
-                    host=self._info.network.guest_ip,
-                    key_path=self._ssh_key_path,
-                )
-                self._ssh_ready = True
+            ssh = await asyncio.to_thread(self._ensure_ssh_for_env, timeout=boot_timeout)
             injector = inject_env_vars_windows if self._is_windows_guest() else inject_env_vars
-            await asyncio.to_thread(injector, self._ssh, env_vars)
+            await asyncio.to_thread(injector, ssh, env_vars)
 
         # Mount workspace directories after boot if configured.
         if self._info.config.workspace_mounts:
@@ -2551,13 +2602,7 @@ class SmolVM:
                     {"vm_id": self._vm_id},
                 )
             if not self._ssh_ready:
-                await self.async_wait_for_ssh(timeout=boot_timeout)
-            if self._ssh is None:
-                self._ssh = self._new_ssh_client(
-                    host=self._info.network.guest_ip,
-                    key_path=self._ssh_key_path,
-                )
-                self._ssh_ready = True
+                await asyncio.to_thread(self._wait_for_ssh_over_network, timeout=boot_timeout)
             await asyncio.to_thread(self._mount_workspaces)
 
         return self
@@ -2604,118 +2649,24 @@ class SmolVM:
 
         # Resolve and connect the channel (vsock or SSH) off the event loop,
         # then run the command. Both transports are synchronous.
-        channel = await asyncio.to_thread(self._ensure_ssh_for_operation, action="run a command")
+        channel = await asyncio.to_thread(
+            self._ensure_control_for_operation, action="run a command"
+        )
         return await asyncio.to_thread(channel.run, command, timeout=timeout, shell=shell)
 
-    async def async_wait_for_ssh(self, timeout: float = 60.0) -> SmolVM:
-        """Async version of :meth:`wait_for_ssh`.
-
-        Uses ``asyncio.sleep`` for polling instead of ``time.sleep``.
-        """
+    async def async_wait_for_ready(self, timeout: float = 60.0) -> SmolVM:
+        """Async version of :meth:`wait_for_ready`."""
         import asyncio
 
-        self._refresh_info()
-        if self._ssh_ready:
-            return self
+        await asyncio.to_thread(self.wait_for_ready, timeout=timeout)
+        return self
 
-        # Honor the resolved control channel: try vsock before SSH so an
-        # explicit comm_channel="vsock" never silently downgrades on the async
-        # path (mirrors the sync _wait_for_ssh dispatch).
-        resolution = self._resolve_channel()
-        if resolution.kind == "vsock":
-            probe = timeout
-            if resolution.allow_fallback:
-                probe = min(timeout, _VSOCK_AUTO_PROBE_TIMEOUT)
-            if await asyncio.to_thread(self._try_vsock_ready, probe):
-                return self
-            if not resolution.allow_fallback:
-                raise OperationTimeoutError(
-                    "wait_for_ready: the guest vsock agent did not respond", timeout
-                )
+    async def async_wait_for_ssh(self, timeout: float = 60.0) -> SmolVM:
+        """Async version of :meth:`wait_for_ssh`."""
+        import asyncio
 
-        network = self._info.network
-        if network is None:
-            raise SmolVMError("VM has no network", {"vm_id": self._vm_id})
-
-        primary_key = self._ssh_key_path or self._default_ssh_key_path
-
-        ordered_endpoints: list[tuple[str, int]] = []
-        if network.ssh_host_port is not None:
-            ordered_endpoints.append(("127.0.0.1", network.ssh_host_port))
-        if network.guest_ip:
-            ordered_endpoints.append((network.guest_ip, 22))
-
-        attempts: list[tuple[str, int, str | None]] = []
-        for host, port in ordered_endpoints:
-            attempts.append((host, port, primary_key))
-
-        if primary_key is None:
-            from smolvm.utils import ensure_ssh_key
-
-            try:
-                default_key, _ = ensure_ssh_key()
-                default_key_str = str(default_key)
-                for host, port in ordered_endpoints:
-                    attempt = (host, port, default_key_str)
-                    if attempt in attempts:
-                        continue
-                    attempts.append(attempt)
-            except Exception as exc:
-                # Best-effort: if we cannot ensure a default SSH key, just skip
-                # adding fallback key-based connection attempts, but record why.
-                logger.debug(
-                    "Failed to ensure default SSH key for VM %s: %s",
-                    self._vm_id,
-                    exc,
-                )
-
-        deadline = time.monotonic() + timeout
-        errors: list[str] = []
-
-        for host, port, key_path in attempts:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            label = f"wait_for_ssh({host}:{port})"
-            try:
-                # Poll SSH with async sleep
-                start_time = time.monotonic()
-                ssh_timeout = min(remaining, timeout / len(attempts))
-                while time.monotonic() - start_time < ssh_timeout:
-                    try:
-                        # Use the factory so Windows guests get powershell
-                        # shell_kind and ssh_password is honored — direct
-                        # SSHClient construction here was a silent regression
-                        # against the sync wait_for_ssh path. Tight
-                        # connect_timeout (2s) keeps the polling loop
-                        # iterating quickly within the per-endpoint budget.
-                        ssh = await asyncio.to_thread(
-                            self._new_ssh_client,
-                            host=host,
-                            port=port,
-                            key_path=key_path,
-                            connect_timeout=2,
-                        )
-                        self._ssh = ssh
-                        self._ssh_ready = True
-                        logger.info("SSH ready: %s:%d", host, port)
-                        return self
-                    except Exception as e:
-                        last_error = str(e)
-                        await asyncio.sleep(0.5)
-
-                errors.append(
-                    f"{host}:{port} [key={key_path}] "
-                    f"(Operation '{label}: last error: {last_error}' timed out "
-                    f"after {time.monotonic() - start_time:.1f}s)"
-                )
-            except Exception as e:
-                errors.append(f"{host}:{port} [key={key_path}] ({e})")
-
-        raise OperationTimeoutError(
-            f"wait_for_ssh: {'; '.join(errors)}",
-            timeout,
-        )
+        await asyncio.to_thread(self.wait_for_ssh, timeout=timeout)
+        return self
 
     @classmethod
     async def async_create_many(
@@ -2954,6 +2905,10 @@ modprobe 9pnet_virtio""".strip()
 
     def _reset_runtime_state(self, *, close_ssh: bool = True) -> None:
         """Clear cached runtime connection state after lifecycle changes."""
+        if self._control_channel is not None and self._control_channel is not self._ssh:
+            self._control_channel.close()
+        self._control_channel = None
+        self._control_ready = False
         if close_ssh and self._ssh is not None:
             self._ssh.close()
         if close_ssh:
@@ -2961,6 +2916,13 @@ modprobe 9pnet_virtio""".strip()
         self._ssh_ready = False
         if hasattr(self, "_probed_endpoint"):
             self._probed_endpoint = None
+
+    def _ensure_control_cache_attrs(self) -> None:
+        """Initialize control-channel cache fields for legacy test fixtures."""
+        if not hasattr(self, "_control_channel"):
+            self._control_channel = self._ssh if getattr(self, "_ssh_ready", False) else None
+        if not hasattr(self, "_control_ready"):
+            self._control_ready = self._control_channel is not None
 
     def _guest_shell_kind(self) -> ShellKind:
         """Pick the SSHClient login-shell flavor for this guest OS.
@@ -3011,15 +2973,65 @@ modprobe 9pnet_virtio""".strip()
             shell_kind=self._guest_shell_kind(),
         )
 
-    def _ensure_ssh_for_file_transfer(self) -> SSHClient:
-        """Return a ready SSH client for file transfer operations."""
-        return self._ensure_ssh_for_operation(action="transfer files")
+    def _ensure_control_for_file_transfer(self) -> CommChannel:
+        """Return a ready control channel for file transfer operations."""
+        return self._ensure_control_for_operation(action="transfer files")
 
-    def _ensure_ssh_for_env(self) -> SSHClient:
+    def _ensure_ssh_for_env(self, *, timeout: float = _DEFAULT_RUN_READY_TIMEOUT) -> SSHClient:
         """Return a ready SSH client for env operations on a running VM."""
-        return self._ensure_ssh_for_operation(action="manage environment variables")
+        return self._ensure_ssh_for_operation(
+            action="manage environment variables",
+            timeout=timeout,
+        )
 
-    def _ensure_ssh_for_operation(self, *, action: str) -> SSHClient:
+    def _ensure_control_for_operation(
+        self,
+        *,
+        action: str,
+        timeout: float = _DEFAULT_RUN_READY_TIMEOUT,
+    ) -> CommChannel:
+        """Return a ready command/file-transfer control channel."""
+        prefix = f"Cannot {action}"
+        self._refresh_info()
+
+        if self._info.status != VMState.RUNNING:
+            raise SmolVMError(
+                f"{prefix} in sandbox '{self._vm_id}' because it is "
+                f"{self._info.status.value}; start it with 'smolvm start {self._vm_id}'.",
+                {"vm_id": self._vm_id},
+            )
+        resolution = self._resolve_channel()
+        if not self.can_run_commands():
+            raise CommandExecutionUnavailableError(
+                vm_id=self._vm_id,
+                reason="VM config does not advertise a command-capable boot path.",
+                remediation=self._command_exec_remediation(),
+            )
+        if resolution.kind == "ssh" and self._info.network is None:
+            raise SmolVMError(
+                f"{prefix} in sandbox '{self._vm_id}' over SSH because it has no network; "
+                f"remove it with 'smolvm delete {self._vm_id}' and create it again.",
+                {"vm_id": self._vm_id},
+            )
+
+        self._ensure_control_cache_attrs()
+        if not self._control_ready:
+            self._wait_for_ready(timeout=timeout)
+
+        if self._control_channel is None:
+            raise SmolVMError(
+                f"{prefix}: control channel is not initialized",
+                {"vm_id": self._vm_id},
+            )
+
+        return self._control_channel
+
+    def _ensure_ssh_for_operation(
+        self,
+        *,
+        action: str,
+        timeout: float = _DEFAULT_RUN_READY_TIMEOUT,
+    ) -> SSHClient:
         """Return a ready SSH client for operations that need guest SSH."""
         prefix = f"Cannot {action}"
         self._refresh_info()
@@ -3045,7 +3057,7 @@ modprobe 9pnet_virtio""".strip()
             )
 
         if not self._ssh_ready:
-            self._wait_for_ssh(timeout=_DEFAULT_RUN_READY_TIMEOUT)
+            self._wait_for_ssh_over_network(timeout=timeout)
 
         if self._ssh is None:
             raise SmolVMError(
@@ -3125,6 +3137,7 @@ modprobe 9pnet_virtio""".strip()
         *,
         deadline: float,
         errors: list[str],
+        as_control: bool = False,
     ) -> bool:
         """Try a sequence of SSH endpoint/key combinations.
 
@@ -3155,6 +3168,9 @@ modprobe 9pnet_virtio""".strip()
                 client.wait_for_ssh(timeout=endpoint_timeout)
                 self._ssh = client
                 self._ssh_ready = True
+                if as_control:
+                    self._control_channel = client
+                    self._control_ready = True
                 if self._ssh_key_path is None and key_path is not None:
                     self._ssh_key_path = key_path
                     logger.debug(
@@ -3172,15 +3188,21 @@ modprobe 9pnet_virtio""".strip()
     def _resolve_channel(self) -> ChannelResolution:
         """Resolve which control channel this VM should use."""
         config = self._info.config
-        return resolve_comm_channel(
-            requested=self._comm_channel_request,
-            config_channel=getattr(config, "comm_channel", None),
-            backend=getattr(config, "backend", None),
-            guest_os=getattr(config, "guest_os", None),
-        )
+        try:
+            return resolve_comm_channel(
+                requested=getattr(self, "_comm_channel_request", None),
+                config_channel=getattr(config, "comm_channel", None),
+                backend=getattr(config, "backend", None),
+                guest_os=getattr(config, "guest_os", None),
+            )
+        except VsockNotSupportedError as exc:
+            raise SmolVMError(
+                _vsock_not_supported_message(self._vm_id, exc),
+                {"vm_id": self._vm_id, **exc.details},
+            ) from exc
 
     def _try_vsock_ready(self, timeout: float) -> bool:
-        """Probe the guest vsock agent; on success cache the channel.
+        """Probe the guest vsock agents; on success cache the control channel.
 
         Returns True if the agent answered within *timeout*. Requires a
         reserved CID (``config.vsock``) — without one (e.g. a VM created
@@ -3190,22 +3212,45 @@ modprobe 9pnet_virtio""".strip()
         vsock = getattr(self._info.config, "vsock", None)
         if vsock is None:
             return False
-        channel = VsockChannel.from_cid(vsock.guest_cid)
-        try:
-            channel.wait_ready(timeout=timeout)
-        except (OperationTimeoutError, SmolVMError, OSError):
-            return False
-        self._ssh = channel  # type: ignore[assignment]  # CommChannel duck-types
-        self._ssh_ready = True
-        return True
+        channels: list[CommChannel] = []
+        backend = getattr(self._info.config, "backend", None)
+        if backend == BACKEND_FIRECRACKER:
+            uds_path = vsock.uds_path or getattr(self._info, "vsock_uds_path", None)
+            if not uds_path:
+                return False
+            channels = [
+                RustHttpVsockChannel.from_uds(uds_path),
+                LegacyFramedVsockChannel.from_uds(uds_path),
+            ]
+        else:
+            channels = [
+                RustHttpVsockChannel.from_cid(vsock.guest_cid),
+                LegacyFramedVsockChannel.from_cid(vsock.guest_cid),
+            ]
 
-    def _wait_for_ssh(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        for channel in channels:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                channel.wait_ready(timeout=remaining)
+            except (OperationTimeoutError, SmolVMError, OSError):
+                channel.close()
+                continue
+            self._control_channel = channel
+            self._control_ready = True
+            return True
+        return False
+
+    def _wait_for_ready(self, timeout: float) -> None:
         """Wait until the resolved control channel is ready.
 
-        Named ``_wait_for_ssh`` for back-compat; it now dispatches to vsock
-        when that's the resolved channel, falling back to SSH only when the
-        selection was automatic (never for an explicit ``comm_channel='vsock'``).
+        It tries vsock when that is the resolved channel, falling back to SSH
+        only when channel selection was automatic.
         """
+        if self._control_ready:
+            return
         resolution = self._resolve_channel()
         if resolution.kind == "vsock":
             deadline = time.monotonic() + timeout
@@ -3219,18 +3264,18 @@ modprobe 9pnet_virtio""".strip()
                     "wait_for_ready: the guest vsock agent did not respond", timeout
                 )
             logger.info("VM %s: vsock agent not reachable, falling back to SSH", self._vm_id)
-            self._wait_for_ssh_over_network(max(1.0, deadline - time.monotonic()))
+            self._wait_for_ssh_over_network(
+                max(1.0, deadline - time.monotonic()),
+                as_control=True,
+            )
             return
-        self._wait_for_ssh_over_network(timeout)
+        self._wait_for_ssh_over_network(timeout, as_control=True)
 
-    def _wait_for_ssh_over_network(self, timeout: float) -> None:
+    def _wait_for_ssh_over_network(self, timeout: float, *, as_control: bool = False) -> None:
         """Wait for SSH across available network endpoints."""
         endpoints = self._ssh_endpoints()
 
         # Prefer the already selected client first, then try remaining candidates.
-        # self._ssh is only ever an SSHClient here: _try_vsock_ready assigns the
-        # vsock channel solely on success, after which _wait_for_ssh returns
-        # before reaching this network path.
         ordered_endpoints = endpoints
         if self._ssh is not None:
             current = (self._ssh.host, self._ssh.port)
@@ -3269,10 +3314,18 @@ modprobe 9pnet_virtio""".strip()
 
         errors: list[str] = []
         deadline = time.monotonic() + timeout
-        if self._attempt_ssh_candidates(attempts, deadline=deadline, errors=errors):
+        if self._attempt_ssh_candidates(
+            attempts,
+            deadline=deadline,
+            errors=errors,
+            as_control=as_control,
+        ):
             return
 
-        self._ssh_ready = False
+        if as_control:
+            self._control_ready = False
+        else:
+            self._ssh_ready = False
         detail = "; ".join(errors) if errors else "no endpoint attempts completed"
         raise OperationTimeoutError(f"wait_for_ssh: {detail}", timeout)
 

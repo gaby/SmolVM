@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from uuid import uuid4
 
-from smolvm.comm.select import resolve_comm_channel
+from smolvm.comm.select import VsockNotSupportedError, resolve_comm_channel
 from smolvm.exceptions import (
     NetworkError,
     SmolVMError,
@@ -241,6 +241,14 @@ def _crashed_message(vm_id: str) -> str:
     return (
         f"VM '{vm_id}' is not running — its process has exited; "
         f"run 'smolvm delete {vm_id}' to clear it."
+    )
+
+
+def _vsock_not_supported_message(vm_id: str, error: VsockNotSupportedError) -> str:
+    """Format a user-facing explicit-vsock failure at the VM boundary."""
+    return (
+        f"Cannot use vsock for sandbox '{vm_id}': {error.reason}; "
+        "create it with comm_channel='ssh'."
     )
 
 
@@ -1308,20 +1316,27 @@ class SmolVMManager:
     def _maybe_enable_vsock(self, config: VMConfig, backend: str, vm_info: VMInfo) -> VMInfo:
         """Reserve a vsock CID and persist ``config.vsock`` when needed.
 
-        Auto/explicit vsock control channels need a reserved CID. An explicit
-        QEMU vsock device also needs reservation even when the control channel
-        is SSH, otherwise two guests could be configured with the same CID.
-        The reservation happens after the VM row exists because ``vsock_cids``
-        references it.
+        Auto/explicit vsock control channels need a reserved CID. QEMU uses the
+        CID directly from the host. Firecracker exposes the same guest CID via a
+        host-side Unix socket, so the generated UDS path is also persisted in
+        ``config.vsock`` for the facade to dial.
         """
-        resolution = resolve_comm_channel(
-            requested=None,
-            config_channel=config.comm_channel,
-            backend=backend,
-            guest_os=config.guest_os,
-        )
+        try:
+            resolution = resolve_comm_channel(
+                requested=None,
+                config_channel=config.comm_channel,
+                backend=backend,
+                guest_os=config.guest_os,
+            )
+        except VsockNotSupportedError as exc:
+            raise SmolVMError(
+                _vsock_not_supported_message(config.vm_id, exc),
+                {"vm_id": config.vm_id, **exc.details},
+            ) from exc
         requested_vsock = config.vsock
-        should_reserve_device = backend == BACKEND_QEMU and requested_vsock is not None
+        should_reserve_device = (
+            backend in {BACKEND_QEMU, BACKEND_FIRECRACKER} and requested_vsock is not None
+        )
         if resolution.kind != "vsock" and not should_reserve_device:
             return vm_info
 
@@ -1329,11 +1344,14 @@ class SmolVMManager:
             config.vm_id,
             requested_vsock.guest_cid if requested_vsock is not None else None,
         )
+        uds_path = requested_vsock.uds_path if requested_vsock is not None else None
+        if backend == BACKEND_FIRECRACKER and uds_path is None:
+            uds_path = str(self.socket_dir / f"vsock-{config.vm_id}.sock")
         updated = config.model_copy(
             update={
                 "vsock": VsockConfig(
                     guest_cid=cid,
-                    uds_path=requested_vsock.uds_path if requested_vsock is not None else None,
+                    uds_path=uds_path,
                 )
             }
         )
@@ -1596,12 +1614,7 @@ class SmolVMManager:
             # Update VM with network info
             vm_info = self.state.update_vm(effective_config.vm_id, network=network_config)
 
-            # QEMU-on-TAP still uses the vsock control channel (unique per-host
-            # CID reserved from state). Firecracker manages its own vsock via
-            # the VsockConfig passed directly in the VM config, so this is a
-            # no-op there.
-            if backend == BACKEND_QEMU:
-                vm_info = self._maybe_enable_vsock(effective_config, backend, vm_info)
+            vm_info = self._maybe_enable_vsock(effective_config, backend, vm_info)
 
             logger.info(
                 "VM created: %s (IP: %s, TAP: %s)",
@@ -1964,6 +1977,8 @@ class SmolVMManager:
             (snapshot.artifacts.memory_path, "mem_file_path"),
         ]
         for required_path, label in required_artifacts:
+            if snapshot.snapshot_type == SnapshotType.DISK and label != "disk_path":
+                continue
             if required_path is None:
                 if snapshot.backend == BACKEND_QEMU and label != "disk_path":
                     continue
@@ -2074,6 +2089,8 @@ class SmolVMManager:
                 pid=launch.pid,
                 control_socket_path=launch.control_socket_path,
             )
+            if launch.vsock_uds_path is not None:
+                vm_info = vm_info.model_copy(update={"vsock_uds_path": launch.vsock_uds_path})
             self.state.mark_snapshot_restored(snapshot_id, restore_vm_id)
             if existing_disk_backup_path is not None and existing_disk_backup_path.exists():
                 with suppress(Exception):
@@ -2093,6 +2110,7 @@ class SmolVMManager:
                             network=effective_snapshot.network_config,
                             pid=launch.pid,
                             control_socket_path=launch.control_socket_path,
+                            vsock_uds_path=launch.vsock_uds_path,
                         ),
                         timeout=5.0,
                     )
@@ -2915,10 +2933,7 @@ class SmolVMManager:
             )
             vm_info = self.state.update_vm(effective_config.vm_id, network=network_config)
 
-            # QEMU-on-TAP still uses the vsock control channel (see the sync
-            # create path for the rationale). No-op for Firecracker.
-            if backend == BACKEND_QEMU:
-                vm_info = self._maybe_enable_vsock(effective_config, backend, vm_info)
+            vm_info = self._maybe_enable_vsock(effective_config, backend, vm_info)
 
             return vm_info
 

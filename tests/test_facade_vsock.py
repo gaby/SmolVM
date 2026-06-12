@@ -15,7 +15,7 @@
 """Facade-level tests for the vsock control-channel seam.
 
 These build a SmolVM via ``__new__`` (bypassing the SDK/create path) and drive
-``_wait_for_ssh`` directly, so they validate channel resolution + dispatch
+``_wait_for_ready`` directly, so they validate channel resolution + dispatch
 without booting a VM.
 """
 
@@ -24,10 +24,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from smolvm.comm.rust_http_vsock_channel import RustHttpVsockChannel
 from smolvm.comm.vsock_channel import VsockChannel
 from smolvm.exceptions import OperationTimeoutError
 from smolvm.facade import SmolVM
-from smolvm.types import GuestOS, VMConfig, VMInfo, VMState, VsockConfig
+from smolvm.types import (
+    CommandResult,
+    GuestOS,
+    NetworkConfig,
+    VMConfig,
+    VMInfo,
+    VMState,
+    VsockConfig,
+)
 
 
 def _vsock_vm(tmp_path: Path, *, comm_channel: str | None, request: str | None) -> SmolVM:
@@ -50,6 +59,9 @@ def _vsock_vm(tmp_path: Path, *, comm_channel: str | None, request: str | None) 
     vm = SmolVM.__new__(SmolVM)
     vm._comm_channel_request = request
     vm._vm_id = "vm1"
+    vm._control_channel = None
+    vm._control_ready = False
+    vm._callbacks = MagicMock()
     vm._ssh = None
     vm._ssh_ready = False
     vm._info = info
@@ -58,18 +70,84 @@ def _vsock_vm(tmp_path: Path, *, comm_channel: str | None, request: str | None) 
     return vm
 
 
-def test_wait_for_ssh_uses_vsock_when_agent_answers(
+def test_wait_for_ready_uses_rust_vsock_when_agent_answers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("smolvm.comm.select.host_supports_vsock", lambda: True)
-    monkeypatch.setattr(VsockChannel, "wait_ready", lambda self, timeout=60.0, interval=0.1: None)
+    monkeypatch.setattr(
+        RustHttpVsockChannel,
+        "wait_ready",
+        lambda self, timeout=60.0, interval=0.1: None,
+    )
 
     vm = _vsock_vm(tmp_path, comm_channel="vsock", request=None)
-    vm._wait_for_ssh(timeout=5)
+    vm._wait_for_ready(timeout=5)
 
+    assert vm._control_ready is True
+    assert isinstance(vm._control_channel, RustHttpVsockChannel)
+    assert vm._control_channel.guest_cid == 5
+    assert vm._ssh is None
+
+
+def test_public_vsock_ready_and_run_do_not_require_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("smolvm.comm.select.host_supports_vsock", lambda: True)
+    monkeypatch.setattr(
+        RustHttpVsockChannel,
+        "wait_ready",
+        lambda self, timeout=60.0, interval=0.1: None,
+    )
+    monkeypatch.setattr(
+        RustHttpVsockChannel,
+        "run",
+        lambda self, command, timeout=30, shell="login": CommandResult(
+            exit_code=0, stdout="ok", stderr=""
+        ),
+    )
+
+    vm = _vsock_vm(tmp_path, comm_channel="vsock", request="vsock")
+
+    vm.wait_for_ready(timeout=5)
+    result = vm.run("printf ok")
+
+    assert result.stdout == "ok"
+    assert vm._control_ready is True
+    assert vm._info.network is None
+
+
+def test_wait_for_ssh_waits_for_ssh_not_vsock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SSH-named public API must not report readiness from the vsock agent."""
+    vm = _vsock_vm(tmp_path, comm_channel="vsock", request="vsock")
+    network = NetworkConfig(
+        guest_ip="172.16.0.2",
+        tap_device="tap0",
+        guest_mac="02:00:00:00:00:01",
+        ssh_host_port=2200,
+    )
+    vm._info = vm._info.model_copy(update={"network": network})
+    vm._sdk.get.return_value = vm._info
+
+    def _wait_for_ready(self, timeout: float) -> None:
+        raise AssertionError("wait_for_ssh must not use the vsock control waiter")
+
+    seen: dict[str, float | bool] = {}
+
+    def _wait_for_ssh_over_network(self, timeout: float, *, as_control: bool = False) -> None:
+        seen["timeout"] = timeout
+        seen["as_control"] = as_control
+        self._ssh_ready = True
+
+    monkeypatch.setattr(SmolVM, "_wait_for_ready", _wait_for_ready)
+    monkeypatch.setattr(SmolVM, "_wait_for_ssh_over_network", _wait_for_ssh_over_network)
+
+    vm.wait_for_ssh(timeout=5)
+
+    assert seen == {"timeout": 5, "as_control": False}
     assert vm._ssh_ready is True
-    assert isinstance(vm._ssh, VsockChannel)
-    assert vm._ssh.guest_cid == 5
+    assert vm._control_ready is False
 
 
 def test_explicit_vsock_does_not_fall_back_to_ssh(
@@ -80,13 +158,14 @@ def test_explicit_vsock_does_not_fall_back_to_ssh(
     def _fail(self, timeout=60.0, interval=0.1):
         raise OperationTimeoutError("vsock", timeout)
 
+    monkeypatch.setattr(RustHttpVsockChannel, "wait_ready", _fail)
     monkeypatch.setattr(VsockChannel, "wait_ready", _fail)
 
     # request="vsock" → explicit, allow_fallback=False
     vm = _vsock_vm(tmp_path, comm_channel="vsock", request="vsock")
     with pytest.raises(OperationTimeoutError):
-        vm._wait_for_ssh(timeout=1)
-    assert vm._ssh_ready is False
+        vm._wait_for_ready(timeout=1)
+    assert vm._control_ready is False
 
 
 def test_auto_vsock_falls_back_to_ssh_within_probe_budget(
@@ -98,32 +177,36 @@ def test_auto_vsock_falls_back_to_ssh_within_probe_budget(
 
     monkeypatch.setattr("smolvm.comm.select.host_supports_vsock", lambda: True)
 
-    seen = {}
+    seen = {"probe_timeouts": []}
 
     def _fail(self, timeout=60.0, interval=0.1):
-        seen["probe_timeout"] = timeout
+        seen["probe_timeouts"].append(timeout)
         raise OperationTimeoutError("vsock", timeout)
 
+    monkeypatch.setattr(RustHttpVsockChannel, "wait_ready", _fail)
     monkeypatch.setattr(VsockChannel, "wait_ready", _fail)
 
     ssh_called = {}
 
-    def _ssh_ok(self, timeout):
+    def _ssh_ok(self, timeout, *, as_control=False):
         ssh_called["timeout"] = timeout
-        self._ssh_ready = True
+        ssh_called["as_control"] = as_control
+        self._control_ready = True
 
     monkeypatch.setattr(SmolVM, "_wait_for_ssh_over_network", _ssh_ok)
 
     # auto channel (comm_channel=None, request=None) → vsock with fallback
     vm = _vsock_vm(tmp_path, comm_channel=None, request=None)
-    vm._wait_for_ssh(timeout=30)
+    vm._wait_for_ready(timeout=30)
 
     # vsock probe was capped at the (short) auto budget, not the 30s call timeout
-    assert seen["probe_timeout"] == facade._VSOCK_AUTO_PROBE_TIMEOUT
+    assert seen["probe_timeouts"][0] == pytest.approx(facade._VSOCK_AUTO_PROBE_TIMEOUT)
+    assert all(timeout <= facade._VSOCK_AUTO_PROBE_TIMEOUT for timeout in seen["probe_timeouts"])
     assert facade._VSOCK_AUTO_PROBE_TIMEOUT <= 3.0  # guardrail stays short
     # and we then fell back to SSH
     assert ssh_called  # SSH path was taken
-    assert vm._ssh_ready is True
+    assert ssh_called["as_control"] is True
+    assert vm._control_ready is True
 
 
 def test_resolve_channel_reads_config_and_request(
