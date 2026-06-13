@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from uuid import uuid4
 
-from smolvm.comm.select import VsockNotSupportedError, resolve_comm_channel
+from smolvm.comm.select import ChannelResolution, VsockNotSupportedError, resolve_comm_channel
 from smolvm.exceptions import (
     NetworkError,
     SmolVMError,
@@ -244,11 +244,30 @@ def _crashed_message(vm_id: str) -> str:
     )
 
 
-def _vsock_not_supported_message(vm_id: str, error: VsockNotSupportedError) -> str:
+def _vsock_recovery_command(vm_id: str, backend: str) -> str:
+    """Return a CLI recovery command for an explicit-vsock create failure."""
+    return f"smolvm create --name {vm_id} --backend {backend}"
+
+
+def _vsock_not_supported_message(
+    vm_id: str,
+    error: VsockNotSupportedError,
+    *,
+    recovery_command: str,
+) -> str:
     """Format a user-facing explicit-vsock failure at the VM boundary."""
+    reason_by_code = {
+        "vsock_not_supported_for_windows": "Windows guests use SSH in this release",
+        "vsock_not_supported_for_backend": "this backend does not support vsock in this release",
+        "vsock_host_device_missing": "this host is missing QEMU vsock support",
+        "vsock_not_supported_for_firecracker_host": (
+            "Firecracker vsock is only available on Linux"
+        ),
+    }
+    reason = reason_by_code.get(error.code, "vsock is not available for this sandbox")
     return (
-        f"Cannot use vsock for sandbox '{vm_id}': {error.reason}; "
-        "create it with comm_channel='ssh'."
+        f"Cannot use vsock for sandbox '{vm_id}': {reason}; "
+        f"create it with SSH by running: {recovery_command}."
     )
 
 
@@ -1313,6 +1332,49 @@ class SmolVMManager:
 
         return errors
 
+    def _resolve_control_channel_for_config(
+        self,
+        config: VMConfig,
+        backend: str,
+    ) -> ChannelResolution:
+        """Resolve the create-time control channel for *config*."""
+        try:
+            return resolve_comm_channel(
+                requested=None,
+                config_channel=config.comm_channel,
+                backend=backend,
+                guest_os=config.guest_os,
+            )
+        except VsockNotSupportedError as exc:
+            recovery_command = _vsock_recovery_command(config.vm_id, backend)
+            raise SmolVMError(
+                _vsock_not_supported_message(
+                    config.vm_id,
+                    exc,
+                    recovery_command=recovery_command,
+                ),
+                {"vm_id": config.vm_id, "recovery_command": recovery_command},
+            ) from exc
+
+    def _should_reserve_ssh_forward(
+        self,
+        config: VMConfig,
+        backend: str,
+        *,
+        resolution: ChannelResolution | None = None,
+    ) -> bool:
+        """Return whether create-time networking must expose guest SSH."""
+        if config.env_vars or config.workspace_mounts:
+            return True
+
+        resolution = resolution or self._resolve_control_channel_for_config(config, backend)
+        if resolution.kind == "ssh":
+            return True
+        if resolution.allow_fallback:
+            return True
+
+        return backend == BACKEND_QEMU and config.qemu_network == "slirp"
+
     def _maybe_enable_vsock(self, config: VMConfig, backend: str, vm_info: VMInfo) -> VMInfo:
         """Reserve a vsock CID and persist ``config.vsock`` when needed.
 
@@ -1321,18 +1383,7 @@ class SmolVMManager:
         host-side Unix socket, so the generated UDS path is also persisted in
         ``config.vsock`` for the facade to dial.
         """
-        try:
-            resolution = resolve_comm_channel(
-                requested=None,
-                config_channel=config.comm_channel,
-                backend=backend,
-                guest_os=config.guest_os,
-            )
-        except VsockNotSupportedError as exc:
-            raise SmolVMError(
-                _vsock_not_supported_message(config.vm_id, exc),
-                {"vm_id": config.vm_id, **exc.details},
-            ) from exc
+        resolution = self._resolve_control_channel_for_config(config, backend)
         requested_vsock = config.vsock
         should_reserve_device = (
             backend in {BACKEND_QEMU, BACKEND_FIRECRACKER} and requested_vsock is not None
@@ -1532,7 +1583,17 @@ class SmolVMManager:
                 raise
 
         try:
-            ssh_host_port = self._reserve_available_ssh_port(effective_config.vm_id)
+            channel_resolution = self._resolve_control_channel_for_config(effective_config, backend)
+            ssh_forward_required = self._should_reserve_ssh_forward(
+                effective_config,
+                backend,
+                resolution=channel_resolution,
+            )
+            ssh_host_port = (
+                self._reserve_available_ssh_port(effective_config.vm_id)
+                if ssh_forward_required
+                else None
+            )
 
             if not self._uses_host_tap_networking(effective_config, backend):
                 if (
@@ -1544,7 +1605,7 @@ class SmolVMManager:
                         "with the %s backend (user-mode networking)",
                         backend,
                     )
-                mac_seed = (ssh_host_port % 65534) + 1
+                mac_seed = ((ssh_host_port or SSH_PORT_START) % 65534) + 1
                 guest_mac = self.network.generate_mac(mac_seed)
                 network_config = NetworkConfig(
                     guest_ip=QEMU_GUEST_IP,
@@ -1556,12 +1617,19 @@ class SmolVMManager:
                 )
                 vm_info = self.state.update_vm(effective_config.vm_id, network=network_config)
                 vm_info = self._maybe_enable_vsock(effective_config, backend, vm_info)
-                logger.info(
-                    "VM created: %s (backend=%s, ssh localhost:%d)",
-                    effective_config.vm_id,
-                    backend,
-                    ssh_host_port,
-                )
+                if ssh_host_port is not None:
+                    logger.info(
+                        "VM created: %s (backend=%s, ssh localhost:%d)",
+                        effective_config.vm_id,
+                        backend,
+                        ssh_host_port,
+                    )
+                else:
+                    logger.info(
+                        "VM created: %s (backend=%s, ssh forwarding disabled)",
+                        effective_config.vm_id,
+                        backend,
+                    )
                 return vm_info
 
             # Firecracker networking: allocate an IP first, then derive
@@ -1593,11 +1661,12 @@ class SmolVMManager:
                 )
                 self.network.apply_egress_allowlist(tap_name, allowed_ips)
 
-            self.network.setup_ssh_port_forward(
-                vm_id=effective_config.vm_id,
-                guest_ip=guest_ip,
-                host_port=ssh_host_port,
-            )
+            if ssh_host_port is not None:
+                self.network.setup_ssh_port_forward(
+                    vm_id=effective_config.vm_id,
+                    guest_ip=guest_ip,
+                    host_port=ssh_host_port,
+                )
 
             # Generate MAC address from pool index
             guest_mac = self.network.generate_mac(vm_number)
@@ -2869,7 +2938,17 @@ class SmolVMManager:
                 raise
 
         try:
-            ssh_host_port = self._reserve_available_ssh_port(effective_config.vm_id)
+            channel_resolution = self._resolve_control_channel_for_config(effective_config, backend)
+            ssh_forward_required = self._should_reserve_ssh_forward(
+                effective_config,
+                backend,
+                resolution=channel_resolution,
+            )
+            ssh_host_port = (
+                self._reserve_available_ssh_port(effective_config.vm_id)
+                if ssh_forward_required
+                else None
+            )
 
             if not self._uses_host_tap_networking(effective_config, backend):
                 if (
@@ -2881,7 +2960,7 @@ class SmolVMManager:
                         "with the %s backend (user-mode networking)",
                         backend,
                     )
-                mac_seed = (ssh_host_port % 65534) + 1
+                mac_seed = ((ssh_host_port or SSH_PORT_START) % 65534) + 1
                 guest_mac = self.network.generate_mac(mac_seed)
                 network_config = NetworkConfig(
                     guest_ip=QEMU_GUEST_IP,
@@ -2917,11 +2996,12 @@ class SmolVMManager:
                 )
                 await self.network.async_apply_egress_allowlist(tap_name, allowed_ips)
 
-            await self.network.async_setup_ssh_port_forward(
-                vm_id=effective_config.vm_id,
-                guest_ip=guest_ip,
-                host_port=ssh_host_port,
-            )
+            if ssh_host_port is not None:
+                await self.network.async_setup_ssh_port_forward(
+                    vm_id=effective_config.vm_id,
+                    guest_ip=guest_ip,
+                    host_port=ssh_host_port,
+                )
 
             guest_mac = self.network.generate_mac(vm_number)
             network_config = NetworkConfig(
