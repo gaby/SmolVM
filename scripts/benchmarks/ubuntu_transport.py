@@ -42,11 +42,14 @@ from typing import Any, Literal
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from boot_telemetry import collect_boot_telemetry, summarize_boot_telemetry  # noqa: E402
 
 from smolvm.facade import SmolVM, _build_auto_config  # noqa: E402
 from smolvm.images.published import _images_release_tag  # noqa: E402
 from smolvm.types import SnapshotType  # noqa: E402
-from smolvm.vm import SmolVMManager  # noqa: E402
+from smolvm.vm import SmolVMManager, resolve_data_dir  # noqa: E402
 
 logger = logging.getLogger("smolvm.bench.ubuntu_transport")
 
@@ -75,11 +78,34 @@ def _mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 1)
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 1)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return round(ordered[lower] * (1.0 - weight) + ordered[upper] * weight, 1)
+
+
 def _stats(values: list[float]) -> dict[str, Any]:
     if not values:
-        return {"median": None, "mean": None, "min": None, "max": None, "count": 0}
+        return {
+            "median": None,
+            "p90": None,
+            "p95": None,
+            "mean": None,
+            "min": None,
+            "max": None,
+            "count": 0,
+        }
     return {
         "median": _median(values),
+        "p90": _percentile(values, 0.90),
+        "p95": _percentile(values, 0.95),
         "mean": _mean(values),
         "min": round(min(values), 1),
         "max": round(max(values), 1),
@@ -99,6 +125,14 @@ def _safe_teardown(vm: SmolVM | None) -> None:
 def _safe_delete_snapshot(snapshot_id: str) -> None:
     with suppress(Exception), SmolVMManager() as sdk:
         sdk.delete_snapshot(snapshot_id)
+
+
+def _vm_log_path(vm: SmolVM | None) -> Path | None:
+    """Return the runtime log path for a benchmark VM."""
+    vm_id = getattr(vm, "_vm_id", None)
+    if not vm_id:
+        return None
+    return resolve_data_dir() / f"{vm_id}.log"
 
 
 def _current_init_path() -> Path:
@@ -181,6 +215,7 @@ def _run_one(
     vm_name = f"bench-{backend[:2]}-{transport[:2]}-{uuid.uuid4().hex[:8]}"
     record: dict[str, Any] = {"iter": iteration, "vm_id": vm_name, "warmup": warmup}
     vm: SmolVM | None = None
+    log_path: Path | None = None
     try:
         started = time.perf_counter()
         config, ssh_key_path, published_rootfs, patched_rootfs = _config_for_variant(
@@ -189,6 +224,7 @@ def _run_one(
             rootfs_source=rootfs_source,
         )
         vm = SmolVM(config=config, ssh_key_path=ssh_key_path, comm_channel=transport)
+        log_path = _vm_log_path(vm)
         record["host_create_ms"] = round((time.perf_counter() - started) * 1000, 1)
         record["create_ms"] = record["host_create_ms"]
         record["published_rootfs_path"] = str(published_rootfs)
@@ -239,7 +275,10 @@ def _run_one(
             1,
         )
     finally:
+        if log_path is None:
+            log_path = _vm_log_path(vm)
         _safe_teardown(vm)
+        record["boot_telemetry"] = collect_boot_telemetry(log_path)
     return record
 
 
@@ -257,7 +296,7 @@ def _summarize_fields(records: list[dict[str, Any]], fields: list[str]) -> dict[
 
 
 def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
-    return _summarize_fields(
+    summary = _summarize_fields(
         records,
         [
             "host_create_ms",
@@ -274,6 +313,10 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "total_ready_ms",
         ],
     )
+    boot_telemetry_stats = summarize_boot_telemetry(records, _stats)
+    if boot_telemetry_stats:
+        summary["boot_telemetry_stats"] = boot_telemetry_stats
+    return summary
 
 
 def _snapshot_type_for_choice(choice: SnapshotChoice) -> SnapshotType:
@@ -313,6 +356,68 @@ def _parse_variants(raw: str) -> tuple[Variant, ...]:
     return tuple(selected)
 
 
+def _format_ms(value: Any) -> str:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return f"{value:.1f} ms"
+    return "-"
+
+
+def _summary_metric(summary: dict[str, Any], metric: str, stat: str = "median") -> Any:
+    value = summary.get(metric)
+    if not isinstance(value, dict):
+        return None
+    return value.get(stat)
+
+
+def _phase_summary(summary: dict[str, Any]) -> str:
+    phase_stats = summary.get("boot_telemetry_stats", {}).get("guest_init_phases_ms", {})
+    if not isinstance(phase_stats, dict):
+        return "-"
+
+    ranked: list[tuple[str, float]] = []
+    for phase_name, stats in phase_stats.items():
+        if not isinstance(stats, dict):
+            continue
+        value = stats.get("median")
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            ranked.append((phase_name, float(value)))
+    if not ranked:
+        return "-"
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ", ".join(f"{name}={value:.1f} ms" for name, value in ranked[:3])
+
+
+def _format_variant_summary_table(report: dict[str, Any]) -> str:
+    rows = [
+        "| Backend | Transport | Total ready p50 | Total ready p95 | "
+        "First command p50 | Warm exec p50 | Top guest phases |",
+        "|---|---|---:|---:|---:|---:|---|",
+    ]
+    variants = report.get("variants", {})
+    if not isinstance(variants, dict):
+        return "\n".join(rows)
+
+    for key in sorted(variants):
+        variant = variants[key]
+        if not isinstance(variant, dict):
+            continue
+        summary = variant.get("summary", {})
+        if not isinstance(summary, dict):
+            continue
+        rows.append(
+            "| "
+            f"{variant.get('backend', '-')} | "
+            f"{variant.get('transport', '-')} | "
+            f"{_format_ms(_summary_metric(summary, 'total_fresh_ready_ms'))} | "
+            f"{_format_ms(_summary_metric(summary, 'total_fresh_ready_ms', 'p95'))} | "
+            f"{_format_ms(_summary_metric(summary, 'first_command_ms'))} | "
+            f"{_format_ms(_summary_metric(summary, 'warm_exec_median_ms'))} | "
+            f"{_phase_summary(summary)} |"
+        )
+    return "\n".join(rows)
+
+
 def _run_snapshot_one(
     backend: Backend,
     transport: Transport,
@@ -335,6 +440,8 @@ def _run_snapshot_one(
     }
     source_vm: SmolVM | None = None
     restored_vm: SmolVM | None = None
+    source_log_path: Path | None = None
+    restored_log_path: Path | None = None
     try:
         started = time.perf_counter()
         config, ssh_key_path, published_rootfs, patched_rootfs = _config_for_variant(
@@ -343,6 +450,7 @@ def _run_snapshot_one(
             rootfs_source=rootfs_source,
         )
         source_vm = SmolVM(config=config, ssh_key_path=ssh_key_path, comm_channel=transport)
+        source_log_path = _vm_log_path(source_vm)
         record["snapshot_source_host_create_ms"] = round(
             (time.perf_counter() - started) * 1000, 1
         )
@@ -390,6 +498,7 @@ def _run_snapshot_one(
             ssh_key_path=ssh_key_path,
             comm_channel=transport,
         )
+        restored_log_path = _vm_log_path(restored_vm)
         record["snapshot_restore_ms"] = round((time.perf_counter() - started) * 1000, 1)
 
         started = time.perf_counter()
@@ -428,14 +537,20 @@ def _run_snapshot_one(
                 float(uptime.stdout.split()[0]), 3
             )
     finally:
+        if source_log_path is None:
+            source_log_path = _vm_log_path(source_vm)
+        if restored_log_path is None:
+            restored_log_path = _vm_log_path(restored_vm)
         _safe_teardown(source_vm)
         _safe_teardown(restored_vm)
         _safe_delete_snapshot(snapshot_id)
+        record["snapshot_source_boot_telemetry"] = collect_boot_telemetry(source_log_path)
+        record["snapshot_restore_boot_telemetry"] = collect_boot_telemetry(restored_log_path)
     return record
 
 
 def _summarize_snapshot(records: list[dict[str, Any]]) -> dict[str, Any]:
-    return _summarize_fields(
+    summary = _summarize_fields(
         records,
         [
             "snapshot_source_host_create_ms",
@@ -451,6 +566,29 @@ def _summarize_snapshot(records: list[dict[str, Any]]) -> dict[str, Any]:
             "snapshot_warm_exec_median_ms",
             "snapshot_guest_uptime_after_ready_s",
         ],
+    )
+    source_telemetry_stats = _summarize_boot_telemetry_key(
+        records,
+        "snapshot_source_boot_telemetry",
+    )
+    if source_telemetry_stats:
+        summary["snapshot_source_boot_telemetry_stats"] = source_telemetry_stats
+    restore_telemetry_stats = _summarize_boot_telemetry_key(
+        records,
+        "snapshot_restore_boot_telemetry",
+    )
+    if restore_telemetry_stats:
+        summary["snapshot_restore_boot_telemetry_stats"] = restore_telemetry_stats
+    return summary
+
+
+def _summarize_boot_telemetry_key(
+    records: list[dict[str, Any]],
+    key: str,
+) -> dict[str, Any]:
+    return summarize_boot_telemetry(
+        [{"boot_telemetry": record.get(key)} for record in records],
+        _stats,
     )
 
 
@@ -619,6 +757,7 @@ def main() -> None:
         print(payload)
     else:
         print(f"Wrote {args.output}")
+        print(_format_variant_summary_table(report))
 
 
 if __name__ == "__main__":
