@@ -46,6 +46,13 @@ These are fresh Ubuntu boot numbers, not snapshot restore numbers. A 50-120 ms
 VMM launch is already plausible today; the remaining latency is mostly Linux
 boot, init, and control-channel readiness.
 
+After publishing `images-2026.06.14.0`, phase telemetry exposed a separate
+host-side Firecracker issue: the decompressed raw ext4 cache was fully
+allocated, so isolated Firecracker starts copied gigabytes of zeros on
+non-reflink filesystems. Preserving sparse holes in the published rootfs cache
+and raw disk copy path brought Firecracker-vsock published total ready to
+`1057.4 ms` on the local benchmark host.
+
 ## Optimization Roadmap
 
 ### Phase 1: Measurement Hygiene
@@ -88,6 +95,9 @@ Current status:
 - Firecracker explicit-vsock now creates/configures the TAP needed by
   Firecracker, but defers route/NAT/egress setup until SSH or port forwarding
   needs host TCP/IP connectivity.
+- Published zstd rootfs decompression preserves sparse zero regions, and raw
+  isolated-disk copies preserve those holes. This removes the accidental
+  4 GiB copy from the Firecracker critical path on non-reflink filesystems.
 
 Acceptance:
 
@@ -95,6 +105,8 @@ Acceptance:
 - SSH variants still reach SSH and accept the injected key.
 - Explicit-vsock benchmarks do not wait for SSH readiness unless the requested
   startup feature needs SSH.
+- Firecracker host-create time stays near the measured TAP/setup cost instead
+  of scaling with the apparent raw rootfs size.
 
 ### Phase 3: QEMU Fast Machine Profile
 
@@ -148,6 +160,33 @@ Approach:
 - Restore and immediately repair mutable identity such as hostname, machine-id,
   SSH keys when SSH is enabled, network identity, and agent session state.
 - Benchmark restore-to-first-command separately from fresh boot.
+
+Current status:
+
+- The Ubuntu transport benchmark has an opt-in `--include-snapshot` lane that
+  reports snapshot restore-to-ready and restore-to-first-command separately from
+  fresh boot.
+- `SmolVM.from_snapshot(..., comm_channel=...)` can reattach to restored VMs
+  with the same SSH or vsock transport selected by the benchmark variant.
+- The benchmark defaults snapshot measurement to requesting diff snapshots; QEMU
+  may fall back to a full snapshot when the active disk has no backing file.
+- QEMU vsock CID allocation skips CIDs already visible in live QEMU process
+  arguments, so stale/out-of-band QEMU processes do not break benchmark runs.
+- A CLI-validated QEMU-vsock snapshot probe restored to first command in
+  `195.0 ms` (`snapshot_restore_ms=193.5`, ready wait `0.6 ms`, first command
+  `0.9 ms`).
+- QEMU published Ubuntu restores fast enough to show the snapshot path is
+  useful, but it is not using the smallest possible snapshot artifact yet. The
+  current run asks for a diff snapshot, which should save only changed disk
+  blocks, but QEMU falls back to a full disk artifact because the managed
+  `qcow2` disk has no backing file. `qcow2` is QEMU's copy-on-write disk
+  format, a backing file is the unchanged base image it can refer back to, and
+  a raw-backed overlay would let the per-sandbox disk point at the published
+  raw rootfs while storing only sandbox changes. A follow-up should evaluate
+  raw-backed `qcow2` overlays for the published raw rootfs path.
+- Firecracker full/diff snapshot restore needs follow-up before we can report
+  warm numbers: stale vsock UDS cleanup is fixed, but the restored guest still
+  panics in `restore_fpregs_from_fpstate` on the local benchmark host.
 
 Acceptance:
 
