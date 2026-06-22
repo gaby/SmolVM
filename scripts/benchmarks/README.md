@@ -23,7 +23,7 @@ Firecracker on macOS errors out at startup.
 3. Linux only: `smolvm setup` configured the host networking and your user can
    talk to Firecracker.
 
-The bench never escalates with `sudo`. Set things up first.
+The lifecycle benchmark never escalates with `sudo`. Set things up first.
 
 ## Running
 
@@ -45,6 +45,31 @@ uv run python scripts/benchmarks/bench.py --backend qemu
 ```
 
 `-v` enables per-iteration progress logging.
+
+## Linux Networking Stages
+
+Use `networking.py` to decide whether the Rust networking path makes Linux VM
+startup faster on your machine. It records each host networking stage, then
+compares the native path with the subprocess fallback.
+
+The measured stages include TAP setup (the virtual network device used by
+Firecracker), routes (the host paths for guest IPs), sysctls (kernel networking
+settings), and nftables-backed NAT (the firewall rules that give the guest
+network access):
+
+```bash
+uv run python scripts/benchmarks/networking.py --json
+uv run python scripts/benchmarks/networking.py --include-full-start --output /tmp/smolvm-networking.json
+```
+
+This benchmark is Linux-only and touches real host networking. It expects the
+same privileges as Firecracker TAP networking. The `native` mode uses Rust
+helpers when direct TAP privileges are available; rerun the benchmark with
+`sudo` or another root/CAP_NET_ADMIN launch path to measure that speedup.
+`forced-off` sets `SMOLVM_DISABLE_NATIVE_NETWORKING=1`, and
+`unprivileged-fallback` is skipped unless native can be attempted without
+direct TAP privileges and the existing sudo fallback is available. Run
+`smolvm setup` first if the sudo fallback is missing.
 
 ## Ubuntu Transport Comparison
 

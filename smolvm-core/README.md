@@ -19,16 +19,17 @@ SmolVM uses `smolvm-core` for two host-side jobs when they are available:
 - Linux sandbox networking setup — creating TAP devices (virtual network cards), adding routes, and writing sysctls (kernel settings)
 - QEMU sandbox control on Linux and macOS — speaking QMP, QEMU's JSON control protocol, over a Unix socket
 
-When native host networking is unavailable, SmolVM falls back to running `ip`, `nft`, and `sysctl` as subprocesses. When native QMP is unavailable, SmolVM falls back to its pure-Python QMP client. Both fallback paths produce the same result; the native paths are faster and keep low-level protocol handling out of the main Python API.
+When native host networking is unavailable, or when the SmolVM process lacks permission to change Linux networking directly, SmolVM falls back to running `ip`, `nft`, and `sysctl` as subprocesses. When native QMP is unavailable, SmolVM falls back to its pure-Python QMP client. Both fallback paths produce the same result; the native paths are faster and keep low-level protocol handling out of the main Python API.
 
 | Scenario | Path used | What happens |
 |---|---|---|
-| Linux + `smolvm-core` wheel installed | Native networking + native QMP | Direct kernel calls for networking and native QMP for QEMU control. |
+| Linux + `smolvm-core` wheel installed + root/CAP_NET_ADMIN | Native networking + native QMP | Direct kernel calls for networking and native QMP for QEMU control. |
+| Linux + wheel installed, but no direct networking permission | Subprocess networking + native QMP | SmolVM falls back to `ip`/`nft`/`sysctl` subprocesses for networking; native QMP still works. |
 | Linux + wheel missing or broken | Subprocess networking + Python QMP | Fully functional, but networking falls back to `ip`/`nft`/`sysctl` subprocesses and QMP uses the Python client. |
 | macOS + `smolvm-core` wheel installed | Native QMP only | macOS uses QEMU user-mode networking (SLIRP), so host networking is not exercised; QEMU control uses native QMP. |
 | macOS + wheel missing or broken | Python QMP | QEMU control uses the pure-Python QMP client. |
 
-On Linux, if SmolVM falls back to subprocess, it logs a warning at startup:
+On Linux, missing native support and missing networking permission produce different warnings. If the native wheel is missing or broken, SmolVM logs:
 
 ```
 WARNING smolvm.host._accel: smolvm-core native extension is unavailable;
@@ -37,6 +38,8 @@ which is significantly slower. Reinstall smolvm to pick up the native wheel.
 ```
 
 The fix is to reinstall `smolvm` so pip picks up the matching wheel for your platform.
+
+If the wheel is installed but the process cannot change Linux networking directly, SmolVM logs a permission warning and uses the slower sudo fallback. Run `smolvm setup` if the fallback is missing, or start the same SmolVM command as root or with CAP_NET_ADMIN to use the native networking speedup.
 
 ## Public Python interface
 
@@ -58,10 +61,13 @@ smolvm_core.delete_tap(name: str) -> None
 smolvm_core.flush_addrs(name: str) -> None
 smolvm_core.add_addr(name: str, ip: str, prefix_len: int) -> None
 smolvm_core.set_link_up(name: str) -> None
+smolvm_core.configure_tap(name: str, host_ip: str, prefix_len: int) -> None
 smolvm_core.add_route(dest: str, prefix_len: int, dev: str) -> None
 smolvm_core.get_default_interface() -> str
 smolvm_core.write_sysctl(key: str, value: str) -> None
 ```
+
+`configure_tap()` is the preferred helper when setting up a TAP for a sandbox. It flushes addresses, assigns the host IP, and brings the link up in one native call. SmolVM still writes per-TAP sysctls from Python so fallback behavior stays the same.
 
 These helpers raise `OSError("Not available on this platform")` when the operation does not exist on the current operating system. SmolVM catches that and uses the portable fallback path where one exists.
 
