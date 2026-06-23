@@ -90,6 +90,11 @@ uv run python scripts/benchmarks/preset_start.py --preset codex --backend qemu -
 uv run python scripts/benchmarks/browser_ready.py --backend qemu --json --output /tmp/smolvm-browser-ready.json
 ```
 
+If `file_transfer.py` fails because the sandbox image does not support fast file
+or directory transfer, rebuild or republish the image with the current control
+service and rerun before claiming streaming speedups from the newer fast
+file-transfer protocol.
+
 ## Linux Networking Stages
 
 Use `networking.py` to decide whether the Rust networking path makes Linux VM

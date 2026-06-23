@@ -84,6 +84,45 @@ Networking note:
   existing sudo-command path, with stage sums of `242.1 ms` and `236.4 ms`.
   These are fallback-path numbers, not native TAP speedup numbers.
 
+## 2026-06-23 - Current PR: Alpha Cleanup And Transfer Validation
+
+This benchmark confirms the disk-image speedup and shows that current
+published Ubuntu images must be republished before the new fast file-transfer
+path can be measured.
+
+- Commit: current PR branch, based on `0818286`.
+- Image tag: current published Ubuntu image used by the local benchmark run.
+- Commands:
+  - `UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/benchmarks/disk_io.py --iterations 2 --sizes 16M,128M --json --output /tmp/smolvm-alpha-cleanup-disk-io.json`
+  - `UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/benchmarks/file_transfer.py --backend qemu --comm-channel vsock --os ubuntu --sizes 1K --skip-directory --boot-timeout 120 --ready-timeout 120 --json --output /tmp/smolvm-alpha-cleanup-file-transfer-current-published.json`
+- Host: Linux x86_64, kernel `7.0.0-15-generic`, KVM available.
+- Method: two local disk iterations; one QEMU/vsock published-Ubuntu file
+  transfer smoke with small payloads.
+- Behavior changed: the new Rust guest-agent build drops the old JSON/base64
+  file endpoints, and the host no longer falls back to those older endpoints.
+  The active published Ubuntu image still lacks protocol-v2 transfer
+  capabilities, meaning the newer fast file-transfer protocol is not present
+  until the image is republished from this branch.
+
+Disk helper validation:
+
+| Operation | Size | Native path | Forced-off path | Result |
+|---|---:|---:|---:|---|
+| sparse copy | 16 MiB | 10.5 ms (`cp`) | 10.2 ms (`cp`) | unchanged; `cp` remains first |
+| sparse copy | 128 MiB | 64.6 ms (`cp`) | 64.8 ms (`cp`) | unchanged; `cp` remains first |
+| zstd decompress | 16 MiB | 13.5 ms | 40.6 ms | 66.8% faster |
+| zstd decompress | 128 MiB | 96.4 ms | 376.1 ms | 74.4% faster |
+
+File-transfer validation:
+
+| Backend | Transport | Result | Feature flags |
+|---|---|---|---|
+| QEMU | vsock | failed as expected after 52.7 ms start and 282.9 ms ready | current published image lacks `GET /capabilities`, `files.stream`, and `files.directory_tar` |
+
+Finding: the current published Ubuntu image can boot over vsock but cannot use
+the new fast file-transfer protocol. Rerun this file-transfer benchmark after
+the next published-image release before claiming streaming transfer speedups.
+
 ## Required Entry Format
 
 Add a short section for each PR that changes startup behavior or benchmark
