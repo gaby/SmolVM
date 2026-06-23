@@ -3283,7 +3283,8 @@ class TestCliStart:
             writable_mounts=False,
         )
         vm.start.assert_called_once_with(boot_timeout=30.0, on_progress=ANY)
-        vm.wait_for_ssh.assert_called_once_with(timeout=30.0, on_progress=ANY)
+        vm.wait_for_ready.assert_called_once_with(timeout=30.0, on_progress=ANY)
+        vm.wait_for_ssh.assert_not_called()
         mock_apply.assert_called_once()
         vm.close.assert_called_once()
 
@@ -3327,6 +3328,54 @@ class TestCliStart:
         assert payload["data"]["preset"]["name"] == "codex"
         assert payload["data"]["preset"]["injected_env_keys"] == ["OPENAI_API_KEY"]
         assert payload["data"]["next"]["ssh_command"] == "smolvm sandbox ssh sbx-1"
+
+    @patch("smolvm.images.published.is_preset_published", return_value=False)
+    @patch("smolvm.presets.apply_preset")
+    @patch("smolvm.facade._build_auto_config")
+    @patch("smolvm.facade.SmolVM")
+    def test_start_codex_json_threads_explicit_comm_channel(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_build_auto_config: MagicMock,
+        mock_apply_fn: MagicMock,
+        _mock_is_published: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        config = MagicMock(vm_id="sbx-1")
+        mock_build_auto_config.return_value = (config, "/tmp/id_ed25519")
+        vm = self._make_vm_mock("sbx-1")
+        mock_vm_cls.return_value = vm
+        mock_apply_fn.return_value = {
+            "preset": "codex",
+            "copied_configs": [],
+            "injected_env_keys": [],
+        }
+
+        ret = main(["codex", "start", "--name", "sbx-1", "--json", "--comm-channel", "ssh"])
+
+        assert ret == 0
+        mock_vm_cls.assert_called_once_with(
+            config,
+            ssh_key_path="/tmp/id_ed25519",
+            mounts=None,
+            writable_mounts=False,
+            comm_channel="ssh",
+        )
+        json.loads(capsys.readouterr().out)
+
+    def test_preset_control_channel_uses_resolved_control_without_ssh_fallback(self) -> None:
+        from smolvm.cli.main import _preset_control_channel
+
+        channel = object()
+        vm = MagicMock()
+        vm._ensure_control_for_operation.return_value = channel
+
+        assert _preset_control_channel(vm, timeout=12.0) is channel
+        vm._ensure_control_for_operation.assert_called_once_with(
+            action="apply preset",
+            timeout=12.0,
+        )
+        vm.wait_for_ssh.assert_not_called()
 
     @patch("smolvm.images.published.is_preset_published", return_value=False)
     @patch("smolvm.cli.main._apply_preset_with_progress")
@@ -3925,6 +3974,53 @@ class TestPublishedImageLaunchPath:
         mock_vm.stop.assert_not_called()
         mock_vm.delete.assert_not_called()
         mock_vm.close.assert_called_once()
+
+    @patch("smolvm.cli.main.subprocess.run")
+    @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.utils.ensure_ssh_key")
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main.platform.machine", return_value="x86_64")
+    @patch("smolvm.cli.main.platform.system", return_value="Linux")
+    def test_published_path_threads_explicit_comm_channel(
+        self,
+        _mock_system: MagicMock,
+        _mock_machine: MagicMock,
+        mock_ensure_image: MagicMock,
+        mock_ensure_ssh_key: MagicMock,
+        mock_vm_cls: MagicMock,
+        _mock_subprocess: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Published images must honor an explicit control-channel choice."""
+        from smolvm.images.manager import LocalImage
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        priv = tmp_path / "id_ed25519"
+        pub = tmp_path / "id_ed25519.pub"
+        for path in (kernel, rootfs, priv):
+            path.touch()
+        pub.write_text("ssh-ed25519 AAAAExampleKey user@host\n")
+
+        mock_ensure_image.return_value = LocalImage(
+            name="openclaw-v0.0.13-amd64-firecracker",
+            kernel_path=kernel,
+            rootfs_path=rootfs,
+        )
+        mock_ensure_ssh_key.return_value = (priv, pub)
+        mock_vm = MagicMock()
+        mock_vm.vm_id = "sbx-published-1"
+        mock_vm.info.status = VMState.RUNNING
+        mock_vm.info.config.backend = "firecracker"
+        mock_vm.info.network = MagicMock(spec=NetworkConfig)
+        mock_vm.info.network.guest_ip = "172.16.0.2"
+        mock_vm.info.network.ssh_host_port = 2200
+        mock_vm_cls.return_value = mock_vm
+
+        ret = main(["openclaw", "start", "--json", "--comm-channel", "ssh"])
+
+        assert ret == 0
+        assert mock_vm_cls.call_args.kwargs["comm_channel"] == "ssh"
 
     @patch("smolvm.cli.main.subprocess.run")
     @patch("smolvm.facade.SmolVM")
