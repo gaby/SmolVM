@@ -535,16 +535,16 @@ The kernel loads from `-kernel`, mounts the rootfs from the virtio drive at `/`,
 
 `/init` does its six steps from Chapter 3, ending with `/usr/sbin/sshd -e` running and authorized_keys populated.
 
-### Step 6 — Wait for sshd, return
+### Step 6 — Wait until the sandbox can answer
 
-Back on the host, `cli/main.py` polls TCP port 2200 with a 30-second timeout. As soon as the connection succeeds, the CLI prints:
+Back on the host, `cli/main.py` waits until the sandbox control channel answers. On current Linux images this uses the guest agent over vsock, which is a private VM socket; on SSH-only sandboxes it waits for SSH instead. As soon as the sandbox is ready, the CLI prints:
 
 ```
 ╭───── Sandbox Ready ─────╮
 │ Started 'codex-davinci' │
 │ with codex preinstalled │
 ╰─────────────────────────╯
-Next: smolvm sandbox ssh codex-davinci
+Next: smolvm sandbox shell codex-davinci
 ```
 
 End-to-end, on a warm cache, this takes 5–10 seconds. On a cold cache (first download), add ~30s for the rootfs zstd download.
