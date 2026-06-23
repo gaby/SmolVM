@@ -464,6 +464,7 @@ def test_directory_tar_strips_owner_metadata(tmp_path: Path) -> None:
 
     data = _directory_to_tar(source)
 
+    assert b"././@PaxHeader" not in data
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
         members = archive.getmembers()
 
@@ -472,6 +473,16 @@ def test_directory_tar_strips_owner_metadata(tmp_path: Path) -> None:
     assert all(member.uname == "" and member.gname == "" for member in members)
     key_member = next(member for member in members if member.name == "id_ed25519")
     assert key_member.mode & 0o777 == 0o600
+
+
+def test_directory_tar_wraps_ustar_path_limit_errors(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    long_name = "a" * 120
+    (source / long_name).write_text("too long for ustar")
+
+    with pytest.raises(SmolVMError, match="file path is too long"):
+        _directory_to_tar(source)
 
 
 def test_legacy_directory_download_uses_guest_mktemp(tmp_path: Path) -> None:
