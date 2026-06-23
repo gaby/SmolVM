@@ -14,10 +14,14 @@
 
 """Tests for Firecracker snapshot API helpers."""
 
+import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from smolvm.api import FirecrackerClient
+from smolvm.exceptions import FirecrackerAPIError
 
 
 class _Response:
@@ -96,3 +100,114 @@ def test_load_snapshot_payload(tmp_path: Path) -> None:
             {"iface_id": "eth0", "host_dev_name": "tap-restored"},
         ],
     }
+
+
+def test_native_firecracker_request_path_is_used_when_available(tmp_path: Path) -> None:
+    """Native Firecracker helper should bypass requests when enabled and socket exists."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    native._firecracker_request.return_value = (204, None)
+    client = _client(tmp_path)
+
+    with patch("smolvm.api._native", native):
+        client.start_instance()
+
+    native._firecracker_request.assert_called_once_with(
+        str(socket_path),
+        "PUT",
+        "/actions",
+        json.dumps({"action_type": "InstanceStart"}, separators=(",", ":")),
+        10.0,
+    )
+    client.session.request.assert_not_called()
+
+
+def test_native_firecracker_transport_error_falls_back_to_requests(tmp_path: Path) -> None:
+    """Native transport errors should fall through to requests-unixsocket."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    native._firecracker_request.side_effect = OSError("connection reset")
+    client = _client(tmp_path)
+    client.session.request.return_value = _Response(status_code=200, payload={"ok": True})
+
+    with patch("smolvm.api._native", native):
+        assert client._request("GET", "/", expected_status=(200,)) == {"ok": True}
+
+    native._firecracker_request.assert_called_once()
+    client.session.request.assert_called_once()
+
+
+def test_native_firecracker_request_can_be_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SMOLVM_DISABLE_NATIVE_FIRECRACKER_API should force the requests path."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    client = _client(tmp_path)
+    monkeypatch.setenv("SMOLVM_DISABLE_NATIVE_FIRECRACKER_API", "1")
+
+    with patch("smolvm.api._native", native):
+        client.start_instance()
+
+    native._firecracker_request.assert_not_called()
+    client.session.request.assert_called_once()
+
+
+def test_native_firecracker_api_error_preserves_status_code(tmp_path: Path) -> None:
+    """Native HTTP responses should keep the same error contract as requests."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    native._firecracker_request.return_value = (400, '{"fault_message":"bad request"}')
+    client = _client(tmp_path)
+
+    with (
+        patch("smolvm.api._native", native),
+        pytest.raises(FirecrackerAPIError) as exc_info,
+    ):
+        client.start_instance()
+
+    assert exc_info.value.status_code == 400
+    assert "bad request" in str(exc_info.value)
+    client.session.request.assert_not_called()
+
+
+def test_wait_for_socket_native_timeout_falls_back_to_polling(tmp_path: Path) -> None:
+    """Native socket wait timeout should still try the Python polling loop."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    native._firecracker_wait_for_socket.side_effect = OSError("timed out")
+    client = FirecrackerClient(socket_path)
+    client._request = MagicMock()
+
+    with patch("smolvm.api._native", native):
+        client.wait_for_socket(timeout=0.5)
+
+    native._firecracker_wait_for_socket.assert_called_once_with(str(socket_path), 0.5)
+    client._request.assert_called_once_with("GET", "/", expected_status=(200,))
+
+
+def test_wait_for_socket_caps_native_probe_before_polling(tmp_path: Path) -> None:
+    """A native wait failure should not consume the full boot timeout."""
+    socket_path = tmp_path / "fc.sock"
+    socket_path.touch()
+    native = MagicMock()
+    native.has_native_firecracker_api.return_value = True
+    native._firecracker_wait_for_socket.side_effect = OSError("timed out")
+    client = FirecrackerClient(socket_path)
+    client._request = MagicMock()
+
+    with patch("smolvm.api._native", native):
+        client.wait_for_socket(timeout=180.0)
+
+    native._firecracker_wait_for_socket.assert_called_once_with(str(socket_path), 1.0)
+    client._request.assert_called_once_with("GET", "/", expected_status=(200,))

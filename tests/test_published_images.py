@@ -890,6 +890,20 @@ class TestBundledManifest:
 class TestDecompressZstd:
     """Direct tests for the streaming decompressor."""
 
+    def test_decompress_zstd_delegates_to_host_disk_helper(self, tmp_path: Path) -> None:
+        """Published image decompression should go through the disk switchboard."""
+        src = tmp_path / "rootfs.ext4.zst"
+        dst = tmp_path / "rootfs.ext4"
+
+        with patch("smolvm.host.disk.decompress_zstd_sparse") as mock_decompress:
+            _decompress_zstd(src, dst)
+
+        mock_decompress.assert_called_once_with(
+            src,
+            dst,
+            chunk_size=published_module._SPARSE_DECOMPRESS_CHUNK_SIZE,
+        )
+
     def test_decompress_zstd_preserves_sparse_zero_ranges(self, tmp_path: Path) -> None:
         """Published raw ext4 caches should keep large zero regions sparse."""
         import zstandard
@@ -917,4 +931,23 @@ class TestDecompressZstd:
 
         # Neither the destination nor the .tmp sibling should remain.
         assert not dst.exists()
+        assert not (dst.parent / (dst.name + ".tmp")).exists()
+
+    def test_native_decode_error_matches_zstandard_contract(self, tmp_path: Path) -> None:
+        """Rust zstd decode failures should match the Python decompressor API."""
+        import zstandard
+
+        src = tmp_path / "corrupt.ext4.zst"
+        dst = tmp_path / "corrupt.ext4"
+        (dst.parent / (dst.name + ".tmp")).write_bytes(b"partial")
+
+        with (
+            patch(
+                "smolvm.host.disk.decompress_zstd_sparse",
+                side_effect=OSError("Unknown frame descriptor"),
+            ),
+            pytest.raises(zstandard.ZstdError, match="Unknown frame descriptor"),
+        ):
+            _decompress_zstd(src, dst)
+
         assert not (dst.parent / (dst.name + ".tmp")).exists()
