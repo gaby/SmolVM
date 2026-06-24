@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import http.client
 import io
 import ipaddress
@@ -64,6 +66,57 @@ _TERMINAL_FRAME_CLOSE = 3
 _TERMINAL_FRAME_OUTPUT = 101
 _TERMINAL_FRAME_EXIT = 102
 _TERMINAL_FRAME_ERROR = 103
+_LINUX_AF_VSOCK = 40
+
+
+class _SockaddrVm(ctypes.Structure):
+    _fields_ = [
+        ("svm_family", ctypes.c_ushort),
+        ("svm_reserved1", ctypes.c_ushort),
+        ("svm_port", ctypes.c_uint32),
+        ("svm_cid", ctypes.c_uint32),
+        ("svm_zero", ctypes.c_ubyte * 4),
+    ]
+
+
+_SVM_ZERO = ctypes.c_ubyte * 4
+
+
+def _vsock_family() -> int | None:
+    family = getattr(socket, "AF_VSOCK", None)
+    if family is not None:
+        return int(family)
+    if sys.platform.startswith("linux"):
+        # Some Python builds omit socket.AF_VSOCK even though Linux supports
+        # the socket family. The kernel ABI value is stable.
+        return _LINUX_AF_VSOCK
+    return None
+
+
+def _connect_vsock_raw(sock: socket.socket, guest_cid: int, port: int, timeout: float) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    libc.connect.restype = ctypes.c_int
+    addr = _SockaddrVm(
+        svm_family=_LINUX_AF_VSOCK,
+        svm_reserved1=0,
+        svm_port=port,
+        svm_cid=guest_cid,
+        svm_zero=_SVM_ZERO(0, 0, 0, 0),
+    )
+    sock.setblocking(False)
+    result = libc.connect(sock.fileno(), ctypes.byref(addr), ctypes.sizeof(addr))
+    if result != 0:
+        err = ctypes.get_errno()
+        if err not in {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY}:
+            raise OSError(err, os.strerror(err))
+        _, writable, _ = select.select([], [sock], [], timeout)
+        if not writable:
+            raise TimeoutError("timed out")
+        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if err != 0:
+            raise OSError(err, os.strerror(err))
+    sock.settimeout(timeout)
 
 
 @dataclass(frozen=True)
@@ -107,6 +160,20 @@ def _feature_required_message(feature: str, sandbox_name: str | None) -> str:
     return (
         f"This sandbox was created from an older image and cannot use {feature}; "
         "run `smolvm sandbox list`, then delete and recreate the sandbox after updating SmolVM."
+    )
+
+
+def _vsock_unavailable_message(sandbox_name: str | None) -> str:
+    if sandbox_name:
+        sandbox = shlex.quote(sandbox_name)
+        return (
+            f"This computer cannot open fast sandbox connections for {sandbox}; "
+            f"run `smolvm sandbox delete {sandbox}` and then "
+            f"`smolvm sandbox create --name {sandbox} --comm-channel ssh`."
+        )
+    return (
+        "This computer cannot open fast sandbox connections; run "
+        "`smolvm sandbox create --comm-channel ssh` to create a sandbox with the compatible path."
     )
 
 
@@ -450,15 +517,17 @@ class RustHttpVsockChannel:
 
     def _open_vsock(self, port: int | None = None) -> socket.socket:
         port = self.agent_port if port is None else port
-        if not hasattr(socket, "AF_VSOCK"):
-            raise SmolVMError(
-                "vsock is not available on this host (no AF_VSOCK). "
-                "Use the SSH channel, or run on a Linux host with vhost_vsock loaded."
-            )
-        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        family = _vsock_family()
+        if family is None:
+            raise SmolVMError(_vsock_unavailable_message(self.sandbox_name))
+        sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(float(self.connect_timeout))
         try:
-            sock.connect((self.guest_cid, port))
+            if hasattr(socket, "AF_VSOCK"):
+                sock.connect((self.guest_cid, port))
+            else:
+                assert self.guest_cid is not None
+                _connect_vsock_raw(sock, self.guest_cid, port, float(self.connect_timeout))
         except OSError:
             sock.close()
             raise
