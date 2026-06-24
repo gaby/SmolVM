@@ -18,6 +18,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import click
@@ -25,6 +26,7 @@ import pytest
 
 from smolvm.cli.main import (
     DASHBOARD_ALLOW_BETA_ENV,
+    _attach_shell_or_ssh,
     _current_version_is_prerelease,
     build_cli,
     main,
@@ -1833,8 +1835,13 @@ class TestCliPort:
 class TestCliShell:
     """Tests for `smolvm sandbox shell`."""
 
+    @patch("smolvm.cli.main.subprocess.run")
     @patch("smolvm.facade.SmolVM")
-    def test_shell_running_vm_uses_control_channel(self, mock_vm_cls: MagicMock) -> None:
+    def test_shell_running_vm_uses_control_channel(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         vm = MagicMock()
         vm.status = VMState.RUNNING
         vm.attach_shell.return_value = 7
@@ -1848,6 +1855,7 @@ class TestCliShell:
         vm.wait_for_shell.assert_called_once_with(timeout=15.0)
         vm.wait_for_ssh.assert_not_called()
         vm.attach_shell.assert_called_once_with(timeout=15.0)
+        mock_run.assert_not_called()
         vm.close.assert_called_once()
 
     @pytest.mark.parametrize("status", [VMState.CREATED, VMState.STOPPED])
@@ -1871,34 +1879,87 @@ class TestCliShell:
         vm.attach_shell.assert_called_once_with(timeout=30.0)
         vm.close.assert_called_once()
 
+    @patch("smolvm.cli.main.subprocess.run")
     @patch("smolvm.facade.SmolVM")
-    def test_shell_rejects_unsupported_vm_before_starting(
+    def test_shell_falls_back_to_ssh_when_fast_shell_unsupported_after_starting(
         self,
         mock_vm_cls: MagicMock,
-        capsys: pytest.CaptureFixture,
+        mock_run: MagicMock,
     ) -> None:
         from smolvm.exceptions import SmolVMError
 
         vm = MagicMock()
         vm.status = VMState.STOPPED
-        vm.ensure_shell_supported.side_effect = SmolVMError(
+        vm.wait_for_shell.side_effect = SmolVMError(
             "Sandbox 'vm001' cannot use 'smolvm sandbox shell'; "
             "run 'smolvm sandbox ssh vm001' to open an SSH shell."
         )
+        vm._ssh_attach_command.return_value = ["ssh", "vm001"]
+        mock_run.return_value.returncode = 0
         mock_vm_cls.from_id.return_value = vm
 
         ret = main(["sandbox", "shell", "vm001"])
 
-        assert ret == 1
-        vm.start.assert_not_called()
+        assert ret == 0
+        vm.start.assert_called_once_with(boot_timeout=30.0)
         vm.resume.assert_not_called()
-        vm.wait_for_shell.assert_not_called()
-        vm.wait_for_ssh.assert_not_called()
+        vm.wait_for_shell.assert_called_once_with(timeout=30.0)
+        vm.wait_for_ssh.assert_called_once_with(timeout=30.0)
         vm.attach_shell.assert_not_called()
+        mock_run.assert_called_once_with(["ssh", "vm001"], check=False)
         vm.close.assert_called_once()
-        err = capsys.readouterr().err
-        assert "sandbox ssh vm001" in err
-        assert "vm001" in err
+
+    @patch("smolvm.cli.main.subprocess.run")
+    @patch("smolvm.facade.SmolVM")
+    def test_shell_falls_back_to_ssh_when_terminal_feature_missing(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        from smolvm.exceptions import SmolVMError
+
+        vm = MagicMock()
+        vm.status = VMState.RUNNING
+        vm.attach_shell.side_effect = SmolVMError(
+            "Sandbox vm001 was created from an older image and cannot use fast shell access."
+        )
+        vm._ssh_attach_command.return_value = ["ssh", "vm001"]
+        mock_run.return_value.returncode = 0
+        mock_vm_cls.from_id.return_value = vm
+
+        ret = main(["sandbox", "shell", "vm001"])
+
+        assert ret == 0
+        vm.start.assert_not_called()
+        vm.wait_for_shell.assert_called_once_with(timeout=30.0)
+        vm.wait_for_ssh.assert_called_once_with(timeout=30.0)
+        vm.attach_shell.assert_called_once_with(timeout=30.0)
+        mock_run.assert_called_once_with(["ssh", "vm001"], check=False)
+        vm.close.assert_called_once()
+
+    @patch("smolvm.cli.main.subprocess.run")
+    def test_shell_stops_status_before_ssh_subprocess(self, mock_run: MagicMock) -> None:
+        from smolvm.exceptions import SmolVMError
+
+        events: list[str] = []
+        status = MagicMock()
+        status.stop.side_effect = lambda: events.append("stop")
+        vm = MagicMock()
+        vm.wait_for_shell.side_effect = SmolVMError("fast shell access is unavailable")
+        vm._ssh_attach_command.return_value = ["ssh", "vm001"]
+        mock_run.side_effect = lambda *_args, **_kwargs: (
+            events.append("run") or SimpleNamespace(returncode=0)
+        )
+
+        ret = _attach_shell_or_ssh(
+            vm,
+            SimpleNamespace(boot_timeout=30.0),
+            status=status,
+        )
+
+        assert ret == 0
+        assert events == ["stop", "run"]
+        vm.wait_for_ssh.assert_called_once_with(timeout=30.0)
 
     @patch("smolvm.facade.SmolVM")
     def test_shell_resumes_paused_vm(self, mock_vm_cls: MagicMock) -> None:
