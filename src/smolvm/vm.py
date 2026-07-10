@@ -23,6 +23,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import platform
 import pwd
@@ -36,7 +37,6 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 from uuid import uuid4
@@ -76,6 +76,7 @@ from smolvm.types import (
     GuestOS,
     NetworkConfig,
     RootfsFormat,
+    SnapshotCapturePolicy,
     SnapshotInfo,
     SnapshotType,
     VMConfig,
@@ -568,8 +569,8 @@ class SmolVMManager:
             return
         raise VMAlreadyExistsError(vm_id)
 
-    def _acquire_vm_create_lock(self, vm_id: str) -> tuple[Any | None, TextIO | None]:
-        """Acquire the create-time disk lock for one VM ID."""
+    def _acquire_operation_lock(self, lock_name: str) -> tuple[Any | None, TextIO | None]:
+        """Acquire one named cross-process operation lock."""
         try:
             import fcntl
         except ImportError:
@@ -579,9 +580,13 @@ class SmolVMManager:
 
         lock_dir = self.data_dir / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_file = (lock_dir / f"{vm_id}.create.lock").open("w")
+        lock_file = (lock_dir / lock_name).open("w")
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         return fcntl, lock_file
+
+    def _acquire_vm_create_lock(self, vm_id: str) -> tuple[Any | None, TextIO | None]:
+        """Acquire the create-time disk lock for one VM ID."""
+        return self._acquire_operation_lock(f"{vm_id}.create.lock")
 
     @staticmethod
     def _release_vm_create_lock(lock: tuple[Any | None, TextIO | None]) -> None:
@@ -612,6 +617,18 @@ class SmolVMManager:
             yield
         finally:
             await asyncio.to_thread(self._release_vm_create_lock, lock)
+
+    @contextmanager
+    def _snapshot_operation_locks(self, vm_id: str, snapshot_id: str) -> Iterator[None]:
+        """Serialize snapshots by source VM and globally unique snapshot ID."""
+        locks: list[tuple[Any | None, TextIO | None]] = []
+        try:
+            locks.append(self._acquire_operation_lock(f"{vm_id}.snapshot.lock"))
+            locks.append(self._acquire_operation_lock(f"snapshot-{snapshot_id}.lock"))
+            yield
+        finally:
+            for lock in reversed(locks):
+                self._release_vm_create_lock(lock)
 
     @staticmethod
     def _restore_staging_disk_path(managed_disk_path: Path) -> Path:
@@ -1997,6 +2014,9 @@ class SmolVMManager:
         *,
         snapshot_type: SnapshotType = SnapshotType.FULL,
         resume_source: bool = False,
+        capture_policy: SnapshotCapturePolicy = SnapshotCapturePolicy.ALLOW_PAUSE,
+        timeout_seconds: float = 600.0,
+        max_bytes_per_second: int | None = None,
     ) -> SnapshotInfo:
         """Create a snapshot for a paused or running VM.
 
@@ -2007,9 +2027,47 @@ class SmolVMManager:
         ``DISK`` is self-contained like ``FULL`` but stores only the disk (no
         guest RAM), so it is much faster and lighter; restoring it boots the
         guest fresh from the disk instead of resuming the running state.
+
+        ``capture_policy=LIVE_ONLY`` fails instead of pausing a running guest.
+        It requires a running QEMU VM, ``snapshot_type=DISK``, and
+        ``resume_source=True``. ``timeout_seconds`` must be positive and bounds
+        live disk capture; ``max_bytes_per_second`` may optionally apply a
+        positive bandwidth limit.
         """
         if not vm_id:
             raise ValueError("vm_id cannot be empty")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite number greater than zero")
+        if max_bytes_per_second is not None and max_bytes_per_second <= 0:
+            raise ValueError("max_bytes_per_second must be greater than zero when set")
+
+        snapshot_id = snapshot_id or f"snap-{vm_id}-{int(time.time())}"
+        snapshot_root = self._snapshot_root_for_id(snapshot_id)
+        with self._snapshot_operation_locks(vm_id, snapshot_id):
+            return self._create_snapshot_locked(
+                vm_id=vm_id,
+                snapshot_id=snapshot_id,
+                snapshot_root=snapshot_root,
+                snapshot_type=snapshot_type,
+                resume_source=resume_source,
+                capture_policy=capture_policy,
+                timeout_seconds=timeout_seconds,
+                max_bytes_per_second=max_bytes_per_second,
+            )
+
+    def _create_snapshot_locked(
+        self,
+        *,
+        vm_id: str,
+        snapshot_id: str,
+        snapshot_root: Path,
+        snapshot_type: SnapshotType,
+        resume_source: bool,
+        capture_policy: SnapshotCapturePolicy,
+        timeout_seconds: float,
+        max_bytes_per_second: int | None,
+    ) -> SnapshotInfo:
+        """Create one snapshot while its VM and snapshot-ID locks are held."""
 
         vm_info = self.state.get_vm(vm_id)
         self._ensure_snapshot_supported(vm_info)
@@ -2019,21 +2077,85 @@ class SmolVMManager:
                 {"vm_id": vm_id, "current_status": vm_info.status.value},
             )
 
-        snapshot_id = snapshot_id or f"snap-{vm_id}-{int(time.time())}"
-        snapshot_root = self._snapshot_root_for_id(snapshot_id)
-        if snapshot_root.exists():
-            raise SnapshotAlreadyExistsError(snapshot_id)
-        with suppress(SnapshotNotFoundError):
-            self.state.get_snapshot(snapshot_id)
-            raise SnapshotAlreadyExistsError(snapshot_id)
-
         original_status = vm_info.status
         backend = self._backend_for_vm(vm_info)
+        live_command = (
+            f"smolvm sandbox snapshot create {vm_id} --snapshot-id {snapshot_id} "
+            "--snapshot-type disk --resume-source --live-only"
+        )
+        if capture_policy == SnapshotCapturePolicy.LIVE_ONLY:
+            if original_status != VMState.RUNNING:
+                raise SmolVMError(
+                    f"Sandbox '{vm_id}' must be running for a live snapshot; run "
+                    f"'smolvm sandbox start {vm_id}'.",
+                    {"vm_id": vm_id, "current_status": original_status.value},
+                )
+            if backend != BACKEND_QEMU:
+                raise SmolVMError(
+                    f"Sandbox '{vm_id}' cannot stay available during this snapshot; run "
+                    f"'smolvm sandbox snapshot create {vm_id} --snapshot-id {snapshot_id} "
+                    "--snapshot-type disk --resume-source' to allow a brief pause.",
+                    {
+                        "vm_id": vm_id,
+                        "backend": backend,
+                        "snapshot_type": snapshot_type.value,
+                    },
+                )
+            if snapshot_type != SnapshotType.DISK:
+                raise SmolVMError(
+                    f"Live snapshots of sandbox '{vm_id}' save disk state only; run "
+                    f"'{live_command}'.",
+                    {
+                        "vm_id": vm_id,
+                        "backend": backend,
+                        "snapshot_type": snapshot_type.value,
+                    },
+                )
+            if not resume_source:
+                raise SmolVMError(
+                    f"A live snapshot keeps sandbox '{vm_id}' running; run '{live_command}'.",
+                    {"vm_id": vm_id},
+                )
         managed_disk_path = self._managed_disk_for_vm(vm_info)
         if managed_disk_path is None:
             raise SmolVMError("Snapshotting requires a managed isolated disk", {"vm_id": vm_id})
 
         adapter = self._runtime_adapter_for_backend(backend)
+        if isinstance(adapter, QemuRuntimeAdapter):
+            adapter.reconcile_live_backups(
+                vm_info,
+                snapshot_dir=self.snapshot_dir,
+                locked_snapshot_id=snapshot_id,
+                persisted_snapshot_ids={
+                    snapshot.snapshot_id for snapshot in self.state.list_snapshots(vm_id=vm_id)
+                },
+            )
+
+        with suppress(SnapshotNotFoundError):
+            self.state.get_snapshot(snapshot_id)
+            raise SnapshotAlreadyExistsError(snapshot_id)
+
+        if snapshot_root.exists():
+            manifest_path = snapshot_root / "live-backup.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    manifest = {}
+                manifest_vm_id = manifest.get("vm_id")
+                if manifest_vm_id not in (None, vm_id):
+                    raise SnapshotAlreadyExistsError(snapshot_id)
+                raise SmolVMError(
+                    f"A previous live snapshot of sandbox '{vm_id}' is still cleaning up; "
+                    f"retry with '{live_command}'.",
+                    {
+                        "vm_id": vm_id,
+                        "snapshot_id": snapshot_id,
+                        "cleanup_pending": True,
+                    },
+                )
+            shutil.rmtree(snapshot_root)
+
         snapshot_persisted = False
 
         try:
@@ -2048,6 +2170,9 @@ class SmolVMManager:
                     resume_source=resume_source,
                     original_status=original_status,
                     snapshot_type=snapshot_type,
+                    capture_policy=capture_policy,
+                    timeout_seconds=timeout_seconds,
+                    max_bytes_per_second=max_bytes_per_second,
                 )
             )
 
@@ -2058,36 +2183,59 @@ class SmolVMManager:
                 artifacts=result.artifacts,
                 vm_config=vm_info.config,
                 network_config=vm_info.network,
-                created_at=datetime.now(timezone.utc),
+                created_at=result.captured_at,
                 snapshot_type=snapshot_type,
             )
             self.state.create_snapshot(snapshot_info)
             snapshot_persisted = True
-            source_status = VMState.PAUSED
-            if original_status == VMState.RUNNING and resume_source:
-                adapter.resume(vm_info)
-                source_status = VMState.RUNNING
+            if result.operation_manifest_path is not None:
+                with suppress(OSError):
+                    result.operation_manifest_path.unlink()
+            source_status = result.source_status
+            if (
+                source_status == VMState.PAUSED
+                and original_status == VMState.RUNNING
+                and resume_source
+            ):
+                try:
+                    adapter.resume(vm_info)
+                except Exception:
+                    logger.exception(
+                        "Snapshot %s was created, but sandbox %s could not be resumed; "
+                        "leaving it paused",
+                        snapshot_id,
+                        vm_id,
+                    )
+                else:
+                    source_status = VMState.RUNNING
             self.state.update_vm(vm_id, status=source_status)
             return snapshot_info
         except Exception as original_error:
             snapshot_dir_removed = False
             rollback_error: Exception | None = None
-            try:
-                shutil.rmtree(snapshot_root)
-                snapshot_dir_removed = True
-            except FileNotFoundError:
-                snapshot_dir_removed = True
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Failed to remove snapshot directory during rollback for %s: %s",
-                    snapshot_id,
-                    cleanup_error,
-                )
-                rollback_error = cleanup_error
+            cleanup_pending = bool(
+                getattr(original_error, "details", {}).get("cleanup_pending", False)
+            )
+            if not cleanup_pending:
+                try:
+                    shutil.rmtree(snapshot_root)
+                    snapshot_dir_removed = True
+                except FileNotFoundError:
+                    snapshot_dir_removed = True
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Failed to remove snapshot directory during rollback for %s: %s",
+                        snapshot_id,
+                        cleanup_error,
+                    )
+                    rollback_error = cleanup_error
             if snapshot_persisted and snapshot_dir_removed:
                 with suppress(Exception):
                     self.state.delete_snapshot(snapshot_id)
-            if original_status == VMState.RUNNING:
+            if (
+                original_status == VMState.RUNNING
+                and capture_policy == SnapshotCapturePolicy.ALLOW_PAUSE
+            ):
                 with suppress(Exception):
                     adapter.resume(vm_info)
                     self.state.update_vm(vm_id, status=VMState.RUNNING)

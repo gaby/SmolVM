@@ -28,8 +28,10 @@ from smolvm.exceptions import (
 from smolvm.facade import SmolVM, _build_auto_config
 from smolvm.images import BootImage, DirectKernelBoot, FirmwareBoot
 from smolvm.types import (
+    GuestFlushPolicy,
     GuestOS,
     PortForwardConfig,
+    SnapshotCapturePolicy,
     SnapshotType,
     VMConfig,
     VMState,
@@ -633,6 +635,35 @@ class TestVMInit:
 class TestSnapshot:
     """Tests for facade snapshot behavior."""
 
+    @pytest.mark.parametrize(
+        ("snapshot_type", "resume_source"),
+        [
+            (SnapshotType.FULL, True),
+            (SnapshotType.DISK, False),
+        ],
+    )
+    def test_live_snapshot_validation_names_exact_cli_recovery(
+        self,
+        snapshot_type: SnapshotType,
+        resume_source: bool,
+    ) -> None:
+        """Live-only validation should give CLI users a complete retry command."""
+        vm = SmolVM.__new__(SmolVM)
+        vm._vm_id = "vm001"
+
+        with pytest.raises(
+            SmolVMError,
+            match=(
+                r"smolvm sandbox snapshot create vm001 --snapshot-type disk "
+                r"--resume-source --live-only"
+            ),
+        ):
+            vm.snapshot(
+                snapshot_type=snapshot_type,
+                resume_source=resume_source,
+                capture_policy=SnapshotCapturePolicy.LIVE_ONLY,
+            )
+
     def test_disk_snapshot_syncs_guest_before_sdk_snapshot(self) -> None:
         """Disk-only snapshots should flush guest filesystem buffers first."""
         vm = SmolVM.__new__(SmolVM)
@@ -664,6 +695,9 @@ class TestSnapshot:
                 snapshot_id=None,
                 snapshot_type=SnapshotType.DISK,
                 resume_source=False,
+                capture_policy=SnapshotCapturePolicy.ALLOW_PAUSE,
+                timeout_seconds=600.0,
+                max_bytes_per_second=None,
             ),
         ]
 
@@ -700,6 +734,30 @@ class TestSnapshot:
 
         with pytest.raises(OperationTimeoutError, match=r"POST /sync"):
             vm._sync_guest_for_disk_snapshot()
+
+    def test_disk_snapshot_best_effort_flush_continues_after_sync_failure(self) -> None:
+        """Continuity snapshots may proceed crash-consistently when sync is unavailable."""
+        vm = SmolVM.__new__(SmolVM)
+        vm._vm_id = "vm001"
+        vm._info = MagicMock(status=VMState.RUNNING)
+        vm._refresh_info = MagicMock()
+        vm._reset_runtime_state = MagicMock()
+        vm._ensure_control_for_operation = MagicMock()
+        vm._ensure_control_for_operation.return_value.sync.side_effect = SmolVMError(
+            "sync unavailable"
+        )
+        vm._sdk = MagicMock()
+        expected = MagicMock()
+        vm._sdk.create_snapshot.return_value = expected
+
+        assert (
+            vm.snapshot(
+                snapshot_type=SnapshotType.DISK,
+                flush_policy=GuestFlushPolicy.BEST_EFFORT,
+            )
+            is expected
+        )
+        vm._sdk.create_snapshot.assert_called_once()
 
 
 class TestFromBootImage:
