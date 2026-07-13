@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import click
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -2871,14 +2872,14 @@ def _run_windows_build_image(args: SimpleNamespace) -> int:
         )
     else:
         console = console_stdout()
+        username_literal = escape(repr(args.username))
         console.print(
             Panel.fit(
                 f"Built Windows image: [bold]{output}[/bold]\n\n"
-                f"Boot it with:\n"
-                f"  [bold]smolvm sandbox create --os windows --image {output}[/bold]\n"
-                f"or in Python:\n"
+                f"Boot it from Python with:\n"
                 f'  [bold]SmolVM(os="windows", image="{output}", '
-                f'ssh_user="{args.username}", ssh_password="<hidden>")[/bold]',
+                f'ssh_user={username_literal}, ssh_password="<hidden>")[/bold]\n\n'
+                "The sandbox CLI does not accept Windows login credentials yet.",
                 title="Windows image ready",
                 border_style="green",
             )
