@@ -40,6 +40,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
@@ -421,7 +422,7 @@ def _decompressed_rootfs_sidecar_value(rootfs_sha256: str) -> str:
 
 
 def _decompress_zstd(src: Path, dst: Path) -> None:
-    """Stream-decompress a zstd file. Writes to a sibling ``.tmp`` then renames.
+    """Stream-decompress a zstd file through a unique sibling staging path.
 
     Published raw ext4 images contain large zeroed regions. Keep those regions
     sparse in the local cache so Firecracker isolated-disk materialization does
@@ -430,10 +431,13 @@ def _decompress_zstd(src: Path, dst: Path) -> None:
     """
     from smolvm.host.disk import decompress_zstd_sparse
 
+    staging = dst.with_name(f".{dst.name}.{uuid4().hex}.partial")
     try:
-        decompress_zstd_sparse(src, dst, chunk_size=_SPARSE_DECOMPRESS_CHUNK_SIZE)
+        decompress_zstd_sparse(src, staging, chunk_size=_SPARSE_DECOMPRESS_CHUNK_SIZE)
+        staging.replace(dst)
     except OSError as exc:
-        (dst.parent / (dst.name + ".tmp")).unlink(missing_ok=True)
+        (staging.parent / (staging.name + ".tmp")).unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         if _looks_like_zstd_decode_error(exc):
             import zstandard
 
