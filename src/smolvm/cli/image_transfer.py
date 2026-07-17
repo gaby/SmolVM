@@ -20,7 +20,9 @@ encoding (``raw`` bytes or a ``zstd`` stream), its decoded size, and the
 SHA-256 digest of the stored bytes, all verified on load. Member names
 never carry encoding suffixes, so sibling files like ``x`` and ``x.zst``
 can't collide. Large files travel as zstd streams so sparse
-rootfs images stay small; the decompressed ``rootfs.ext4`` and its sidecar
+rootfs images stay small; files that are already ``.zst`` always travel
+raw (never re-compressed), so their manifest digest is also the digest of
+the installed file. The decompressed ``rootfs.ext4`` and its sidecar
 are omitted entirely when the compressed ``rootfs.ext4.zst`` is present and
 are recreated on load, byte-compatible with what ``ensure_published_image``
 expects.
@@ -69,6 +71,12 @@ _MANIFEST_SIZE_CAP = 10 * 1024 * 1024
 _DECOMPRESSED_ROOTFS = "rootfs.ext4"
 _ROOTFS_ZST = "rootfs.ext4.zst"
 _ROOTFS_SIDECAR = "rootfs.ext4.from-sha256"
+# Builders hold this lock while rewriting an entry (see builder.py).
+_BUILD_LOCK = ".build.lock"
+
+
+class _EntryChangedError(Exception):
+    """A file in the image shrank while it was being archived."""
 
 
 class ImageSavePayload(TypedDict):
@@ -135,6 +143,8 @@ def run_image_save(
     command_name: str = "image.save",
 ) -> int:
     """Execute ``smolvm image save``."""
+    import fcntl
+
     import zstandard
 
     root = resolve_image_dir(image_dir)
@@ -224,9 +234,14 @@ def run_image_save(
     try:
         tmp_parent = str(out_path.parent) if out_path.parent.is_dir() else None
         with (
+            (entry / _BUILD_LOCK).open("a") as build_lock,
             tempfile.TemporaryDirectory(dir=tmp_parent) as tmp,
             tarfile.open(partial_archive, "w") as tar,
         ):
+            # Hold the entry's build lock so the archive is one consistent
+            # generation, not a mix of two builds; non-blocking so a running
+            # build reports as busy instead of hanging the save.
+            fcntl.flock(build_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             scratch = Path(tmp) / "member.zst"
             for f in sorted(entry.rglob("*")):
                 if f.is_symlink():
@@ -238,7 +253,11 @@ def run_image_save(
                 if not f.is_file():
                     continue
                 rel = f.relative_to(entry).as_posix()
-                if rel in excluded or rel == ".build.lock":
+                if rel in excluded:
+                    continue
+                # Dot-prefixed names are lock files and builders' in-progress
+                # temp artifacts, never part of the image.
+                if any(segment.startswith(".") for segment in rel.split("/")):
                     continue
                 if rel.endswith(".zst"):
                     # Hash while tar reads the file so the manifest digest
@@ -247,9 +266,19 @@ def run_image_save(
                     # producing a silently inconsistent archive.
                     hasher = hashlib.sha256()
                     with open(f, "rb") as src:
-                        info = tarfile.TarInfo(f"files/{rel}")
+                        info = tar.gettarinfo(arcname=f"files/{rel}", fileobj=src)
+                        # Force a plain file member: gettarinfo turns a second
+                        # hardlink to an already-added file into a link entry
+                        # the manifest cannot describe.
+                        info.type = tarfile.REGTYPE
+                        info.linkname = ""
                         info.size = os.fstat(src.fileno()).st_size
-                        tar.addfile(info, _HashingReader(src, hasher))
+                        try:
+                            tar.addfile(info, _HashingReader(src, hasher))
+                        except OSError as exc:
+                            if os.fstat(src.fileno()).st_size < info.size:
+                                raise _EntryChangedError(rel) from exc
+                            raise
                     files_meta.append(
                         {
                             "path": rel,
@@ -260,10 +289,8 @@ def run_image_save(
                     )
                 else:
                     # Compress into one reused scratch file, add, discard —
-                    # scratch usage stays bounded by a single member. The
-                    # recorded size counts the bytes actually compressed, so
-                    # manifest and stream stay consistent under concurrent
-                    # source changes.
+                    # scratch usage stays bounded by a single member, and the
+                    # recorded size counts the bytes actually compressed.
                     with open(f, "rb") as src, open(scratch, "wb") as dst:
                         read_bytes, _ = compressor.copy_stream(src, dst)
                     files_meta.append(
@@ -291,6 +318,24 @@ def run_image_save(
             info.size = len(manifest_bytes)
             tar.addfile(info, io.BytesIO(manifest_bytes))
         partial_archive.replace(out_path)
+    except _EntryChangedError as exc:
+        with suppress(OSError):
+            partial_archive.unlink(missing_ok=True)
+        return _fail(
+            command_name,
+            f"The image changed while it was being saved ('{exc.args[0]}' shrank).",
+            json_output=json_output,
+            recovery=f"Wait until nothing is using the image, then retry '{retry_command}'.",
+        )
+    except BlockingIOError:
+        with suppress(OSError):
+            partial_archive.unlink(missing_ok=True)
+        return _fail(
+            command_name,
+            f"'{archive_name}' is being built right now.",
+            json_output=json_output,
+            recovery=f"Wait for the build to finish, then retry '{retry_command}'.",
+        )
     except OSError as exc:
         with suppress(OSError):
             partial_archive.unlink(missing_ok=True)
@@ -299,6 +344,15 @@ def run_image_save(
             f"Could not write '{out_path}': {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Free up disk space or fix permissions, then retry '{retry_command}'.",
+        )
+    except zstandard.ZstdError as exc:
+        with suppress(OSError):
+            partial_archive.unlink(missing_ok=True)
+        return _fail(
+            command_name,
+            f"Could not save the image: {_brief_error(exc)}",
+            json_output=json_output,
+            recovery=f"Retry '{retry_command}'.",
         )
     except BaseException:
         with suppress(OSError):
@@ -412,6 +466,10 @@ def run_image_load(
                 not isinstance(meta, dict)
                 or not isinstance(meta.get("path"), str)
                 or meta.get("encoding") not in {"raw", "zstd"}
+                # .zst files always travel raw; a re-compressed one would
+                # install bytes that differ from the digest the manifest
+                # (and the regenerated rootfs sidecar) describes.
+                or (meta["path"].endswith(".zst") and meta["encoding"] != "raw")
                 or not isinstance(meta.get("size"), int)
                 or isinstance(meta.get("size"), bool)
                 or meta["size"] < 0
@@ -462,8 +520,9 @@ def run_image_load(
                 source = tar.extractfile(member)
                 if source is None:
                     raise tarfile.TarError(f"could not read '{member.name}' from the archive")
-                # Every member's bytes are verified against the manifest
-                # digest before use; the rootfs digest doubles as the
+                # Every member's stored bytes are verified against the
+                # manifest digest before use; for the always-raw
+                # rootfs.ext4.zst, that same digest doubles as the
                 # sidecar fallback.
                 hasher = hashlib.sha256()
                 if meta["encoding"] == "raw":
@@ -491,11 +550,9 @@ def run_image_load(
                         f"'{meta['path']}' does not match the size the archive declares"
                     )
                 if meta["path"] == _ROOTFS_ZST:
-                    # The sidecar must describe the installed file's bytes.
-                    # With raw encoding those are exactly the verified stored
-                    # bytes; a zstd-encoded member was decompressed on the way
-                    # in, so hash what actually landed on disk.
-                    zst_sha = digest if meta["encoding"] == "raw" else _sha256_file(destination)
+                    # Always raw (validated above), so this digest is also
+                    # the digest of the installed file.
+                    zst_sha = digest
 
             # Recreate what save deliberately left out, byte-compatible with
             # what ensure_published_image validates on the next start.

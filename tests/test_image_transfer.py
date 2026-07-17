@@ -331,12 +331,12 @@ class TestArchiveRobustness:
         assert (loaded / "data.txt").read_bytes() == b"plain"
         assert (loaded / "data.txt.zst").read_bytes() == zstandard.compress(b"compressed")
 
-    def test_zstd_encoded_rootfs_member_regenerates_matching_sidecar(
+    def test_zstd_encoded_zst_member_is_rejected(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """A hand-built archive may ship rootfs.ext4.zst as a zstd stream;
-        the regenerated sidecar must hash the installed file, not the
-        archive stream (regression)."""
+        """.zst files always travel raw; a re-compressed rootfs.ext4.zst
+        would install bytes whose digest differs from what the manifest and
+        the regenerated sidecar describe, so load refuses the archive."""
         zst_file = zstandard.compress(_SPARSE_PAYLOAD)
         stored = zstandard.compress(zst_file)
         archive = tmp_path / "in.tar"
@@ -359,15 +359,74 @@ class TestArchiveRobustness:
         )
 
         dest = tmp_path / "dest"
-        assert main(["image", "load", "-i", str(archive), "--image-dir", str(dest), "--json"]) == 0
+        ret = main(["image", "load", "-i", str(archive), "--image-dir", str(dest), "--json"])
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert not (dest / "oddball").exists()
+
+    def test_save_skips_build_temp_artifacts(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Dot-prefixed lock files and builders' in-progress artifacts must
+        not travel; archiving them would install a half-written rootfs on
+        the target machine."""
+        src = tmp_path / "src"
+        entry = _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+        (entry / ".rootfs.tmp.ext4").write_bytes(b"half-written")
+        context_dir = entry / ".build-abc123"
+        context_dir.mkdir()
+        (context_dir / "Dockerfile").write_text("FROM scratch")
+        archive = tmp_path / "codex.tar"
+
+        assert main(["image", "save", "codex", "--image-dir", str(src), "-o", str(archive)]) == 0
         capsys.readouterr()
 
-        loaded = dest / "oddball"
-        installed_sha = hashlib.sha256((loaded / "rootfs.ext4.zst").read_bytes()).hexdigest()
-        assert (loaded / "rootfs.ext4.from-sha256").read_text() == f"sparse-v1:{installed_sha}"
-        with open(loaded / "rootfs.ext4", "rb") as f:
-            f.seek(1 << 20)
-            assert f.read(9) == b"REAL-DATA"
+        with tarfile.open(archive) as tar:
+            names = tar.getnames()
+        assert names, "archive must not be empty"
+        assert not any(".rootfs.tmp.ext4" in n or ".build-abc123" in n for n in names)
+
+    def test_save_reports_busy_while_entry_is_being_built(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """While a builder holds the entry's build lock, save must fail
+        with a clear message instead of archiving a mix of two builds."""
+        fcntl = pytest.importorskip("fcntl")
+        src = tmp_path / "src"
+        entry = _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+        archive = tmp_path / "codex.tar"
+
+        with (entry / ".build.lock").open("w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            ret = main(
+                ["image", "save", "codex", "--image-dir", str(src), "-o", str(archive), "--json"]
+            )
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "being built" in payload["error"]["message"]
+        assert "retry" in payload["error"]["recovery"]
+        assert not archive.exists()
+
+    def test_raw_zst_member_keeps_source_metadata(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Raw members are streamed from an open fd; the tar header must
+        still carry the source file's mtime, like every other member."""
+        src = tmp_path / "src"
+        entry = _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+        stamp = 1_700_000_000
+        os.utime(entry / "rootfs.ext4.zst", (stamp, stamp))
+        archive = tmp_path / "codex.tar"
+
+        assert main(["image", "save", "codex", "--image-dir", str(src), "-o", str(archive)]) == 0
+        capsys.readouterr()
+
+        with tarfile.open(archive) as tar:
+            member = tar.getmember("files/rootfs.ext4.zst")
+        assert member.isreg()
+        assert member.mtime == stamp
 
     def test_truncated_archive_gets_clean_envelope(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
