@@ -24,9 +24,21 @@ the directory returned by :func:`smolvm.images.manager.resolve_image_dir`.
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, TypedDict, cast
+
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TransferSpeedColumn,
+)
 
 from smolvm import __version__
 from smolvm.cli.output import (
@@ -36,26 +48,39 @@ from smolvm.cli.output import (
     render_empty,
     render_error,
 )
-from smolvm.cli.prune import _format_bytes, _total_size
+from smolvm.cli.prune import _VERSION_PATTERN, _format_bytes, _total_size
 from smolvm.images.manager import resolve_image_dir
 
 # Cache directory names produced by ``published.cache_name()``:
 # ``{preset}-v{cli_version}-{arch}-{vmm}`` with a ``-alpine`` suffix for
 # Alpine rootfs builds (Ubuntu carries no suffix for backward compat).
 # The preset group is non-greedy so hyphenated presets (``claude-code``)
-# parse correctly against the ``-v<semver>-`` anchor.
+# parse correctly against the ``-v<version>-`` anchor; the version
+# fragment is shared with prune so list/rm/prune agree on what counts as
+# a versioned cache directory (a test round-trips it against cache_name()).
 _IMAGE_DIR_NAME_RE = re.compile(
-    r"^(?P<preset>[a-z0-9-]+?)-v(?P<version>\d+\.\d+\.\d+[a-z0-9]*)"
+    rf"^(?P<preset>[a-z0-9-]+?)-v(?P<version>{_VERSION_PATTERN})"
     r"-(?P<arch>amd64|arm64)-(?P<vmm>firecracker|qemu|libkrun)(?:-(?P<os>alpine))?$"
 )
 
 # Base kernel dirs from ``published.ensure_base_kernel()``.
 _KERNEL_DIR_NAME_RE = re.compile(
-    r"^base-kernel-v(?P<version>\d+\.\d+\.\d+[a-z0-9]*)-(?P<arch>amd64|arm64)$"
+    rf"^base-kernel-v(?P<version>{_VERSION_PATTERN})-(?P<arch>amd64|arm64)$"
 )
 
-# Public CLI names that differ from the manifest preset name.
-_PRESET_ALIASES = {"claude": "claude-code"}
+
+def _canonical_preset(name: str) -> str:
+    """Map a public CLI alias (e.g. ``claude``) to its manifest preset name.
+
+    Alias data lives on the preset definitions themselves so a new alias
+    automatically works here without touching this module.
+    """
+    from smolvm.presets import list_presets
+
+    for preset in list_presets():
+        if name == preset.name or name in preset.aliases:
+            return preset.name
+    return name
 
 
 class ImageRow(TypedDict):
@@ -90,6 +115,7 @@ class ImagePullPayload(TypedDict):
     rootfs_path: str
     size_bytes: int
     already_cached: bool
+    warnings: list[str]
 
 
 class RemovedEntry(TypedDict):
@@ -172,6 +198,40 @@ def _cached_rows(root: Path) -> list[ImageRow]:
     return [_classify(child) for child in sorted(root.iterdir()) if child.is_dir()]
 
 
+def _download_progress() -> Progress:
+    """The download progress renderer shared with the sandbox boot flow."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeElapsedColumn(),
+        console=console_stdout(),
+        transient=True,
+    )
+
+
+def _pull_retry_command(
+    preset: str,
+    arch: str | None,
+    vmm: str | None,
+    os_name: str | None,
+    image_dir: str | None,
+) -> str:
+    """The user's pull invocation, reconstructed for recovery messages."""
+    parts = ["smolvm", "image", "pull", preset]
+    if arch:
+        parts += ["--arch", arch]
+    if vmm:
+        parts += ["--vmm", vmm]
+    if os_name:
+        parts += ["--os", os_name]
+    if image_dir:
+        parts += ["--image-dir", shlex.quote(image_dir)]
+    return " ".join(parts)
+
+
 def run_image_pull(
     *,
     preset: str,
@@ -184,6 +244,7 @@ def run_image_pull(
 ) -> int:
     """Execute ``smolvm image pull``."""
     from smolvm.cli.main import _host_arch_for_published, _vmm_for_host
+    from smolvm.exceptions import ImageError
     from smolvm.images.published import (
         MANIFEST,
         Arch,
@@ -195,25 +256,25 @@ def run_image_pull(
         is_preset_published,
     )
 
-    canonical = _PRESET_ALIASES.get(preset, preset)
+    canonical = _canonical_preset(preset)
+    retry_command = _pull_retry_command(preset, arch, vmm, os_name, image_dir)
 
     try:
-        resolved_arch = arch or _host_arch_for_published()
-        resolved_vmm = vmm or _vmm_for_host()
-    except RuntimeError as exc:
+        resolved_arch = cast("Arch", arch) if arch else _host_arch_for_published()
+        resolved_vmm = cast("Vmm", vmm) if vmm else _vmm_for_host()
+    except RuntimeError:
         return _fail(
             command_name,
-            f"{exc} Pass the platform explicitly, e.g. "
-            f"'smolvm image pull {preset} --arch amd64 --vmm firecracker'.",
+            "SmolVM doesn't publish prebuilt images for this machine. Pass the "
+            f"platform explicitly, e.g. 'smolvm image pull {preset} --arch amd64 "
+            "--vmm firecracker'.",
             json_output=json_output,
             code="invalid_input",
             exit_code=2,
         )
-    resolved_os = os_name or "ubuntu"
+    resolved_os: Os = cast("Os", os_name) if os_name else "ubuntu"
 
-    if not is_preset_published(
-        canonical, cast(Arch, resolved_arch), cast(Vmm, resolved_vmm), cast(Os, resolved_os)
-    ):
+    if not is_preset_published(canonical, resolved_arch, resolved_vmm, resolved_os):
         known_presets = sorted({key[0] for key in MANIFEST})
         if canonical not in known_presets:
             return _fail(
@@ -233,76 +294,82 @@ def run_image_pull(
             exit_code=2,
         )
 
+    published_preset = cast("Preset", canonical)
     root = resolve_image_dir(image_dir)
-    name = cache_name(
-        cast(Preset, canonical),
-        cast(Arch, resolved_arch),
-        cast(Vmm, resolved_vmm),
-        os=cast(Os, resolved_os),
-    )
-    downloaded_labels: set[str] = set()
+    name = cache_name(published_preset, resolved_arch, resolved_vmm, os=resolved_os)
+    target_dir = root / name
 
+    # "Already cached" must mean the pull was a no-op. Downloads are
+    # observable through on_download, but rootfs decompression is not, so
+    # also watch the cache directory itself: any file (re)created in it —
+    # by download or decompression — bumps its mtime.
+    pre_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
+    downloaded = False
+
+    progress_cm: AbstractContextManager[Progress | None] = (
+        nullcontext(None) if json_output else _download_progress()
+    )
     try:
-        if json_output:
+        with progress_cm as progress:
+            download_tasks: dict[str, Any] = {}
+            if progress is not None:
+                # Visible immediately: SHA verification of cached files and
+                # rootfs decompression run without download callbacks and
+                # can take a while on multi-GB images.
+                progress.add_task("Preparing image...", total=None)
 
             def on_download(label: str, chunk: int, total: int | None) -> None:
-                downloaded_labels.add(label)
+                nonlocal downloaded
+                downloaded = True
+                if progress is None:
+                    return
+                if label not in download_tasks:
+                    download_tasks[label] = progress.add_task(f"Downloading {label}", total=total)
+                progress.update(download_tasks[label], advance=chunk)
 
             local = ensure_published_image(
-                cast(Preset, canonical),
-                cast(Arch, resolved_arch),
-                cast(Vmm, resolved_vmm),
-                cast(Os, resolved_os),
+                published_preset,
+                resolved_arch,
+                resolved_vmm,
+                resolved_os,
                 cache_dir=root,
                 on_download=on_download,
             )
-        else:
-            from rich.progress import (
-                BarColumn,
-                DownloadColumn,
-                Progress,
-                SpinnerColumn,
-                TextColumn,
-                TimeElapsedColumn,
-                TransferSpeedColumn,
-            )
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                DownloadColumn(),
-                TransferSpeedColumn(),
-                TimeElapsedColumn(),
-                console=console_stdout(),
-                transient=True,
-            ) as progress:
-                download_tasks: dict[str, Any] = {}
-
-                def on_progress(label: str, chunk: int, total: int | None) -> None:
-                    downloaded_labels.add(label)
-                    if label not in download_tasks:
-                        download_tasks[label] = progress.add_task(
-                            f"Downloading {label}", total=total
-                        )
-                    progress.update(download_tasks[label], advance=chunk)
-
-                local = ensure_published_image(
-                    cast("Preset", canonical),
-                    cast("Arch", resolved_arch),
-                    cast("Vmm", resolved_vmm),
-                    cast("Os", resolved_os),
-                    cache_dir=root,
-                    on_download=on_progress,
-                )
-    except Exception as exc:
+    except ImageError as exc:
         return _fail(
             command_name,
             f"Could not download the image: {exc}",
             json_output=json_output,
-            recovery=f"Check your network connection and retry 'smolvm image pull {preset}'.",
+            recovery=f"Check your network connection and retry '{retry_command}'.",
+        )
+    except OSError as exc:
+        return _fail(
+            command_name,
+            f"Could not save the image: {exc}",
+            json_output=json_output,
+            recovery=f"Free up disk space or fix permissions on '{root}', "
+            f"then retry '{retry_command}'.",
+        )
+    except Exception as exc:
+        return _fail(
+            command_name,
+            f"Could not get the image: {exc}",
+            json_output=json_output,
+            recovery=f"Retry '{retry_command}'.",
         )
 
+    post_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
+    already_cached = not downloaded and pre_mtime is not None and post_mtime == pre_mtime
+
+    warnings: list[str] = []
+    default_root = resolve_image_dir(None)
+    if root != default_root:
+        warnings.append(
+            f"Sandboxes look for images in '{default_root}'. Set "
+            f"SMOLVM_IMAGE_DIR={shlex.quote(str(root))} so they use this download."
+        )
+
+    size_bytes = _total_size(target_dir)
     payload = ImagePullPayload(
         preset=canonical,
         arch=resolved_arch,
@@ -312,20 +379,23 @@ def run_image_pull(
         name=name,
         kernel_path=str(local.kernel_path),
         rootfs_path=str(local.rootfs_path),
-        size_bytes=_total_size(root / name),
-        already_cached=not downloaded_labels,
+        size_bytes=size_bytes,
+        already_cached=already_cached,
+        warnings=warnings,
     )
     if json_output:
         return emit_success(command_name, payload)
 
     console = console_stdout()
-    size = _format_bytes(payload["size_bytes"])
-    if payload["already_cached"]:
+    size = _format_bytes(size_bytes)
+    if already_cached:
         console.print(f"Already cached: [bold]{name}[/bold] ({size})")
     else:
         console.print(f"Pulled [bold]{name}[/bold] ({size})")
-    console.print(f"  kernel: {payload['kernel_path']}")
-    console.print(f"  rootfs: {payload['rootfs_path']}")
+    console.print(f"  kernel: {local.kernel_path}")
+    console.print(f"  rootfs: {local.rootfs_path}")
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
     return 0
 
 
@@ -337,7 +407,15 @@ def run_image_list(
 ) -> int:
     """Execute ``smolvm image list``."""
     root = resolve_image_dir(image_dir)
-    rows = _cached_rows(root)
+    try:
+        rows = _cached_rows(root)
+    except OSError as exc:
+        return _fail(
+            command_name,
+            f"Could not read the image folder '{root}': {exc}",
+            json_output=json_output,
+            recovery="Fix the folder's permissions and run 'smolvm image list' again.",
+        )
     payload = ImageListPayload(
         image_dir=str(root),
         images=rows,
@@ -349,14 +427,16 @@ def run_image_list(
     if not rows:
         render_empty(
             "Images",
-            f"No cached images in {root}. Run 'smolvm image pull <preset>' to download one.",
+            f"No cached images in {root}. Run 'smolvm image pull codex' to download one.",
         )
         return 0
 
     from rich.table import Table
 
     table = Table(title="Cached Images")
-    table.add_column("Name")
+    # Fold long names instead of truncating: the full name is the handle
+    # `smolvm image rm <name>` needs.
+    table.add_column("Name", overflow="fold")
     table.add_column("Kind")
     table.add_column("Platform")
     table.add_column("Version")
@@ -382,6 +462,20 @@ def run_image_list(
     return 0
 
 
+def _normalize_rm_name(name: str, root: Path) -> str:
+    """Normalize what the user typed to a bare cache-entry name.
+
+    Accepts trailing path separators (shell tab completion) and the
+    absolute path that ``image list`` prints, as long as it points at a
+    direct child of the image directory.
+    """
+    requested = name.rstrip("/\\")
+    candidate = Path(requested)
+    if candidate.is_absolute() and candidate.parent in {root, root.resolve()}:
+        return candidate.name
+    return requested
+
+
 def run_image_rm(
     *,
     name: str,
@@ -392,8 +486,9 @@ def run_image_rm(
 ) -> int:
     """Execute ``smolvm image rm``."""
     root = resolve_image_dir(image_dir)
+    requested = _normalize_rm_name(name, root)
 
-    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+    if not requested or "/" in requested or "\\" in requested or requested in {".", ".."}:
         return _fail(
             command_name,
             f"'{name}' is not a cached image name.",
@@ -403,41 +498,55 @@ def run_image_rm(
             exit_code=2,
         )
 
-    targets: list[Path] = []
-    exact = root / name
-    if exact.is_dir():
-        targets = [exact]
-    elif root.is_dir():
-        # Fall back to preset-wide removal: every cached image whose parsed
-        # preset matches, across versions, arches, vmms, and oses.
-        canonical = _PRESET_ALIASES.get(name, name)
-        for child in sorted(root.iterdir()):
-            if not child.is_dir():
-                continue
-            match = _IMAGE_DIR_NAME_RE.match(child.name)
-            if match and match["preset"] == canonical:
-                targets.append(child)
-
-    if not targets:
+    permission_recovery = f"Fix the folder's permissions, then retry 'smolvm image rm {requested}'."
+    matches: list[Path] = []
+    try:
+        exact = root / requested
+        if exact.is_dir() or exact.is_symlink():
+            matches = [exact]
+        elif root.is_dir():
+            # Fall back to preset-wide removal: every cached image whose
+            # parsed preset matches, across versions, arches, vmms, and oses.
+            canonical = _canonical_preset(requested)
+            for child in sorted(root.iterdir()):
+                if not child.is_dir():
+                    continue
+                match = _IMAGE_DIR_NAME_RE.match(child.name)
+                if match and match["preset"] == canonical:
+                    matches.append(child)
+    except OSError as exc:
         return _fail(
             command_name,
-            f"No cached image named '{name}'.",
+            f"Could not read the image folder '{root}': {exc}",
+            json_output=json_output,
+            recovery=permission_recovery,
+        )
+
+    if not matches:
+        return _fail(
+            command_name,
+            f"No cached image named '{requested}'.",
             json_output=json_output,
             recovery="Run 'smolvm image list' to see cached images.",
         )
 
     resolved_root = root.resolve()
     entries: list[RemovedEntry] = []
-    for target in targets:
-        # Deletion is confined to direct children of the image directory;
-        # a symlinked entry pointing elsewhere is refused rather than
-        # followed.
+    for target in matches:
+        if target.is_symlink():
+            # A link is removed with unlink() — what it points at is never
+            # touched — so removing it frees no space.
+            entries.append(RemovedEntry(name=target.name, path=str(target), size_bytes=0))
+            continue
+        # Names are validated above and matches are direct children, so a
+        # real directory escaping the root should be impossible; keep a
+        # hard stop in front of the recursive delete anyway.
         if target.resolve().parent != resolved_root:
             return _fail(
                 command_name,
-                f"'{target.name}' points outside the image directory and was not removed.",
+                f"'{target.name}' could not be removed safely.",
                 json_output=json_output,
-                recovery=f"Remove it manually: {target}",
+                recovery=f"Delete it yourself if needed: '{target}'.",
             )
         entries.append(
             RemovedEntry(name=target.name, path=str(target), size_bytes=_total_size(target))
@@ -459,8 +568,19 @@ def run_image_rm(
             console.print(f"  {entry['name']}  ({_format_bytes(entry['size_bytes'])})")
         return 0
 
-    for target in targets:
-        shutil.rmtree(target)
+    for target in matches:
+        try:
+            if target.is_symlink():
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+        except OSError as exc:
+            return _fail(
+                command_name,
+                f"Could not remove '{target.name}': {exc}",
+                json_output=json_output,
+                recovery=permission_recovery,
+            )
 
     payload = ImageRmPayload(removed=entries, freed_bytes=freed)
     if json_output:

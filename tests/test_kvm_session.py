@@ -114,6 +114,10 @@ class TestShouldAttemptReexec:
             ["sandbox", "file"],
             ["sandbox", "snapshot", "list"],
             ["sandbox", "port"],
+            ["image", "pull", "codex"],
+            ["image", "list"],
+            ["image", "rm", "codex"],
+            ["image", "prune"],
         ]
         for argv in skipped:
             assert _kvm_session._should_attempt_reexec(argv) is False, (

@@ -48,19 +48,33 @@ _DOWNLOAD_CHUNK_SIZE = 8192
 IMAGE_DIR_ENV = "SMOLVM_IMAGE_DIR"
 
 
+def _expand_image_dir(path: Path) -> Path:
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        # "~unknownuser/..." with no resolvable home — keep the path as
+        # written rather than crashing; consumers treat a missing directory
+        # as an empty cache.
+        return path
+
+
 def resolve_image_dir(image_dir: Path | str | None = None) -> Path:
     """Resolve the image cache directory.
 
     Priority: explicit argument, then ``$SMOLVM_IMAGE_DIR``, then
-    ``~/.smolvm/images``. The directory is not created here — read-only
-    consumers (listing, pruning) must tolerate a missing directory, and
-    downloads create it at write time.
+    ``~/.smolvm/images``. An empty or whitespace-only argument falls
+    through to the environment/default so ``--image-dir "$UNSET_VAR"``
+    never targets the current working directory. The directory is not
+    created here — read-only consumers (listing, pruning) must tolerate
+    a missing directory, and downloads create it at write time.
     """
-    if image_dir is not None:
-        return Path(image_dir).expanduser()
+    if isinstance(image_dir, Path):
+        return _expand_image_dir(image_dir)
+    if image_dir is not None and image_dir.strip():
+        return _expand_image_dir(Path(image_dir.strip()))
     env_dir = os.environ.get(IMAGE_DIR_ENV, "").strip()
     if env_dir:
-        return Path(env_dir).expanduser()
+        return _expand_image_dir(Path(env_dir))
     return Path.home() / ".smolvm" / "images"
 
 

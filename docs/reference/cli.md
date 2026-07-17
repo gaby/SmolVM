@@ -48,7 +48,7 @@ The first time you start a sandbox or agent, SmolVM downloads the files it boots
 | `smolvm image rm <name>` | Remove a downloaded image to free disk space. |
 | `smolvm image prune` | Remove images left behind by older SmolVM versions. |
 
-Images are stored in `~/.smolvm/images`. To store them somewhere else, set the `SMOLVM_IMAGE_DIR` environment variable, or pass `--image-dir` to any `smolvm image` command.
+Images are stored in `~/.smolvm/images`. To keep them somewhere else, set the `SMOLVM_IMAGE_DIR` environment variable — sandboxes read it too, so images you pull are found when a sandbox starts. The `--image-dir` option points a single `smolvm image` command at a different folder; sandboxes do not read that folder.
 
 ## Browser, local services, and Windows
 

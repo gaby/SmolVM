@@ -359,12 +359,13 @@ def update(check_only: bool, json_output: bool) -> Any:
 @cli.command("prune", help="Remove stale image-cache entries (alias for 'smolvm image prune').")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed.")
 @click.option("--cache-dir", default=None, hidden=True)
+@image_dir_option
 @json_option
-def prune(dry_run: bool, cache_dir: str | None, json_output: bool) -> Any:
+def prune(dry_run: bool, cache_dir: str | None, image_dir: str | None, json_output: bool) -> Any:
     _before_command(json_output=json_output)
     from smolvm.cli.prune import run_prune
 
-    return run_prune(dry_run=dry_run, json_output=json_output, cache_dir=cache_dir)
+    return run_prune(dry_run=dry_run, json_output=json_output, cache_dir=image_dir or cache_dir)
 
 
 @cli.group(context_settings=CONTEXT_SETTINGS)
@@ -378,20 +379,20 @@ def image() -> None:
     "--arch",
     type=click.Choice(["amd64", "arm64"]),
     default=None,
-    help="Guest CPU architecture; defaults to this machine's.",
+    help="Processor type of the image; defaults to this machine's.",
 )
 @click.option(
     "--vmm",
     type=click.Choice(["firecracker", "qemu", "libkrun"]),
     default=None,
-    help="Hypervisor the kernel is built for; defaults to this machine's runtime.",
+    help="Virtual machine engine that boots the image; defaults to what this machine uses.",
 )
 @click.option(
     "--os",
     "os_name",
     type=click.Choice(["ubuntu", "alpine"]),
     default=None,
-    help="Guest OS flavour; defaults to ubuntu.",
+    help="Operating system inside the image; defaults to ubuntu.",
 )
 @image_dir_option
 @json_option

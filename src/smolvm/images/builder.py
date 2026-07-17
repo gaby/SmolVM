@@ -2211,7 +2211,7 @@ class DockerRootfsBuilder:
         self.dockerfile = dockerfile
         self.context = dict(context or {})
         self.rootfs_size_mb = rootfs_size_mb
-        self.cache_dir = cache_dir or ImageBuilder().cache_dir
+        self.cache_dir = resolve_image_dir(cache_dir)
         self.fingerprint_inputs = dict(fingerprint_inputs or {})
         self.build_args = dict(build_args or {})
         self.docker_platform = docker_platform
