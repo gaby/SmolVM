@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import click
 
@@ -374,7 +374,8 @@ def image() -> None:
 
 
 @image.command("pull")
-@click.argument("preset", metavar="preset")
+@click.argument("preset", metavar="preset", required=False, default=None)
+@click.option("--all", "all_images", is_flag=True, help="Download every image for this machine.")
 @click.option(
     "--arch",
     type=click.Choice(["amd64", "arm64"]),
@@ -397,7 +398,8 @@ def image() -> None:
 @image_dir_option
 @json_option
 def image_pull(
-    preset: str,
+    preset: str | None,
+    all_images: bool,
     arch: str | None,
     vmm: str | None,
     os_name: str | None,
@@ -406,10 +408,24 @@ def image_pull(
 ) -> Any:
     """Download a sandbox image before first use."""
     _before_command(json_output=json_output)
+    if bool(preset) == all_images:
+        raise click.UsageError(
+            "Choose one target: 'smolvm image pull codex' or 'smolvm image pull --all'."
+        )
+    if all_images:
+        from smolvm.cli.image import run_image_pull_all
+
+        return run_image_pull_all(
+            arch=arch,
+            vmm=vmm,
+            os_name=os_name,
+            image_dir=image_dir,
+            json_output=json_output,
+        )
     from smolvm.cli.image import run_image_pull
 
     return run_image_pull(
-        preset=preset,
+        preset=cast(str, preset),
         arch=arch,
         vmm=vmm,
         os_name=os_name,
@@ -429,6 +445,32 @@ def image_list(image_dir: str | None, json_output: bool) -> Any:
     return run_image_list(image_dir=image_dir, json_output=json_output)
 
 
+# Docker-familiar spelling; same command, same "image.list" JSON envelope.
+image.add_command(image_list, name="ls")
+
+
+@cli.command("images", help="Show downloaded images (alias for 'smolvm image list').")
+@image_dir_option
+@json_option
+def images(image_dir: str | None, json_output: bool) -> Any:
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_list
+
+    return run_image_list(image_dir=image_dir, json_output=json_output, command_name="images")
+
+
+@image.command("inspect")
+@click.argument("name", metavar="name-or-preset")
+@image_dir_option
+@json_option
+def image_inspect(name: str, image_dir: str | None, json_output: bool) -> Any:
+    """Show one image in detail: files, checksums, and where it came from."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_inspect
+
+    return run_image_inspect(name=name, image_dir=image_dir, json_output=json_output)
+
+
 @image.command("rm")
 @click.argument("name", metavar="name-or-preset")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed.")
@@ -443,6 +485,95 @@ def image_rm(name: str, dry_run: bool, image_dir: str | None, json_output: bool)
         name=name,
         image_dir=image_dir,
         dry_run=dry_run,
+        json_output=json_output,
+    )
+
+
+@image.command("build")
+@click.argument("context_path", metavar="path", default=".")
+@click.option("-t", "--tag", required=True, metavar="NAME", help="Name for the built image.")
+@click.option("-f", "--file", "dockerfile", default=None, metavar="PATH", help="Dockerfile path.")
+@click.option(
+    "--size-mb",
+    type=positive_int_type(),
+    default=512,
+    show_default=True,
+    help="Disk size of the built image.",
+)
+@click.option(
+    "--build-arg",
+    "build_args",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Values passed to the Dockerfile's ARG lines.",
+)
+@click.option(
+    "--arch",
+    type=click.Choice(["amd64", "arm64"]),
+    default=None,
+    help="Processor type to build for; defaults to this machine's.",
+)
+@backend_option(default="auto")
+@click.option("--init", default="/init", show_default=True, help="Program the image starts with.")
+@image_dir_option
+@json_option
+def image_build(
+    context_path: str,
+    tag: str,
+    dockerfile: str | None,
+    size_mb: int,
+    build_args: tuple[str, ...],
+    arch: str | None,
+    backend: str,
+    init: str,
+    image_dir: str | None,
+    json_output: bool,
+) -> Any:
+    """Build a custom image from a Dockerfile. Needs Docker installed."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_build
+
+    return run_image_build(
+        tag=tag,
+        context_path=context_path,
+        dockerfile=dockerfile,
+        size_mb=size_mb,
+        build_args=build_args,
+        arch=arch,
+        backend=backend,
+        init=init,
+        image_dir=image_dir,
+        json_output=json_output,
+    )
+
+
+@image.command("save")
+@click.argument("name", metavar="name")
+@click.option("-o", "--output", required=True, metavar="FILE", help="Where to write the archive.")
+@image_dir_option
+@json_option
+def image_save(name: str, output: str, image_dir: str | None, json_output: bool) -> Any:
+    """Pack a downloaded image into a file you can copy to another machine."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image_transfer import run_image_save
+
+    return run_image_save(name=name, output=output, image_dir=image_dir, json_output=json_output)
+
+
+@image.command("load")
+@click.option("-i", "--input", "input_file", required=True, metavar="FILE", help="Archive to load.")
+@click.option("--force", is_flag=True, help="Replace the image if it already exists.")
+@image_dir_option
+@json_option
+def image_load(input_file: str, force: bool, image_dir: str | None, json_output: bool) -> Any:
+    """Unpack an image archive created with 'smolvm image save'."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image_transfer import run_image_load
+
+    return run_image_load(
+        input_file=input_file,
+        image_dir=image_dir,
+        force=force,
         json_output=json_output,
     )
 

@@ -39,12 +39,16 @@ Run these in the order you need them:
 
 ## Manage downloaded images
 
-The first time you start a sandbox or agent, SmolVM downloads the files it boots from and keeps them on disk so later starts are fast. These commands manage that storage:
+The first time you start a sandbox or agent, SmolVM downloads the files it boots from and keeps them on disk so later starts are fast. These commands manage that storage, and they work like Docker's image commands if you know those:
 
 | Command | Use it to |
 | --- | --- |
 | `smolvm image pull <preset>` | Download an image ahead of time, for example before going offline. |
-| `smolvm image list` | See which images are downloaded and how much space they use. |
+| `smolvm image pull --all` | Download every image available for this machine in one go. |
+| `smolvm images` (or `image list` / `image ls`) | See which images are downloaded, when, and how much space they use. |
+| `smolvm image inspect <name>` | See one image in detail: files, checksums, and where it came from. |
+| `smolvm image build -t NAME .` | Build a custom image from a Dockerfile (needs Docker installed). |
+| `smolvm image save <name> -o FILE` / `image load -i FILE` | Copy an image to a machine without internet access. |
 | `smolvm image rm <name>` | Remove a downloaded image to free disk space. |
 | `smolvm image prune` | Remove images left behind by older SmolVM versions. |
 

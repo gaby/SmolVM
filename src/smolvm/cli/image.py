@@ -12,21 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SmolVM image-cache management — pull, list, and remove cached images.
+"""SmolVM image-cache management — pull, list, inspect, build, and remove.
 
 Backs the ``smolvm image`` command group. Images normally download lazily
 the first time a sandbox starts; ``image pull`` fetches them ahead of time
-(offline prep, CI warm-up), ``image list`` shows what is cached, and
-``image rm`` frees disk space for a single image. All commands operate on
-the directory returned by :func:`smolvm.images.manager.resolve_image_dir`.
+(offline prep, CI warm-up), ``image list`` shows what is cached,
+``image inspect`` shows one image in detail, ``image build`` bakes a custom
+image from a Dockerfile, and ``image rm`` frees disk space. All commands
+operate on the directory returned by
+:func:`smolvm.images.manager.resolve_image_dir`.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
+import time
 from contextlib import AbstractContextManager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -48,7 +53,7 @@ from smolvm.cli.output import (
     render_empty,
     render_error,
 )
-from smolvm.cli.prune import _VERSION_PATTERN, _format_bytes, _total_size
+from smolvm.cli.prune import _VERSION_PATTERN, _format_bytes, _size_on_disk, _total_size
 from smolvm.images.manager import resolve_image_dir
 
 # Cache directory names produced by ``published.cache_name()``:
@@ -68,6 +73,13 @@ _KERNEL_DIR_NAME_RE = re.compile(
     rf"^base-kernel-v(?P<version>{_VERSION_PATTERN})-(?P<arch>amd64|arm64)$"
 )
 
+# One path segment of a cache-entry name. Deliberately mirrors the builder's
+# _safe_cache_name charset; "." and ".." are rejected separately.
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# Custom builds live under this subdirectory: custom/<name>/<fingerprint>/.
+_CUSTOM_DIR = "custom"
+
 
 def _canonical_preset(name: str) -> str:
     """Map a public CLI alias (e.g. ``claude``) to its manifest preset name.
@@ -83,17 +95,66 @@ def _canonical_preset(name: str) -> str:
     return name
 
 
+def _created_iso(path: Path) -> str | None:
+    """ISO 8601 UTC creation marker for a cache entry (its dir mtime)."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        return None
+
+
+def _relative_time(iso_ts: str | None, *, now: datetime | None = None) -> str:
+    """Docker-style relative age ("2 hours ago") for an ISO timestamp."""
+    if not iso_ts:
+        return "-"
+    try:
+        then = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return "-"
+    current = now if now is not None else datetime.now(timezone.utc)
+    seconds = max(0, int((current - then).total_seconds()))
+    for unit, span in (
+        ("year", 31_536_000),
+        ("month", 2_592_000),
+        ("week", 604_800),
+        ("day", 86_400),
+        ("hour", 3_600),
+        ("minute", 60),
+    ):
+        count = seconds // span
+        if count:
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return f"{seconds} second{'s' if seconds != 1 else ''} ago"
+
+
+def _valid_entry_name(requested: str) -> bool:
+    """Whether *requested* is a well-formed cache-entry name.
+
+    Plain entries are a single path segment; custom builds may be addressed
+    as ``custom/<name>`` or ``custom/<name>/<fingerprint>``.
+    """
+    if not requested or "\\" in requested:
+        return False
+    segments = requested.split("/")
+    if any(seg in {"", ".", ".."} or not _SAFE_SEGMENT_RE.match(seg) for seg in segments):
+        return False
+    if len(segments) == 1:
+        return True
+    return segments[0] == _CUSTOM_DIR and len(segments) in {2, 3}
+
+
 class ImageRow(TypedDict):
     """One cached entry in the image directory."""
 
     name: str
-    kind: str  # "image" | "kernel" | "other"
+    kind: str  # "image" | "kernel" | "custom" | "other"
     preset: str | None
     version: str | None
     arch: str | None
     vmm: str | None
     os: str | None
     current: bool | None  # matches this CLI version; None when unversioned
+    created: str | None  # ISO 8601 UTC, from the entry dir's mtime
     size_bytes: int
     path: str
 
@@ -116,6 +177,52 @@ class ImagePullPayload(TypedDict):
     size_bytes: int
     already_cached: bool
     warnings: list[str]
+
+
+class PullFailure(TypedDict):
+    preset: str
+    os: str
+    error: str
+
+
+class ImagePullAllPayload(TypedDict):
+    arch: str
+    vmm: str
+    pulled: list[ImagePullPayload]
+    failed: list[PullFailure]
+    warnings: list[str]
+
+
+class ImageFileEntry(TypedDict):
+    name: str
+    size_bytes: int  # apparent size
+    size_on_disk_bytes: int  # allocated blocks, sparse-aware
+
+
+class ImageManifestInfo(TypedDict):
+    kernel_url: str
+    kernel_sha256: str
+    rootfs_url: str
+    rootfs_sha256: str
+    images_release_tag: str
+
+
+class ImageInspectEntry(ImageRow):
+    files: list[ImageFileEntry]
+    rootfs_sidecar: str | None
+    manifest: ImageManifestInfo | None
+
+
+class ImageBuildPayload(TypedDict):
+    name: str
+    fingerprint: str
+    rootfs_path: str
+    kernel_path: str
+    boot_args: str
+    arch: str
+    backend: str
+    size_bytes: int
+    cached: bool
 
 
 class RemovedEntry(TypedDict):
@@ -149,6 +256,7 @@ def _classify(path: Path) -> ImageRow:
     """Build an :class:`ImageRow` for one child directory of the image dir."""
     name = path.name
     size = _total_size(path)
+    created = _created_iso(path)
     image_match = _IMAGE_DIR_NAME_RE.match(name)
     if image_match:
         return ImageRow(
@@ -160,6 +268,7 @@ def _classify(path: Path) -> ImageRow:
             vmm=image_match["vmm"],
             os=image_match["os"] or "ubuntu",
             current=image_match["version"] == __version__,
+            created=created,
             size_bytes=size,
             path=str(path),
         )
@@ -174,6 +283,7 @@ def _classify(path: Path) -> ImageRow:
             vmm=None,
             os=None,
             current=kernel_match["version"] == __version__,
+            created=created,
             size_bytes=size,
             path=str(path),
         )
@@ -186,16 +296,119 @@ def _classify(path: Path) -> ImageRow:
         vmm=None,
         os=None,
         current=None,
+        created=created,
         size_bytes=size,
         path=str(path),
     )
 
 
+def _custom_row(fingerprint_dir: Path) -> ImageRow:
+    """Build an :class:`ImageRow` for one ``custom/<name>/<fingerprint>`` dir."""
+    arch: str | None = None
+    metadata = fingerprint_dir / "metadata.json"
+    if metadata.is_file():
+        try:
+            parsed = json.loads(metadata.read_text())
+            if isinstance(parsed, dict) and isinstance(parsed.get("arch"), str):
+                arch = parsed["arch"]
+        except (OSError, ValueError):
+            arch = None
+    return ImageRow(
+        name=f"{_CUSTOM_DIR}/{fingerprint_dir.parent.name}",
+        kind="custom",
+        preset=None,
+        version=fingerprint_dir.name[:12],
+        arch=arch,
+        vmm=None,
+        os=None,
+        current=None,
+        created=_created_iso(fingerprint_dir),
+        size_bytes=_total_size(fingerprint_dir),
+        path=str(fingerprint_dir),
+    )
+
+
+def _custom_rows(custom_root: Path) -> list[ImageRow]:
+    """One row per built custom image (``custom/<name>/<fingerprint>``)."""
+    rows: list[ImageRow] = []
+    for name_dir in sorted(custom_root.iterdir()):
+        if not name_dir.is_dir() or name_dir.name.startswith("."):
+            continue
+        for fingerprint_dir in sorted(name_dir.iterdir()):
+            if not fingerprint_dir.is_dir() or fingerprint_dir.name.startswith("."):
+                continue
+            rows.append(_custom_row(fingerprint_dir))
+    return rows
+
+
 def _cached_rows(root: Path) -> list[ImageRow]:
-    """Classify every child directory of *root* (empty when it's missing)."""
+    """Classify every cache entry under *root* (empty when it's missing)."""
     if not root.is_dir():
         return []
-    return [_classify(child) for child in sorted(root.iterdir()) if child.is_dir()]
+    rows: list[ImageRow] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if child.name == _CUSTOM_DIR:
+            rows.extend(_custom_rows(child))
+        else:
+            rows.append(_classify(child))
+    return rows
+
+
+def _normalize_rm_name(name: str, root: Path) -> str:
+    """Normalize what the user typed to a cache-entry name.
+
+    Accepts trailing path separators (shell tab completion) and the
+    absolute path that ``image list`` prints, as long as it points inside
+    the image directory.
+    """
+    requested = name.rstrip("/\\")
+    candidate = Path(requested)
+    if candidate.is_absolute():
+        for base in (root, root.resolve()):
+            try:
+                return candidate.relative_to(base).as_posix()
+            except ValueError:
+                continue
+    return requested
+
+
+def _resolve_entries(requested: str, root: Path) -> list[Path]:
+    """Match a validated entry name to cache directories.
+
+    Exact names (including the ``custom/...`` namespace) win; otherwise the
+    name is treated as a preset and every cached variant matches.
+    """
+    exact = root / requested
+    if exact.is_dir() or exact.is_symlink():
+        return [exact]
+    if "/" in requested or not root.is_dir():
+        return []
+    canonical = _canonical_preset(requested)
+    matches: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        match = _IMAGE_DIR_NAME_RE.match(child.name)
+        if match and match["preset"] == canonical:
+            matches.append(child)
+    return matches
+
+
+def _expand_custom_entries(matches: list[Path], root: Path) -> list[Path]:
+    """Expand a ``custom/<name>`` match into its fingerprint directories."""
+    expanded: list[Path] = []
+    for match in matches:
+        if match.parent == root / _CUSTOM_DIR:
+            expanded.extend(
+                child
+                for child in sorted(match.iterdir())
+                if child.is_dir() and not child.name.startswith(".")
+            )
+        else:
+            expanded.append(match)
+    return expanded
 
 
 def _download_progress() -> Progress:
@@ -232,6 +445,84 @@ def _pull_retry_command(
     return " ".join(parts)
 
 
+def _non_default_dir_warnings(root: Path) -> list[str]:
+    """Warn when downloads land somewhere sandbox starts will not look."""
+    default_root = resolve_image_dir(None)
+    if root == default_root:
+        return []
+    return [
+        f"Sandboxes look for images in '{default_root}'. Set "
+        f"SMOLVM_IMAGE_DIR={shlex.quote(str(root))} so they use this download."
+    ]
+
+
+def _execute_pull(
+    *,
+    preset: str,
+    arch: str,
+    vmm: str,
+    os_name: str,
+    root: Path,
+    progress: Progress | None,
+    label_prefix: str = "",
+) -> ImagePullPayload:
+    """Download one published image, reporting progress; raises on failure.
+
+    The (preset, arch, vmm, os) tuple must already be validated against the
+    manifest by the caller.
+    """
+    from smolvm.images.published import Arch, Os, Preset, Vmm, cache_name, ensure_published_image
+
+    name = cache_name(
+        cast("Preset", preset), cast("Arch", arch), cast("Vmm", vmm), os=cast("Os", os_name)
+    )
+    target_dir = root / name
+
+    # "Already cached" must mean the pull was a no-op. Downloads are
+    # observable through on_download, but rootfs decompression is not, so
+    # also watch the cache directory itself: any file (re)created in it —
+    # by download or decompression — bumps its mtime.
+    pre_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
+    downloaded = False
+    download_tasks: dict[str, Any] = {}
+
+    def on_download(label: str, chunk: int, total: int | None) -> None:
+        nonlocal downloaded
+        downloaded = True
+        if progress is None:
+            return
+        key = f"{label_prefix}{label}"
+        if key not in download_tasks:
+            download_tasks[key] = progress.add_task(f"Downloading {key}", total=total)
+        progress.update(download_tasks[key], advance=chunk)
+
+    local = ensure_published_image(
+        cast("Preset", preset),
+        cast("Arch", arch),
+        cast("Vmm", vmm),
+        cast("Os", os_name),
+        cache_dir=root,
+        on_download=on_download,
+    )
+
+    post_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
+    already_cached = not downloaded and pre_mtime is not None and post_mtime == pre_mtime
+
+    return ImagePullPayload(
+        preset=preset,
+        arch=arch,
+        vmm=vmm,
+        os=os_name,
+        version=__version__,
+        name=name,
+        kernel_path=str(local.kernel_path),
+        rootfs_path=str(local.rootfs_path),
+        size_bytes=_total_size(target_dir),
+        already_cached=already_cached,
+        warnings=[],
+    )
+
+
 def run_image_pull(
     *,
     preset: str,
@@ -245,23 +536,14 @@ def run_image_pull(
     """Execute ``smolvm image pull``."""
     from smolvm.cli.main import _host_arch_for_published, _vmm_for_host
     from smolvm.exceptions import ImageError
-    from smolvm.images.published import (
-        MANIFEST,
-        Arch,
-        Os,
-        Preset,
-        Vmm,
-        cache_name,
-        ensure_published_image,
-        is_preset_published,
-    )
+    from smolvm.images.published import MANIFEST, is_preset_published
 
     canonical = _canonical_preset(preset)
     retry_command = _pull_retry_command(preset, arch, vmm, os_name, image_dir)
 
     try:
-        resolved_arch = cast("Arch", arch) if arch else _host_arch_for_published()
-        resolved_vmm = cast("Vmm", vmm) if vmm else _vmm_for_host()
+        resolved_arch = arch or _host_arch_for_published()
+        resolved_vmm = vmm or _vmm_for_host()
     except RuntimeError:
         return _fail(
             command_name,
@@ -272,9 +554,9 @@ def run_image_pull(
             code="invalid_input",
             exit_code=2,
         )
-    resolved_os: Os = cast("Os", os_name) if os_name else "ubuntu"
+    resolved_os = os_name or "ubuntu"
 
-    if not is_preset_published(canonical, resolved_arch, resolved_vmm, resolved_os):
+    if not is_preset_published(canonical, resolved_arch, resolved_vmm, resolved_os):  # type: ignore[arg-type]
         known_presets = sorted({key[0] for key in MANIFEST})
         if canonical not in known_presets:
             return _fail(
@@ -294,46 +576,24 @@ def run_image_pull(
             exit_code=2,
         )
 
-    published_preset = cast("Preset", canonical)
     root = resolve_image_dir(image_dir)
-    name = cache_name(published_preset, resolved_arch, resolved_vmm, os=resolved_os)
-    target_dir = root / name
-
-    # "Already cached" must mean the pull was a no-op. Downloads are
-    # observable through on_download, but rootfs decompression is not, so
-    # also watch the cache directory itself: any file (re)created in it —
-    # by download or decompression — bumps its mtime.
-    pre_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
-    downloaded = False
-
     progress_cm: AbstractContextManager[Progress | None] = (
         nullcontext(None) if json_output else _download_progress()
     )
     try:
         with progress_cm as progress:
-            download_tasks: dict[str, Any] = {}
             if progress is not None:
                 # Visible immediately: SHA verification of cached files and
                 # rootfs decompression run without download callbacks and
                 # can take a while on multi-GB images.
                 progress.add_task("Preparing image...", total=None)
-
-            def on_download(label: str, chunk: int, total: int | None) -> None:
-                nonlocal downloaded
-                downloaded = True
-                if progress is None:
-                    return
-                if label not in download_tasks:
-                    download_tasks[label] = progress.add_task(f"Downloading {label}", total=total)
-                progress.update(download_tasks[label], advance=chunk)
-
-            local = ensure_published_image(
-                published_preset,
-                resolved_arch,
-                resolved_vmm,
-                resolved_os,
-                cache_dir=root,
-                on_download=on_download,
+            payload = _execute_pull(
+                preset=canonical,
+                arch=resolved_arch,
+                vmm=resolved_vmm,
+                os_name=resolved_os,
+                root=root,
+                progress=progress,
             )
     except ImageError as exc:
         return _fail(
@@ -358,44 +618,129 @@ def run_image_pull(
             recovery=f"Retry '{retry_command}'.",
         )
 
-    post_mtime = target_dir.stat().st_mtime_ns if target_dir.is_dir() else None
-    already_cached = not downloaded and pre_mtime is not None and post_mtime == pre_mtime
-
-    warnings: list[str] = []
-    default_root = resolve_image_dir(None)
-    if root != default_root:
-        warnings.append(
-            f"Sandboxes look for images in '{default_root}'. Set "
-            f"SMOLVM_IMAGE_DIR={shlex.quote(str(root))} so they use this download."
-        )
-
-    size_bytes = _total_size(target_dir)
-    payload = ImagePullPayload(
-        preset=canonical,
-        arch=resolved_arch,
-        vmm=resolved_vmm,
-        os=resolved_os,
-        version=__version__,
-        name=name,
-        kernel_path=str(local.kernel_path),
-        rootfs_path=str(local.rootfs_path),
-        size_bytes=size_bytes,
-        already_cached=already_cached,
-        warnings=warnings,
-    )
+    payload["warnings"] = _non_default_dir_warnings(root)
     if json_output:
         return emit_success(command_name, payload)
 
     console = console_stdout()
-    size = _format_bytes(size_bytes)
-    if already_cached:
-        console.print(f"Already cached: [bold]{name}[/bold] ({size})")
+    size = _format_bytes(payload["size_bytes"])
+    if payload["already_cached"]:
+        console.print(f"Already cached: [bold]{payload['name']}[/bold] ({size})")
     else:
-        console.print(f"Pulled [bold]{name}[/bold] ({size})")
-    console.print(f"  kernel: {local.kernel_path}")
-    console.print(f"  rootfs: {local.rootfs_path}")
-    for warning in warnings:
+        console.print(f"Pulled [bold]{payload['name']}[/bold] ({size})")
+    console.print(f"  kernel: {payload['kernel_path']}")
+    console.print(f"  rootfs: {payload['rootfs_path']}")
+    for warning in payload["warnings"]:
         console.print(f"[yellow]{warning}[/yellow]")
+    return 0
+
+
+def run_image_pull_all(
+    *,
+    arch: str | None = None,
+    vmm: str | None = None,
+    os_name: str | None = None,
+    image_dir: str | None = None,
+    json_output: bool = False,
+    command_name: str = "image.pull",
+) -> int:
+    """Execute ``smolvm image pull --all``."""
+    from smolvm.cli.main import _host_arch_for_published, _vmm_for_host
+    from smolvm.images.published import MANIFEST
+
+    try:
+        resolved_arch = arch or _host_arch_for_published()
+        resolved_vmm = vmm or _vmm_for_host()
+    except RuntimeError:
+        return _fail(
+            command_name,
+            "SmolVM doesn't publish prebuilt images for this machine. Pass the "
+            "platform explicitly, e.g. 'smolvm image pull --all --arch amd64 "
+            "--vmm firecracker'.",
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
+
+    targets = sorted(
+        {(p, o) for (p, a, v, o) in MANIFEST if a == resolved_arch and v == resolved_vmm}
+    )
+    if os_name:
+        targets = [(p, o) for (p, o) in targets if o == os_name]
+    if not targets:
+        return _fail(
+            command_name,
+            f"No published images for {resolved_arch}/{resolved_vmm}"
+            f"{f' with os {os_name!r}' if os_name else ''}.",
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
+
+    root = resolve_image_dir(image_dir)
+    pulled: list[ImagePullPayload] = []
+    failed: list[PullFailure] = []
+    progress_cm: AbstractContextManager[Progress | None] = (
+        nullcontext(None) if json_output else _download_progress()
+    )
+    with progress_cm as progress:
+        overall = (
+            progress.add_task("Preparing images...", total=None) if progress is not None else None
+        )
+        for target_preset, target_os in targets:
+            if progress is not None and overall is not None:
+                progress.update(overall, description=f"Preparing {target_preset} ({target_os})...")
+            try:
+                pulled.append(
+                    _execute_pull(
+                        preset=target_preset,
+                        arch=resolved_arch,
+                        vmm=resolved_vmm,
+                        os_name=target_os,
+                        root=root,
+                        progress=progress,
+                        label_prefix=f"{target_preset}/{target_os} ",
+                    )
+                )
+            except Exception as exc:
+                failed.append(PullFailure(preset=target_preset, os=target_os, error=str(exc)))
+
+    payload = ImagePullAllPayload(
+        arch=resolved_arch,
+        vmm=resolved_vmm,
+        pulled=pulled,
+        failed=failed,
+        warnings=_non_default_dir_warnings(root),
+    )
+
+    if json_output:
+        if failed:
+            return emit_error(
+                command_name,
+                "runtime_error",
+                f"Could not download {len(failed)} of {len(targets)} images.",
+                recovery="Check your network connection and retry 'smolvm image pull --all'.",
+                details=payload,
+                exit_code=1,
+            )
+        return emit_success(command_name, payload)
+
+    console = console_stdout()
+    for item in pulled:
+        state = "Already cached" if item["already_cached"] else "Pulled"
+        console.print(f"{state}: [bold]{item['name']}[/bold] ({_format_bytes(item['size_bytes'])})")
+    for failure in failed:
+        console.print(
+            f"[red]Failed: {failure['preset']} ({failure['os']}) — {failure['error']}[/red]"
+        )
+    for warning in payload["warnings"]:
+        console.print(f"[yellow]{warning}[/yellow]")
+    if failed:
+        render_error(
+            f"Could not download {len(failed)} of {len(targets)} images.",
+            hint="Check your network connection and retry 'smolvm image pull --all'.",
+        )
+        return 1
     return 0
 
 
@@ -440,6 +785,7 @@ def run_image_list(
     table.add_column("Kind")
     table.add_column("Platform")
     table.add_column("Version")
+    table.add_column("Created")
     table.add_column("Size", justify="right")
     for row in rows:
         platform_parts = [part for part in (row["arch"], row["vmm"], row["os"]) if part]
@@ -451,6 +797,7 @@ def run_image_list(
             row["kind"],
             "/".join(platform_parts) or "-",
             version,
+            _relative_time(row["created"]),
             _format_bytes(row["size_bytes"]),
         )
     console = console_stdout()
@@ -462,18 +809,143 @@ def run_image_list(
     return 0
 
 
-def _normalize_rm_name(name: str, root: Path) -> str:
-    """Normalize what the user typed to a bare cache-entry name.
+def _inspect_entry(path: Path, root: Path) -> ImageInspectEntry:
+    """Build the detailed inspect record for one cache directory."""
+    row = _custom_row(path) if path.parent != root else _classify(path)
 
-    Accepts trailing path separators (shell tab completion) and the
-    absolute path that ``image list`` prints, as long as it points at a
-    direct child of the image directory.
-    """
-    requested = name.rstrip("/\\")
-    candidate = Path(requested)
-    if candidate.is_absolute() and candidate.parent in {root, root.resolve()}:
-        return candidate.name
-    return requested
+    files: list[ImageFileEntry] = []
+    try:
+        for f in sorted(path.rglob("*")):
+            try:
+                if not f.is_file():
+                    continue
+                st = f.stat()
+                files.append(
+                    ImageFileEntry(
+                        name=f.relative_to(path).as_posix(),
+                        size_bytes=st.st_size,
+                        size_on_disk_bytes=_size_on_disk(st),
+                    )
+                )
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    sidecar_path = path / "rootfs.ext4.from-sha256"
+    sidecar: str | None = None
+    if sidecar_path.is_file():
+        try:
+            sidecar = sidecar_path.read_text().strip()
+        except OSError:
+            sidecar = None
+
+    manifest_info: ImageManifestInfo | None = None
+    if row["kind"] == "image" and row["current"]:
+        from smolvm.images.published import IMAGES_RELEASE_TAG, MANIFEST, ManifestKey
+
+        key = cast("ManifestKey", (row["preset"], row["arch"], row["vmm"], row["os"]))
+        entry = MANIFEST.get(key)
+        if entry is not None:
+            manifest_info = ImageManifestInfo(
+                kernel_url=entry.kernel_url,
+                kernel_sha256=entry.kernel_sha256,
+                rootfs_url=entry.rootfs_url,
+                rootfs_sha256=entry.rootfs_sha256,
+                images_release_tag=IMAGES_RELEASE_TAG,
+            )
+
+    return ImageInspectEntry(
+        **row,
+        files=files,
+        rootfs_sidecar=sidecar,
+        manifest=manifest_info,
+    )
+
+
+def run_image_inspect(
+    *,
+    name: str,
+    image_dir: str | None = None,
+    json_output: bool = False,
+    command_name: str = "image.inspect",
+) -> int:
+    """Execute ``smolvm image inspect``."""
+    root = resolve_image_dir(image_dir)
+    requested = _normalize_rm_name(name, root)
+
+    if not _valid_entry_name(requested):
+        return _fail(
+            command_name,
+            f"'{name}' is not a cached image name.",
+            json_output=json_output,
+            code="invalid_input",
+            recovery="Run 'smolvm image list' to see cached images.",
+            exit_code=2,
+        )
+
+    try:
+        matches = _expand_custom_entries(_resolve_entries(requested, root), root)
+    except OSError as exc:
+        return _fail(
+            command_name,
+            f"Could not read the image folder '{root}': {exc}",
+            json_output=json_output,
+            recovery="Fix the folder's permissions, then retry "
+            f"'smolvm image inspect {requested}'.",
+        )
+
+    if not matches:
+        return _fail(
+            command_name,
+            f"No cached image named '{requested}'.",
+            json_output=json_output,
+            recovery="Run 'smolvm image list' to see cached images.",
+        )
+
+    entries = [_inspect_entry(path, root) for path in matches]
+    if json_output:
+        # Docker-style: inspect always returns an array.
+        return emit_success(command_name, entries)
+
+    from rich.table import Table
+
+    console = console_stdout()
+    for entry in entries:
+        table = Table(title=entry["name"], show_header=False)
+        table.add_column("Field")
+        table.add_column("Value", overflow="fold")
+        table.add_row("Kind", entry["kind"])
+        if entry["preset"]:
+            table.add_row("Preset", entry["preset"])
+        platform_parts = [p for p in (entry["arch"], entry["vmm"], entry["os"]) if p]
+        table.add_row("Platform", "/".join(platform_parts) or "-")
+        version = entry["version"] or "-"
+        if entry["current"] is False:
+            version = f"[yellow]{version} (stale)[/yellow]"
+        table.add_row("Version", version)
+        created = entry["created"]
+        table.add_row("Created", f"{_relative_time(created)} ({created})" if created else "-")
+        table.add_row("Size", _format_bytes(entry["size_bytes"]))
+        table.add_row("Path", entry["path"])
+        manifest = entry["manifest"]
+        if manifest is not None:
+            table.add_row("Release tag", manifest["images_release_tag"])
+            table.add_row("Kernel URL", manifest["kernel_url"])
+            table.add_row("Kernel SHA-256", manifest["kernel_sha256"])
+            table.add_row("Rootfs URL", manifest["rootfs_url"])
+            table.add_row("Rootfs SHA-256", manifest["rootfs_sha256"])
+        if entry["rootfs_sidecar"]:
+            table.add_row("Rootfs sidecar", entry["rootfs_sidecar"])
+        if entry["files"]:
+            file_lines = "\n".join(
+                f"{f['name']}  {_format_bytes(f['size_bytes'])}"
+                f" ({_format_bytes(f['size_on_disk_bytes'])} on disk)"
+                for f in entry["files"]
+            )
+            table.add_row("Files", file_lines)
+        console.print(table)
+    return 0
 
 
 def run_image_rm(
@@ -488,7 +960,7 @@ def run_image_rm(
     root = resolve_image_dir(image_dir)
     requested = _normalize_rm_name(name, root)
 
-    if not requested or "/" in requested or "\\" in requested or requested in {".", ".."}:
+    if not _valid_entry_name(requested):
         return _fail(
             command_name,
             f"'{name}' is not a cached image name.",
@@ -499,21 +971,8 @@ def run_image_rm(
         )
 
     permission_recovery = f"Fix the folder's permissions, then retry 'smolvm image rm {requested}'."
-    matches: list[Path] = []
     try:
-        exact = root / requested
-        if exact.is_dir() or exact.is_symlink():
-            matches = [exact]
-        elif root.is_dir():
-            # Fall back to preset-wide removal: every cached image whose
-            # parsed preset matches, across versions, arches, vmms, and oses.
-            canonical = _canonical_preset(requested)
-            for child in sorted(root.iterdir()):
-                if not child.is_dir():
-                    continue
-                match = _IMAGE_DIR_NAME_RE.match(child.name)
-                if match and match["preset"] == canonical:
-                    matches.append(child)
+        matches = _resolve_entries(requested, root)
     except OSError as exc:
         return _fail(
             command_name,
@@ -533,24 +992,23 @@ def run_image_rm(
     resolved_root = root.resolve()
     entries: list[RemovedEntry] = []
     for target in matches:
+        display = target.relative_to(root).as_posix()
         if target.is_symlink():
             # A link is removed with unlink() — what it points at is never
             # touched — so removing it frees no space.
-            entries.append(RemovedEntry(name=target.name, path=str(target), size_bytes=0))
+            entries.append(RemovedEntry(name=display, path=str(target), size_bytes=0))
             continue
-        # Names are validated above and matches are direct children, so a
-        # real directory escaping the root should be impossible; keep a
-        # hard stop in front of the recursive delete anyway.
-        if target.resolve().parent != resolved_root:
+        # Names are validated above and matches sit under the root, so a
+        # real directory escaping it should be impossible; keep a hard stop
+        # in front of the recursive delete anyway.
+        if resolved_root not in target.resolve().parents:
             return _fail(
                 command_name,
-                f"'{target.name}' could not be removed safely.",
+                f"'{display}' could not be removed safely.",
                 json_output=json_output,
                 recovery=f"Delete it yourself if needed: '{target}'.",
             )
-        entries.append(
-            RemovedEntry(name=target.name, path=str(target), size_bytes=_total_size(target))
-        )
+        entries.append(RemovedEntry(name=display, path=str(target), size_bytes=_total_size(target)))
 
     freed = sum(entry["size_bytes"] for entry in entries)
 
@@ -587,4 +1045,162 @@ def run_image_rm(
         return emit_success(command_name, payload)
     console = console_stdout()
     console.print(f"Removed {len(entries)} image(s), freed {_format_bytes(freed)}.")
+    return 0
+
+
+def run_image_build(
+    *,
+    tag: str,
+    context_path: str,
+    dockerfile: str | None = None,
+    size_mb: int = 512,
+    build_args: tuple[str, ...] = (),
+    arch: str | None = None,
+    backend: str = "auto",
+    init: str = "/init",
+    image_dir: str | None = None,
+    json_output: bool = False,
+    command_name: str = "image.build",
+) -> int:
+    """Execute ``smolvm image build``."""
+    from smolvm.exceptions import ImageError
+    from smolvm.images.boot import DirectKernelBoot
+    from smolvm.images.builder import DockerRootfsBuilder
+
+    retry_command = f"smolvm image build -t {tag} {shlex.quote(context_path)}"
+    context_dir = Path(context_path)
+    dockerfile_path = Path(dockerfile) if dockerfile else context_dir / "Dockerfile"
+    try:
+        dockerfile_text = dockerfile_path.read_text()
+    except OSError:
+        return _fail(
+            command_name,
+            f"No Dockerfile at '{dockerfile_path}'.",
+            json_output=json_output,
+            code="invalid_input",
+            recovery=f"Pass one with 'smolvm image build -t {tag} "
+            f"-f path/to/Dockerfile {shlex.quote(context_path)}'.",
+            exit_code=2,
+        )
+
+    parsed_args: dict[str, str] = {}
+    for item in build_args:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            return _fail(
+                command_name,
+                f"'{item}' is not a valid build argument.",
+                json_output=json_output,
+                code="invalid_input",
+                recovery="Use KEY=VALUE, e.g. --build-arg VERSION=1.2.",
+                exit_code=2,
+            )
+        parsed_args[key] = value
+
+    # Everything in the context folder is sent to the build. Files named
+    # "Dockerfile" (any depth) are reserved by the builder and skipped.
+    context: dict[str, Path] = {}
+    skipped: list[str] = []
+    if context_dir.is_dir():
+        resolved_dockerfile = dockerfile_path.resolve()
+        for f in sorted(context_dir.rglob("*")):
+            if f.is_symlink() or not f.is_file():
+                continue
+            if f.resolve() == resolved_dockerfile:
+                continue
+            if f.name.lower() == "dockerfile":
+                skipped.append(f.relative_to(context_dir).as_posix())
+                continue
+            context[f.relative_to(context_dir).as_posix()] = f
+
+    try:
+        builder = DockerRootfsBuilder(
+            name=tag,
+            dockerfile=dockerfile_text,
+            context=context,
+            rootfs_size_mb=size_mb,
+            cache_dir=resolve_image_dir(image_dir),
+            build_args=parsed_args,
+            ssh_capable=False,
+        )
+    except ValueError as exc:
+        return _fail(
+            command_name,
+            str(exc),
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
+
+    start = time.time()
+    try:
+        boot_image = builder.build_boot_image(
+            backend=backend,
+            arch=arch or "host",
+            boot=DirectKernelBoot(init=init),
+        )
+    except ImageError as exc:
+        return _fail(
+            command_name,
+            str(exc),
+            json_output=json_output,
+            recovery=f"Fix the problem above, then retry '{retry_command}'.",
+        )
+    except OSError as exc:
+        return _fail(
+            command_name,
+            f"Could not write the image: {exc}",
+            json_output=json_output,
+            recovery=f"Free up disk space, then retry '{retry_command}'.",
+        )
+
+    fingerprint_dir = boot_image.rootfs_path.parent
+    try:
+        cached = boot_image.rootfs_path.stat().st_mtime < start
+    except OSError:
+        cached = False
+
+    payload = ImageBuildPayload(
+        name=tag,
+        fingerprint=fingerprint_dir.name,
+        rootfs_path=str(boot_image.rootfs_path),
+        kernel_path=str(boot_image.kernel_path),
+        boot_args=boot_image.render_boot_args(),
+        arch=str(boot_image.arch or arch or "host"),
+        backend=str(boot_image.backend or backend),
+        size_bytes=_total_size(fingerprint_dir),
+        cached=cached,
+    )
+    if json_output:
+        return emit_success(command_name, payload)
+
+    from rich.panel import Panel
+
+    console = console_stdout()
+    for path in skipped:
+        console.print(
+            f"[yellow]Skipped '{path}': files named Dockerfile can't be "
+            "part of the build context.[/yellow]"
+        )
+    verb = "Reusing cached" if cached else "Built"
+    console.print(
+        Panel.fit(
+            f"{verb} custom image [bold]{_CUSTOM_DIR}/{tag}[/bold] "
+            f"({_format_bytes(payload['size_bytes'])})\n"
+            f"  rootfs: {payload['rootfs_path']}\n"
+            f"  kernel: {payload['kernel_path']}\n\n"
+            "Boot it from Python with:\n"
+            "  [bold]from smolvm import BootImage, DirectKernelBoot, SmolVM\n"
+            f'  image = BootImage(name="{tag}",\n'
+            f'                    rootfs_path="{payload["rootfs_path"]}",\n'
+            f'                    rootfs_format="raw-ext4",\n'
+            f'                    kernel_path="{payload["kernel_path"]}",\n'
+            f'                    boot=DirectKernelBoot(init="{init}"))\n'
+            "  with SmolVM.from_image(image) as vm:\n"
+            "      vm.start()[/bold]\n\n"
+            f"Manage it with 'smolvm image list' and 'smolvm image rm {_CUSTOM_DIR}/{tag}'.",
+            title="Custom image ready",
+            border_style="green",
+        )
+    )
     return 0

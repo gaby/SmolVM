@@ -20,6 +20,7 @@ import json
 import os
 import re
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -543,3 +544,318 @@ class TestChoiceListsMatchPublishedTypes:
         assert choices["arch"] == set(typing.get_args(Arch))
         assert choices["vmm"] == set(typing.get_args(Vmm))
         assert choices["os_name"] == set(typing.get_args(Os))
+
+
+class TestRelativeTime:
+    def test_buckets(self) -> None:
+        from datetime import datetime, timezone
+
+        from smolvm.cli.image import _relative_time
+
+        now = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+        def at(seconds_ago: int) -> str:
+            from datetime import timedelta
+
+            return (now - timedelta(seconds=seconds_ago)).isoformat()
+
+        assert _relative_time(at(0), now=now) == "0 seconds ago"
+        assert _relative_time(at(1), now=now) == "1 second ago"
+        assert _relative_time(at(90), now=now) == "1 minute ago"
+        assert _relative_time(at(7200), now=now) == "2 hours ago"
+        assert _relative_time(at(86400 * 3), now=now) == "3 days ago"
+        assert _relative_time(at(86400 * 8), now=now) == "1 week ago"
+        assert _relative_time(at(86400 * 40), now=now) == "1 month ago"
+        assert _relative_time(at(86400 * 400), now=now) == "1 year ago"
+        assert _relative_time(None, now=now) == "-"
+        assert _relative_time("not-a-date", now=now) == "-"
+
+    def test_list_rows_carry_parseable_created(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from datetime import datetime
+
+        _make_cache_dirs(tmp_path)
+        ret = main(["image", "list", "--image-dir", str(tmp_path), "--json"])
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        for row in payload["data"]["images"]:
+            assert row["created"] is not None
+            datetime.fromisoformat(row["created"])
+
+
+class TestAliases:
+    def test_top_level_images_envelope(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        _make_cache_dirs(tmp_path)
+        ret = main(["images", "--image-dir", str(tmp_path), "--json"])
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "images"
+        assert len(payload["data"]["images"]) == 6
+
+    def test_image_ls_keeps_list_envelope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        _make_cache_dirs(tmp_path)
+        ret = main(["image", "ls", "--image-dir", str(tmp_path), "--json"])
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.list"
+
+
+def _make_published_entry(root: Path, name: str) -> Path:
+    """A realistic published cache dir: kernel, zst, sparse rootfs, sidecar."""
+    import hashlib
+
+    import zstandard
+
+    d = root / name
+    d.mkdir(parents=True)
+    raw = b"\x00" * (1 << 20) + b"REAL-DATA" + b"\x00" * (1 << 20)
+    (d / "rootfs.ext4.zst").write_bytes(zstandard.compress(raw))
+    sha = hashlib.sha256((d / "rootfs.ext4.zst").read_bytes()).hexdigest()
+    (d / "rootfs.ext4.from-sha256").write_text(f"sparse-v1:{sha}")
+    (d / "vmlinux.bin").write_bytes(b"kernel-bytes")
+    with open(d / "rootfs.ext4", "wb") as f:
+        f.truncate(len(raw))
+        f.seek(1 << 20)
+        f.write(b"REAL-DATA")
+    return d
+
+
+class TestImageInspect:
+    def test_inspect_exact_name_returns_array(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        _make_published_entry(tmp_path, "codex-v0.0.1-amd64-firecracker")
+
+        ret = main(
+            [
+                "image",
+                "inspect",
+                "codex-v0.0.1-amd64-firecracker",
+                "--image-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.inspect"
+        assert isinstance(payload["data"], list) and len(payload["data"]) == 1
+        entry = payload["data"][0]
+        assert entry["kind"] == "image"
+        assert entry["rootfs_sidecar"].startswith("sparse-v1:")
+        files = {f["name"]: f for f in entry["files"]}
+        assert set(files) == {
+            "rootfs.ext4",
+            "rootfs.ext4.from-sha256",
+            "rootfs.ext4.zst",
+            "vmlinux.bin",
+        }
+        rootfs = files["rootfs.ext4"]
+        if os.name == "posix":
+            assert rootfs["size_on_disk_bytes"] < rootfs["size_bytes"]
+        # Stale version: no manifest section.
+        assert entry["manifest"] is None
+
+    def test_inspect_current_version_gets_manifest(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from smolvm.images.published import IMAGES_RELEASE_TAG, cache_name
+
+        _make_published_entry(tmp_path, cache_name("codex", "amd64", "firecracker"))
+
+        ret = main(["image", "inspect", "codex", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        entry = payload["data"][0]
+        assert entry["current"] is True
+        manifest = entry["manifest"]
+        assert manifest is not None
+        assert manifest["images_release_tag"] == IMAGES_RELEASE_TAG
+        assert len(manifest["rootfs_sha256"]) == 64
+        assert manifest["kernel_url"].startswith("https://")
+
+    def test_inspect_preset_matches_all_variants(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        _make_cache_dirs(tmp_path)
+
+        ret = main(["image", "inspect", "codex", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert len(payload["data"]) == 2
+
+    def test_inspect_unknown_name(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        ret = main(["image", "inspect", "nope", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "smolvm image list" in payload["error"]["recovery"]
+
+
+class TestImagePullAll:
+    @pytest.mark.parametrize("argv", [["image", "pull"], ["image", "pull", "codex", "--all"]])
+    def test_mutual_exclusion(self, argv: list[str], capsys: pytest.CaptureFixture) -> None:
+        ret = main([*argv, "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "Choose one target" in payload["error"]["message"]
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_pull_all_covers_manifest(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from smolvm.images.manager import LocalImage
+        from smolvm.images.published import MANIFEST
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_ensure.return_value = LocalImage(name="x", kernel_path=kernel, rootfs_path=rootfs)
+
+        ret = main(["image", "pull", "--all", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.pull"
+        expected = sorted(
+            {(p, o) for (p, a, v, o) in MANIFEST if a == "amd64" and v == "firecracker"}
+        )
+        assert len(payload["data"]["pulled"]) == len(expected)
+        assert payload["data"]["failed"] == []
+        called = sorted((c.args[0], c.args[3]) for c in mock_ensure.call_args_list)
+        assert called == expected
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_pull_all_isolates_failures(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from smolvm.exceptions import ImageError
+        from smolvm.images.manager import LocalImage
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+
+        def flaky(preset: str, *args: object, **kwargs: object) -> LocalImage:
+            if preset == "codex":
+                raise ImageError("boom")
+            return LocalImage(name="x", kernel_path=kernel, rootfs_path=rootfs)
+
+        mock_ensure.side_effect = flaky
+
+        ret = main(["image", "pull", "--all", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        details = payload["error"]["details"]
+        assert {f["preset"] for f in details["failed"]} == {"codex"}
+        assert details["pulled"]  # other presets still downloaded
+        assert "smolvm image pull --all" in payload["error"]["recovery"]
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_pull_all_os_filter(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from smolvm.images.manager import LocalImage
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_ensure.return_value = LocalImage(name="x", kernel_path=kernel, rootfs_path=rootfs)
+
+        ret = main(
+            ["image", "pull", "--all", "--os", "alpine", "--image-dir", str(tmp_path), "--json"]
+        )
+
+        assert ret == 0
+        capsys.readouterr()
+        assert all(c.args[3] == "alpine" for c in mock_ensure.call_args_list)
+
+
+class TestCustomImages:
+    def _make_custom(self, root: Path, name: str = "myimg") -> Path:
+        fp = root / "custom" / name / "abc123def4567890"
+        fp.mkdir(parents=True)
+        (fp / "metadata.json").write_text(json.dumps({"name": name, "arch": "amd64"}))
+        (fp / "rootfs.ext4").write_bytes(b"rootfs")
+        return fp
+
+    def test_list_shows_custom_rows(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        self._make_custom(tmp_path)
+
+        ret = main(["image", "list", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        rows = json.loads(capsys.readouterr().out)["data"]["images"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["kind"] == "custom"
+        assert row["name"] == "custom/myimg"
+        assert row["version"] == "abc123def456"
+        assert row["arch"] == "amd64"
+
+    def test_rm_custom_name_removes_tree(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        self._make_custom(tmp_path)
+
+        ret = main(["image", "rm", "custom/myimg", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [e["name"] for e in payload["data"]["removed"]] == ["custom/myimg"]
+        assert not (tmp_path / "custom" / "myimg").exists()
+
+    def test_rm_custom_fingerprint(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        fp = self._make_custom(tmp_path)
+
+        ret = main(
+            ["image", "rm", f"custom/myimg/{fp.name}", "--image-dir", str(tmp_path), "--json"]
+        )
+
+        assert ret == 0
+        capsys.readouterr()
+        assert not fp.exists()
+        assert (tmp_path / "custom" / "myimg").exists()
+
+    @pytest.mark.parametrize("bad", ["custom/../x", "custom//x", "custom/a/b/c", "other/x"])
+    def test_rm_rejects_bad_custom_names(
+        self, bad: str, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        ret = main(["image", "rm", bad, "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
