@@ -331,6 +331,44 @@ class TestArchiveRobustness:
         assert (loaded / "data.txt").read_bytes() == b"plain"
         assert (loaded / "data.txt.zst").read_bytes() == zstandard.compress(b"compressed")
 
+    def test_zstd_encoded_rootfs_member_regenerates_matching_sidecar(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A hand-built archive may ship rootfs.ext4.zst as a zstd stream;
+        the regenerated sidecar must hash the installed file, not the
+        archive stream (regression)."""
+        zst_file = zstandard.compress(_SPARSE_PAYLOAD)
+        stored = zstandard.compress(zst_file)
+        archive = tmp_path / "in.tar"
+        _write_archive(
+            archive,
+            {
+                "schema_version": 1,
+                "name": "oddball",
+                "rootfs_sidecar": None,
+                "files": [
+                    {
+                        "path": "rootfs.ext4.zst",
+                        "encoding": "zstd",
+                        "size": len(zst_file),
+                        "sha256": hashlib.sha256(stored).hexdigest(),
+                    }
+                ],
+            },
+            [("files/rootfs.ext4.zst", stored)],
+        )
+
+        dest = tmp_path / "dest"
+        assert main(["image", "load", "-i", str(archive), "--image-dir", str(dest), "--json"]) == 0
+        capsys.readouterr()
+
+        loaded = dest / "oddball"
+        installed_sha = hashlib.sha256((loaded / "rootfs.ext4.zst").read_bytes()).hexdigest()
+        assert (loaded / "rootfs.ext4.from-sha256").read_text() == f"sparse-v1:{installed_sha}"
+        with open(loaded / "rootfs.ext4", "rb") as f:
+            f.seek(1 << 20)
+            assert f.read(9) == b"REAL-DATA"
+
     def test_truncated_archive_gets_clean_envelope(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
@@ -344,6 +382,7 @@ class TestArchiveRobustness:
         # Cut into the first member's data (small archives are mostly
         # zero padding, so a percentage cut may remove nothing real).
         data = archive.read_bytes()
+        assert len(data) > 700, "test needs an archive large enough to truncate"
         archive.write_bytes(data[:700])
 
         ret = main(

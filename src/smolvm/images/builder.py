@@ -212,6 +212,7 @@ def _guest_agent_release_asset() -> tuple[str, str, str]:
 
 
 def _guest_agent_binary_cache_dir(cache_dir: Path | None = None) -> Path:
+    """Return the guest-agent subdirectory of the resolved image cache dir."""
     return resolve_image_dir(cache_dir) / "_guest-agent"
 
 

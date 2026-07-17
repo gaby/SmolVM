@@ -280,7 +280,7 @@ def test_guest_agent_binary_downloads_release_without_source_checkout(
     monkeypatch.delenv("SMOLVM_GUEST_AGENT_BINARY", raising=False)
     monkeypatch.setattr(builder_mod, "_has_guest_agent_source_checkout", lambda: False)
     monkeypatch.setattr(
-        builder_mod, "_guest_agent_binary_cache_dir", lambda cache_dir=None: tmp_path
+        builder_mod, "_guest_agent_binary_cache_dir", lambda _cache_dir=None: tmp_path
     )
     monkeypatch.setattr(builder_mod.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(
@@ -318,7 +318,7 @@ def test_guest_agent_binary_rejects_bad_release_sha(
 
     monkeypatch.delenv("SMOLVM_GUEST_AGENT_BINARY", raising=False)
     monkeypatch.setattr(
-        builder_mod, "_guest_agent_binary_cache_dir", lambda cache_dir=None: tmp_path
+        builder_mod, "_guest_agent_binary_cache_dir", lambda _cache_dir=None: tmp_path
     )
     monkeypatch.setattr(builder_mod.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(

@@ -99,6 +99,19 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+class _HashingReader:
+    """Wrap a binary file so a digest covers exactly the bytes tar reads."""
+
+    def __init__(self, fileobj: io.BufferedReader, hasher: hashlib._Hash) -> None:
+        self._fileobj = fileobj
+        self._hasher = hasher
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._fileobj.read(size)
+        self._hasher.update(chunk)
+        return chunk
+
+
 def _valid_relative_file_path(path: str) -> bool:
     if not path or path.startswith("/") or "\\" in path:
         return False
@@ -228,25 +241,36 @@ def run_image_save(
                 if rel in excluded or rel == ".build.lock":
                     continue
                 if rel.endswith(".zst"):
+                    # Hash while tar reads the file so the manifest digest
+                    # matches the archived bytes even if the source changes
+                    # mid-save; a shrinking source fails the save instead of
+                    # producing a silently inconsistent archive.
+                    hasher = hashlib.sha256()
+                    with open(f, "rb") as src:
+                        info = tarfile.TarInfo(f"files/{rel}")
+                        info.size = os.fstat(src.fileno()).st_size
+                        tar.addfile(info, _HashingReader(src, hasher))
                     files_meta.append(
                         {
                             "path": rel,
                             "encoding": "raw",
-                            "size": f.stat().st_size,
-                            "sha256": _sha256_file(f),
+                            "size": info.size,
+                            "sha256": hasher.hexdigest(),
                         }
                     )
-                    tar.add(f, arcname=f"files/{rel}", recursive=False)
                 else:
                     # Compress into one reused scratch file, add, discard —
-                    # scratch usage stays bounded by a single member.
+                    # scratch usage stays bounded by a single member. The
+                    # recorded size counts the bytes actually compressed, so
+                    # manifest and stream stay consistent under concurrent
+                    # source changes.
                     with open(f, "rb") as src, open(scratch, "wb") as dst:
-                        compressor.copy_stream(src, dst)
+                        read_bytes, _ = compressor.copy_stream(src, dst)
                     files_meta.append(
                         {
                             "path": rel,
                             "encoding": "zstd",
-                            "size": f.stat().st_size,
+                            "size": read_bytes,
                             "sha256": _sha256_file(scratch),
                         }
                     )
@@ -467,7 +491,11 @@ def run_image_load(
                         f"'{meta['path']}' does not match the size the archive declares"
                     )
                 if meta["path"] == _ROOTFS_ZST:
-                    zst_sha = digest
+                    # The sidecar must describe the installed file's bytes.
+                    # With raw encoding those are exactly the verified stored
+                    # bytes; a zstd-encoded member was decompressed on the way
+                    # in, so hash what actually landed on disk.
+                    zst_sha = digest if meta["encoding"] == "raw" else _sha256_file(destination)
 
             # Recreate what save deliberately left out, byte-compatible with
             # what ensure_published_image validates on the next start.
