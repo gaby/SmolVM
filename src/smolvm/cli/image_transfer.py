@@ -157,6 +157,7 @@ def run_image_save(
             str(exc),
             json_output=json_output,
             code="invalid_input",
+            recovery="Retry with one of the full names above.",
             exit_code=2,
         )
     except OSError as exc:
@@ -181,6 +182,8 @@ def run_image_save(
             f"'{requested}' matches more than one cached image. Pick one of: {options}.",
             json_output=json_output,
             code="invalid_input",
+            recovery=f"Retry with the full name, e.g. 'smolvm image save "
+            f"{options.split(', ')[0]} -o {shlex.quote(str(out_path))}'.",
             exit_code=2,
         )
 
@@ -485,7 +488,7 @@ def run_image_load(
             partial.rename(target)
         except (tarfile.TarError, zstandard.ZstdError) as exc:
             shutil.rmtree(partial, ignore_errors=True)
-            return bad_archive(f"'{in_path}' is damaged and was not loaded: {exc}.")
+            return bad_archive(f"'{in_path}' is damaged and was not loaded: {_brief_error(exc)}.")
         except OSError as exc:
             shutil.rmtree(partial, ignore_errors=True)
             return _fail(

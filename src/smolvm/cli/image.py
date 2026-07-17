@@ -1031,6 +1031,7 @@ def run_image_inspect(
             str(exc),
             json_output=json_output,
             code="invalid_input",
+            recovery="Retry with one of the full names above.",
             exit_code=2,
         )
     except OSError as exc:
@@ -1126,6 +1127,7 @@ def run_image_rm(
             str(exc),
             json_output=json_output,
             code="invalid_input",
+            recovery="Retry with one of the full names above.",
             exit_code=2,
         )
     except OSError as exc:
@@ -1322,9 +1324,10 @@ def run_image_build(
     except ValueError as exc:
         return _fail(
             command_name,
-            str(exc),
+            _brief_error(exc),
             json_output=json_output,
             code="invalid_input",
+            recovery=f"Fix the value above, then retry '{retry_command}'.",
             exit_code=2,
         )
 
