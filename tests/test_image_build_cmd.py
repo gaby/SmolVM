@@ -184,7 +184,7 @@ class TestImageBuild:
         payload = json.loads(capsys.readouterr().out)
         assert payload["error"]["code"] == "invalid_input"
         assert "No Dockerfile" in payload["error"]["message"]
-        assert "-f path/to/Dockerfile" in payload["error"]["recovery"]
+        assert "-f option" in payload["error"]["recovery"]
 
     def test_bad_build_arg(self, build_ctx: Path, capsys: pytest.CaptureFixture) -> None:
         ret = main(
@@ -301,3 +301,118 @@ class TestImageBuild:
         out = capsys.readouterr().out
         assert "SmolVM.from_image" in out
         assert "smolvm image rm custom/myimg" in out
+
+
+class TestBuildValidation:
+    def test_tag_cannot_escape_custom_namespace(
+        self, build_ctx: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """-t '..' would write outside custom/ (regression)."""
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                "..",
+                str(build_ctx),
+                "--image-dir",
+                str(tmp_path / "cache"),
+                "--json",
+            ]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert not (tmp_path / "cache").exists()
+
+    def test_invalid_init_gets_clean_envelope(
+        self, build_ctx: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A bad --init used to escape as a raw ValueError traceback
+        (regression)."""
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                "x",
+                str(build_ctx),
+                "--init",
+                "bad init",
+                "--image-dir",
+                str(tmp_path / "cache"),
+                "--json",
+            ]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_input"
+
+    def test_missing_context_folder(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        """A typo'd context path must not silently build with no files
+        (regression)."""
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                "x",
+                "-f",
+                str(dockerfile),
+                str(tmp_path / "nope"),
+                "--json",
+            ]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "not a folder" in payload["error"]["message"]
+
+    @patch("smolvm.images.builder.DockerRootfsBuilder._build_rootfs")
+    @patch("smolvm.images.builder.ensure_base_kernel_for_backend")
+    @patch("smolvm.images.builder.ImageBuilder.check_docker", return_value=True)
+    def test_skipped_dockerfiles_reach_json_warnings(
+        self,
+        _mock_docker: MagicMock,
+        mock_kernel: MagicMock,
+        mock_build: MagicMock,
+        build_ctx: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """JSON callers must see the same skip warnings humans do
+        (regression)."""
+        nested = build_ctx / "sub"
+        nested.mkdir()
+        (nested / "Dockerfile").write_text("FROM other\n")
+        kernel = tmp_path / "vmlinux.image"
+        kernel.write_bytes(b"k")
+        mock_kernel.return_value = kernel
+        mock_build.side_effect = _fake_build_rootfs
+
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                "myimg",
+                str(build_ctx),
+                "--backend",
+                "qemu",
+                "--arch",
+                "amd64",
+                "--image-dir",
+                str(tmp_path / "cache"),
+                "--json",
+            ]
+        )
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert any("sub/Dockerfile" in w for w in payload["data"]["warnings"])

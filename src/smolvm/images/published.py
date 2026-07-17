@@ -358,6 +358,22 @@ def lookup(
     return entry
 
 
+def published_targets(
+    arch: Arch,
+    vmm: Vmm,
+    *,
+    manifest: dict[ManifestKey, PublishedImage] | None = None,
+) -> list[tuple[Preset, Os]]:
+    """Every ``(preset, os)`` combination published for one platform.
+
+    Keeps the manifest key shape private to this module — callers (e.g.
+    ``smolvm image pull --all``) get the download targets without
+    destructuring :data:`MANIFEST` themselves.
+    """
+    catalog = MANIFEST if manifest is None else manifest
+    return sorted({(p, o) for (p, a, v, o) in catalog if a == arch and v == vmm})
+
+
 def is_preset_published(
     preset: str,
     arch: Arch,

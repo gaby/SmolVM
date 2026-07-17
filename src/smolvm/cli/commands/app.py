@@ -374,8 +374,13 @@ def image() -> None:
 
 
 @image.command("pull")
-@click.argument("preset", metavar="preset", required=False, default=None)
-@click.option("--all", "all_images", is_flag=True, help="Download every image for this machine.")
+@click.argument("preset", metavar="[preset]", required=False, default=None)
+@click.option(
+    "--all",
+    "all_images",
+    is_flag=True,
+    help="Download every image for this machine (all operating systems).",
+)
 @click.option(
     "--arch",
     type=click.Choice(["amd64", "arm64"]),
@@ -393,7 +398,8 @@ def image() -> None:
     "os_name",
     type=click.Choice(["ubuntu", "alpine"]),
     default=None,
-    help="Operating system inside the image; defaults to ubuntu.",
+    help="Operating system inside the image; single pulls default to ubuntu, "
+    "and with --all this limits the download.",
 )
 @image_dir_option
 @json_option
@@ -407,11 +413,11 @@ def image_pull(
     json_output: bool,
 ) -> Any:
     """Download a sandbox image before first use."""
-    _before_command(json_output=json_output)
     if bool(preset) == all_images:
         raise click.UsageError(
             "Choose one target: 'smolvm image pull codex' or 'smolvm image pull --all'."
         )
+    _before_command(json_output=json_output)
     if all_images:
         from smolvm.cli.image import run_image_pull_all
 

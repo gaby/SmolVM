@@ -859,3 +859,155 @@ class TestCustomImages:
         assert ret == 2
         payload = json.loads(capsys.readouterr().out)
         assert payload["error"]["code"] == "invalid_input"
+
+
+class TestRmSafety:
+    def test_rm_bare_custom_is_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """'custom' is the namespace, not an entry — one rm must never wipe
+        every build (regression)."""
+        fp = tmp_path / "custom" / "myimg" / "abc123def4567890"
+        fp.mkdir(parents=True)
+        (fp / "rootfs.ext4").write_bytes(b"x")
+
+        ret = main(["image", "rm", "custom", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert fp.exists()
+
+    def test_rm_refuses_symlinked_middle_component(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A symlinked component under custom/ must not redirect the delete
+        at a different entry (regression)."""
+        published = tmp_path / "codex-v9.9.9-amd64-firecracker"
+        published.mkdir()
+        (published / "rootfs.ext4").write_bytes(b"keep me")
+        (tmp_path / "custom").mkdir()
+        (tmp_path / "custom" / "link").symlink_to(tmp_path)
+
+        ret = main(
+            [
+                "image",
+                "rm",
+                "custom/link/codex-v9.9.9-amd64-firecracker",
+                "--image-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert (published / "rootfs.ext4").exists()
+
+    def test_rm_accepts_unusual_directory_names(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Any real top-level directory is removable, not just charset-clean
+        names (regression: 'my old image' became undeletable)."""
+        odd = tmp_path / "my old image"
+        odd.mkdir()
+        (odd / "blob").write_bytes(b"x")
+
+        ret = main(["image", "rm", "my old image", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        capsys.readouterr()
+        assert not odd.exists()
+
+    def test_rm_fingerprint_prefix(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        """Docker-style short ids: the 12-char version shown by list works."""
+        a = tmp_path / "custom" / "web" / "aaaa1111bbbb2222"
+        b = tmp_path / "custom" / "web" / "cccc3333dddd4444"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+
+        ret = main(
+            ["image", "rm", "custom/web/aaaa1111bbbb", "--image-dir", str(tmp_path), "--json"]
+        )
+
+        assert ret == 0
+        capsys.readouterr()
+        assert not a.exists()
+        assert b.exists()
+
+    def test_rm_ambiguous_fingerprint_prefix(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        a = tmp_path / "custom" / "web" / "aaaa1111bbbb2222"
+        b = tmp_path / "custom" / "web" / "aaaa1111cccc3333"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+
+        ret = main(["image", "rm", "custom/web/aaaa", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert "aaaa1111bbbb2222" in payload["error"]["message"]
+        assert "aaaa1111cccc3333" in payload["error"]["message"]
+        assert a.exists() and b.exists()
+
+    def test_list_shows_top_level_dot_dirs(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Orphaned staging dirs must not be invisible disk usage."""
+        staging = tmp_path / ".codex-v0.0.1-amd64-firecracker.partial"
+        staging.mkdir()
+        (staging / "rootfs.ext4").write_bytes(b"x" * 10)
+
+        ret = main(["image", "list", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        rows = json.loads(capsys.readouterr().out)["data"]["images"]
+        assert [r["kind"] for r in rows] == ["other"]
+        assert rows[0]["size_bytes"] > 0
+
+
+class TestPullAllRecovery:
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_failure_recovery_keeps_flags(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from smolvm.exceptions import ImageError
+
+        mock_ensure.side_effect = ImageError("boom")
+
+        ret = main(["image", "pull", "--all", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "--image-dir" in payload["error"]["recovery"]
+
+    @patch("smolvm.images.published.published_targets", return_value=[])
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_no_targets_names_recovery(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_targets: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        ret = main(
+            ["image", "pull", "--all", "--os", "alpine", "--image-dir", str(tmp_path), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        recovery = payload["error"]["recovery"]
+        assert "smolvm image pull --all" in recovery
+        assert "--os" not in recovery

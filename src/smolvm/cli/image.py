@@ -29,7 +29,6 @@ import json
 import re
 import shlex
 import shutil
-import time
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +110,10 @@ def _relative_time(iso_ts: str | None, *, now: datetime | None = None) -> str:
         then = datetime.fromisoformat(iso_ts)
     except ValueError:
         return "-"
+    if then.tzinfo is None:
+        # A naive timestamp can't be compared to the aware clock; degrade
+        # like any other unusable input instead of raising.
+        return "-"
     current = now if now is not None else datetime.now(timezone.utc)
     seconds = max(0, int((current - then).total_seconds()))
     for unit, span in (
@@ -130,17 +133,25 @@ def _relative_time(iso_ts: str | None, *, now: datetime | None = None) -> str:
 def _valid_entry_name(requested: str) -> bool:
     """Whether *requested* is a well-formed cache-entry name.
 
-    Plain entries are a single path segment; custom builds may be addressed
-    as ``custom/<name>`` or ``custom/<name>/<fingerprint>``.
+    Plain entries are a single path segment — any real directory name works,
+    since users may drop oddly named dirs into the cache. Custom builds are
+    addressed as ``custom/<name>`` or ``custom/<name>/<fingerprint>`` with
+    the builder's conservative charset. The bare namespace directory
+    ``custom`` is NOT an entry: accepting it would let one rm wipe every
+    build at once.
     """
     if not requested or "\\" in requested:
         return False
     segments = requested.split("/")
-    if any(seg in {"", ".", ".."} or not _SAFE_SEGMENT_RE.match(seg) for seg in segments):
+    if any(seg in {"", ".", ".."} for seg in segments):
         return False
     if len(segments) == 1:
-        return True
-    return segments[0] == _CUSTOM_DIR and len(segments) in {2, 3}
+        return segments[0] != _CUSTOM_DIR
+    return (
+        segments[0] == _CUSTOM_DIR
+        and len(segments) in {2, 3}
+        and all(_SAFE_SEGMENT_RE.match(seg) for seg in segments[1:])
+    )
 
 
 class ImageRow(TypedDict):
@@ -223,6 +234,7 @@ class ImageBuildPayload(TypedDict):
     backend: str
     size_bytes: int
     cached: bool
+    warnings: list[str]
 
 
 class RemovedEntry(TypedDict):
@@ -252,10 +264,21 @@ def _fail(
     return exit_code
 
 
-def _classify(path: Path) -> ImageRow:
+def _entry_kind(path: Path, root: Path) -> str:
+    """The row kind an entry directory would get, without walking it."""
+    if path.parent != root:
+        return "custom"
+    if _IMAGE_DIR_NAME_RE.match(path.name):
+        return "image"
+    if _KERNEL_DIR_NAME_RE.match(path.name):
+        return "kernel"
+    return "other"
+
+
+def _classify(path: Path, size_bytes: int | None = None) -> ImageRow:
     """Build an :class:`ImageRow` for one child directory of the image dir."""
     name = path.name
-    size = _total_size(path)
+    size = size_bytes if size_bytes is not None else _total_size(path)
     created = _created_iso(path)
     image_match = _IMAGE_DIR_NAME_RE.match(name)
     if image_match:
@@ -302,7 +325,7 @@ def _classify(path: Path) -> ImageRow:
     )
 
 
-def _custom_row(fingerprint_dir: Path) -> ImageRow:
+def _custom_row(fingerprint_dir: Path, size_bytes: int | None = None) -> ImageRow:
     """Build an :class:`ImageRow` for one ``custom/<name>/<fingerprint>`` dir."""
     arch: str | None = None
     metadata = fingerprint_dir / "metadata.json"
@@ -323,7 +346,7 @@ def _custom_row(fingerprint_dir: Path) -> ImageRow:
         os=None,
         current=None,
         created=_created_iso(fingerprint_dir),
-        size_bytes=_total_size(fingerprint_dir),
+        size_bytes=size_bytes if size_bytes is not None else _total_size(fingerprint_dir),
         path=str(fingerprint_dir),
     )
 
@@ -342,12 +365,17 @@ def _custom_rows(custom_root: Path) -> list[ImageRow]:
 
 
 def _cached_rows(root: Path) -> list[ImageRow]:
-    """Classify every cache entry under *root* (empty when it's missing)."""
+    """Classify every cache entry under *root* (empty when it's missing).
+
+    Top-level dot-directories (e.g. an interrupted load's ``.partial``
+    staging dir) are shown as "other" rows so their disk usage is never
+    invisible to the user.
+    """
     if not root.is_dir():
         return []
     rows: list[ImageRow] = []
     for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+        if not child.is_dir():
             continue
         if child.name == _CUSTOM_DIR:
             rows.extend(_custom_rows(child))
@@ -377,13 +405,48 @@ def _normalize_rm_name(name: str, root: Path) -> str:
 def _resolve_entries(requested: str, root: Path) -> list[Path]:
     """Match a validated entry name to cache directories.
 
-    Exact names (including the ``custom/...`` namespace) win; otherwise the
-    name is treated as a preset and every cached variant matches.
+    Exact names (including the ``custom/...`` namespace) win; a custom
+    fingerprint may be shortened to a unique prefix (the 12 characters
+    ``image list`` shows are enough); otherwise the name is treated as a
+    preset and every cached variant matches.
+
+    Raises ``ValueError`` when a fingerprint prefix matches more than one
+    build — callers surface it as an invalid-input error.
     """
+    if "/" in requested:
+        segments = requested.split("/")
+        # A symlinked intermediate component could redirect the whole
+        # operation at a different entry; refuse rather than follow.
+        for depth in range(1, len(segments)):
+            if (root / "/".join(segments[:depth])).is_symlink():
+                return []
+        exact = root / requested
+        if exact.is_dir() or exact.is_symlink():
+            return [exact]
+        if len(segments) == 3:
+            # Docker-style short ids: a unique fingerprint prefix works.
+            name_dir = root / segments[0] / segments[1]
+            if name_dir.is_dir():
+                prefix_matches = [
+                    child
+                    for child in sorted(name_dir.iterdir())
+                    if child.is_dir()
+                    and not child.name.startswith(".")
+                    and child.name.startswith(segments[2])
+                ]
+                if len(prefix_matches) > 1:
+                    options = ", ".join(
+                        f"{segments[0]}/{segments[1]}/{child.name}" for child in prefix_matches
+                    )
+                    raise ValueError(
+                        f"'{requested}' matches more than one build. Pick one of: {options}."
+                    )
+                return prefix_matches
+        return []
     exact = root / requested
     if exact.is_dir() or exact.is_symlink():
         return [exact]
-    if "/" in requested or not root.is_dir():
+    if not root.is_dir():
         return []
     canonical = _canonical_preset(requested)
     matches: list[Path] = []
@@ -434,6 +497,56 @@ def _pull_retry_command(
 ) -> str:
     """The user's pull invocation, reconstructed for recovery messages."""
     parts = ["smolvm", "image", "pull", preset]
+    if arch:
+        parts += ["--arch", arch]
+    if vmm:
+        parts += ["--vmm", vmm]
+    if os_name:
+        parts += ["--os", os_name]
+    if image_dir:
+        parts += ["--image-dir", shlex.quote(image_dir)]
+    return " ".join(parts)
+
+
+def _build_retry_command(
+    tag: str,
+    context_path: str,
+    dockerfile: str | None,
+    size_mb: int,
+    build_args: tuple[str, ...],
+    arch: str | None,
+    backend: str,
+    init: str,
+    image_dir: str | None,
+) -> str:
+    """The user's build invocation, reconstructed for recovery messages."""
+    parts = ["smolvm", "image", "build", "-t", tag]
+    if dockerfile:
+        parts += ["-f", shlex.quote(dockerfile)]
+    if size_mb != 512:
+        parts += ["--size-mb", str(size_mb)]
+    for item in build_args:
+        parts += ["--build-arg", shlex.quote(item)]
+    if arch:
+        parts += ["--arch", arch]
+    if backend != "auto":
+        parts += ["--backend", backend]
+    if init != "/init":
+        parts += ["--init", shlex.quote(init)]
+    if image_dir:
+        parts += ["--image-dir", shlex.quote(image_dir)]
+    parts.append(shlex.quote(context_path))
+    return " ".join(parts)
+
+
+def _pull_all_retry_command(
+    arch: str | None,
+    vmm: str | None,
+    os_name: str | None,
+    image_dir: str | None,
+) -> str:
+    """The user's ``pull --all`` invocation, reconstructed for recovery."""
+    parts = ["smolvm", "image", "pull", "--all"]
     if arch:
         parts += ["--arch", arch]
     if vmm:
@@ -646,7 +759,9 @@ def run_image_pull_all(
 ) -> int:
     """Execute ``smolvm image pull --all``."""
     from smolvm.cli.main import _host_arch_for_published, _vmm_for_host
-    from smolvm.images.published import MANIFEST
+    from smolvm.images.published import Arch, Vmm, published_targets
+
+    retry_command = _pull_all_retry_command(arch, vmm, os_name, image_dir)
 
     try:
         resolved_arch = arch or _host_arch_for_published()
@@ -662,18 +777,17 @@ def run_image_pull_all(
             exit_code=2,
         )
 
-    targets = sorted(
-        {(p, o) for (p, a, v, o) in MANIFEST if a == resolved_arch and v == resolved_vmm}
-    )
+    targets = published_targets(cast("Arch", resolved_arch), cast("Vmm", resolved_vmm))
     if os_name:
         targets = [(p, o) for (p, o) in targets if o == os_name]
     if not targets:
+        no_filter_command = _pull_all_retry_command(arch, vmm, None, image_dir)
         return _fail(
             command_name,
-            f"No published images for {resolved_arch}/{resolved_vmm}"
-            f"{f' with os {os_name!r}' if os_name else ''}.",
+            "No published images match this machine and the options you passed.",
             json_output=json_output,
             code="invalid_input",
+            recovery=f"Run '{no_filter_command}' to download every available image.",
             exit_code=2,
         )
 
@@ -713,13 +827,16 @@ def run_image_pull_all(
         warnings=_non_default_dir_warnings(root),
     )
 
+    failure_recovery = (
+        f"Check your network connection and disk space, then retry '{retry_command}'."
+    )
     if json_output:
         if failed:
             return emit_error(
                 command_name,
                 "runtime_error",
                 f"Could not download {len(failed)} of {len(targets)} images.",
-                recovery="Check your network connection and retry 'smolvm image pull --all'.",
+                recovery=failure_recovery,
                 details=payload,
                 exit_code=1,
             )
@@ -738,7 +855,7 @@ def run_image_pull_all(
     if failed:
         render_error(
             f"Could not download {len(failed)} of {len(targets)} images.",
-            hint="Check your network connection and retry 'smolvm image pull --all'.",
+            hint=failure_recovery,
         )
         return 1
     return 0
@@ -811,8 +928,6 @@ def run_image_list(
 
 def _inspect_entry(path: Path, root: Path) -> ImageInspectEntry:
     """Build the detailed inspect record for one cache directory."""
-    row = _custom_row(path) if path.parent != root else _classify(path)
-
     files: list[ImageFileEntry] = []
     try:
         for f in sorted(path.rglob("*")):
@@ -832,6 +947,14 @@ def _inspect_entry(path: Path, root: Path) -> ImageInspectEntry:
     except OSError:
         pass
 
+    # The files walk already collected on-disk sizes — reuse them for the
+    # row instead of walking the tree a second time.
+    size_on_disk = sum(f["size_on_disk_bytes"] for f in files)
+    if _entry_kind(path, root) == "custom":
+        row = _custom_row(path, size_bytes=size_on_disk)
+    else:
+        row = _classify(path, size_bytes=size_on_disk)
+
     sidecar_path = path / "rootfs.ext4.from-sha256"
     sidecar: str | None = None
     if sidecar_path.is_file():
@@ -842,10 +965,13 @@ def _inspect_entry(path: Path, root: Path) -> ImageInspectEntry:
 
     manifest_info: ImageManifestInfo | None = None
     if row["kind"] == "image" and row["current"]:
-        from smolvm.images.published import IMAGES_RELEASE_TAG, MANIFEST, ManifestKey
+        from smolvm.exceptions import ImageError
+        from smolvm.images.published import IMAGES_RELEASE_TAG, lookup
 
-        key = cast("ManifestKey", (row["preset"], row["arch"], row["vmm"], row["os"]))
-        entry = MANIFEST.get(key)
+        try:
+            entry = lookup(row["preset"], row["arch"], row["vmm"], row["os"])  # type: ignore[arg-type]
+        except ImageError:
+            entry = None
         if entry is not None:
             manifest_info = ImageManifestInfo(
                 kernel_url=entry.kernel_url,
@@ -886,6 +1012,14 @@ def run_image_inspect(
 
     try:
         matches = _expand_custom_entries(_resolve_entries(requested, root), root)
+    except ValueError as exc:
+        return _fail(
+            command_name,
+            str(exc),
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
     except OSError as exc:
         return _fail(
             command_name,
@@ -973,6 +1107,14 @@ def run_image_rm(
     permission_recovery = f"Fix the folder's permissions, then retry 'smolvm image rm {requested}'."
     try:
         matches = _resolve_entries(requested, root)
+    except ValueError as exc:
+        return _fail(
+            command_name,
+            str(exc),
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
     except OSError as exc:
         return _fail(
             command_name,
@@ -989,7 +1131,6 @@ def run_image_rm(
             recovery="Run 'smolvm image list' to see cached images.",
         )
 
-    resolved_root = root.resolve()
     entries: list[RemovedEntry] = []
     for target in matches:
         display = target.relative_to(root).as_posix()
@@ -998,10 +1139,15 @@ def run_image_rm(
             # touched — so removing it frees no space.
             entries.append(RemovedEntry(name=display, path=str(target), size_bytes=0))
             continue
-        # Names are validated above and matches sit under the root, so a
-        # real directory escaping it should be impossible; keep a hard stop
-        # in front of the recursive delete anyway.
-        if resolved_root not in target.resolve().parents:
+        # Names and intermediate components are validated above, so a real
+        # directory escaping its parent should be impossible; keep a hard
+        # stop in front of the recursive delete anyway: the target must
+        # resolve to a direct child of its own (resolved) parent inside the
+        # image directory.
+        resolved_parent = target.parent.resolve()
+        resolved_root = root.resolve()
+        inside_root = resolved_parent == resolved_root or resolved_root in resolved_parent.parents
+        if target.resolve().parent != resolved_parent or not inside_root:
             return _fail(
                 command_name,
                 f"'{display}' could not be removed safely.",
@@ -1026,7 +1172,7 @@ def run_image_rm(
             console.print(f"  {entry['name']}  ({_format_bytes(entry['size_bytes'])})")
         return 0
 
-    for target in matches:
+    for target, entry in zip(matches, entries, strict=True):
         try:
             if target.is_symlink():
                 target.unlink()
@@ -1035,7 +1181,7 @@ def run_image_rm(
         except OSError as exc:
             return _fail(
                 command_name,
-                f"Could not remove '{target.name}': {exc}",
+                f"Could not remove '{entry['name']}': {exc}",
                 json_output=json_output,
                 recovery=permission_recovery,
             )
@@ -1065,10 +1211,36 @@ def run_image_build(
     """Execute ``smolvm image build``."""
     from smolvm.exceptions import ImageError
     from smolvm.images.boot import DirectKernelBoot
-    from smolvm.images.builder import DockerRootfsBuilder
+    from smolvm.images.builder import DockerContextValue, DockerRootfsBuilder
 
-    retry_command = f"smolvm image build -t {tag} {shlex.quote(context_path)}"
+    retry_command = _build_retry_command(
+        tag, context_path, dockerfile, size_mb, build_args, arch, backend, init, image_dir
+    )
+
+    if not _SAFE_SEGMENT_RE.match(tag) or tag in {".", ".."}:
+        # The builder's own charset is slightly looser (it allows "." and
+        # ".."), which would let a tag escape the custom/ namespace.
+        return _fail(
+            command_name,
+            f"'{tag}' can't be used as an image name. Use letters, numbers, "
+            "dots, dashes, and underscores.",
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
+
     context_dir = Path(context_path)
+    if not context_dir.is_dir():
+        return _fail(
+            command_name,
+            f"'{context_path}' is not a folder.",
+            json_output=json_output,
+            code="invalid_input",
+            recovery="Pass the folder with the files your Dockerfile copies "
+            f"(use '.' for the current one), e.g. 'smolvm image build -t {tag} .'.",
+            exit_code=2,
+        )
+
     dockerfile_path = Path(dockerfile) if dockerfile else context_dir / "Dockerfile"
     try:
         dockerfile_text = dockerfile_path.read_text()
@@ -1078,8 +1250,7 @@ def run_image_build(
             f"No Dockerfile at '{dockerfile_path}'.",
             json_output=json_output,
             code="invalid_input",
-            recovery=f"Pass one with 'smolvm image build -t {tag} "
-            f"-f path/to/Dockerfile {shlex.quote(context_path)}'.",
+            recovery="Create it, or point at one with the -f option.",
             exit_code=2,
         )
 
@@ -1099,19 +1270,22 @@ def run_image_build(
 
     # Everything in the context folder is sent to the build. Files named
     # "Dockerfile" (any depth) are reserved by the builder and skipped.
-    context: dict[str, Path] = {}
-    skipped: list[str] = []
-    if context_dir.is_dir():
-        resolved_dockerfile = dockerfile_path.resolve()
-        for f in sorted(context_dir.rglob("*")):
-            if f.is_symlink() or not f.is_file():
-                continue
-            if f.resolve() == resolved_dockerfile:
-                continue
-            if f.name.lower() == "dockerfile":
-                skipped.append(f.relative_to(context_dir).as_posix())
-                continue
-            context[f.relative_to(context_dir).as_posix()] = f
+    context: dict[str, DockerContextValue] = {}
+    warnings: list[str] = []
+    resolved_dockerfile = dockerfile_path.resolve()
+    for f in sorted(context_dir.rglob("*")):
+        if f.is_symlink() or not f.is_file():
+            continue
+        if f.resolve() == resolved_dockerfile:
+            continue
+        if f.name.lower() == "dockerfile":
+            skipped_path = f.relative_to(context_dir).as_posix()
+            warnings.append(
+                f"Skipped '{skipped_path}': files named Dockerfile can't be "
+                "part of the build context. Rename it to include it."
+            )
+            continue
+        context[f.relative_to(context_dir).as_posix()] = f
 
     try:
         builder = DockerRootfsBuilder(
@@ -1132,19 +1306,33 @@ def run_image_build(
             exit_code=2,
         )
 
-    start = time.time()
+    # Clock-free cache detection: a build was reused iff its rootfs existed
+    # before the call and was not rewritten (wall-clock comparisons break
+    # under VM clock drift and coarse filesystem timestamps).
+    existing_builds: dict[str, int] = {}
+    tag_dir = builder.cache_dir / _CUSTOM_DIR / tag
+    if tag_dir.is_dir():
+        for child in tag_dir.iterdir():
+            try:
+                if child.is_dir():
+                    existing_builds[child.name] = (child / "rootfs.ext4").stat().st_mtime_ns
+            except OSError:
+                continue
+
     try:
         boot_image = builder.build_boot_image(
             backend=backend,
             arch=arch or "host",
             boot=DirectKernelBoot(init=init),
         )
-    except ImageError as exc:
+    except (ImageError, ValueError) as exc:
         return _fail(
             command_name,
             str(exc),
             json_output=json_output,
+            code="invalid_input" if isinstance(exc, ValueError) else "runtime_error",
             recovery=f"Fix the problem above, then retry '{retry_command}'.",
+            exit_code=2 if isinstance(exc, ValueError) else 1,
         )
     except OSError as exc:
         return _fail(
@@ -1156,7 +1344,9 @@ def run_image_build(
 
     fingerprint_dir = boot_image.rootfs_path.parent
     try:
-        cached = boot_image.rootfs_path.stat().st_mtime < start
+        cached = (
+            existing_builds.get(fingerprint_dir.name) == boot_image.rootfs_path.stat().st_mtime_ns
+        )
     except OSError:
         cached = False
 
@@ -1170,6 +1360,7 @@ def run_image_build(
         backend=str(boot_image.backend or backend),
         size_bytes=_total_size(fingerprint_dir),
         cached=cached,
+        warnings=warnings,
     )
     if json_output:
         return emit_success(command_name, payload)
@@ -1177,11 +1368,8 @@ def run_image_build(
     from rich.panel import Panel
 
     console = console_stdout()
-    for path in skipped:
-        console.print(
-            f"[yellow]Skipped '{path}': files named Dockerfile can't be "
-            "part of the build context.[/yellow]"
-        )
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
     verb = "Reusing cached" if cached else "Built"
     console.print(
         Panel.fit(

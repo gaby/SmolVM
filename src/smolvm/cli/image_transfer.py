@@ -14,12 +14,15 @@
 
 """``smolvm image save`` / ``smolvm image load`` — move images between machines.
 
-The archive is a plain tar whose first member is ``manifest.json``
-(schema_version 1) describing every other member. Large files are stored as
-zstd streams so sparse rootfs images stay small; the decompressed
-``rootfs.ext4`` and its sidecar are omitted entirely when the compressed
-``rootfs.ext4.zst`` is present and are recreated on load, byte-compatible
-with what ``ensure_published_image`` expects.
+The archive is a plain tar containing exactly one ``manifest.json``
+(schema_version 1) that describes every ``files/<path>`` member: its
+encoding (``raw`` bytes or a ``zstd`` stream) and its decoded size. Member
+names never carry encoding suffixes, so sibling files like ``x`` and
+``x.zst`` can't collide. Large files travel as zstd streams so sparse
+rootfs images stay small; the decompressed ``rootfs.ext4`` and its sidecar
+are omitted entirely when the compressed ``rootfs.ext4.zst`` is present and
+are recreated on load, byte-compatible with what ``ensure_published_image``
+expects.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import shlex
 import shutil
 import tarfile
 import tempfile
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -38,7 +42,7 @@ from typing import Any, TypedDict
 from smolvm import __version__
 from smolvm.cli.image import (
     _IMAGE_DIR_NAME_RE,
-    _classify,
+    _entry_kind,
     _expand_custom_entries,
     _fail,
     _non_default_dir_warnings,
@@ -52,6 +56,9 @@ from smolvm.images.manager import resolve_image_dir
 
 _SCHEMA_VERSION = 1
 _COPY_CHUNK = 1024 * 1024
+_MANIFEST_MEMBER = "manifest.json"
+# Real manifests are a few KB; anything huge is not one of our archives.
+_MANIFEST_SIZE_CAP = 10 * 1024 * 1024
 
 # The decompressed rootfs and its sidecar are recreated on load from the
 # compressed wire file, so archives never carry them alongside it.
@@ -66,6 +73,7 @@ class ImageSavePayload(TypedDict):
     archive_size_bytes: int
     files: int
     excluded_decompressed_rootfs: bool
+    warnings: list[str]
 
 
 class ImageLoadPayload(TypedDict):
@@ -82,6 +90,14 @@ def _valid_relative_file_path(path: str) -> bool:
     return all(segment not in {"", ".", ".."} for segment in path.split("/"))
 
 
+def _remove_existing_entry(path: Path) -> None:
+    """Remove a cache entry in whatever form it exists (dir, link, file)."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
 def run_image_save(
     *,
     name: str,
@@ -95,6 +111,7 @@ def run_image_save(
 
     root = resolve_image_dir(image_dir)
     requested = _normalize_rm_name(name, root)
+    out_path = Path(output)
 
     if not _valid_entry_name(requested):
         return _fail(
@@ -105,15 +122,34 @@ def run_image_save(
             recovery="Run 'smolvm image list' to see cached images.",
             exit_code=2,
         )
+    if out_path.is_dir():
+        return _fail(
+            command_name,
+            f"'{out_path}' is a folder; -o needs a file name.",
+            json_output=json_output,
+            code="invalid_input",
+            recovery=f"Retry with a file path, e.g. 'smolvm image save {requested} "
+            f"-o {shlex.quote(str(out_path / (requested.replace('/', '-') + '.tar')))}'.",
+            exit_code=2,
+        )
 
+    retry_command = f"smolvm image save {requested} -o {shlex.quote(str(out_path))}"
     try:
         matches = _expand_custom_entries(_resolve_entries(requested, root), root)
+    except ValueError as exc:
+        return _fail(
+            command_name,
+            str(exc),
+            json_output=json_output,
+            code="invalid_input",
+            exit_code=2,
+        )
     except OSError as exc:
         return _fail(
             command_name,
             f"Could not read the image folder '{root}': {exc}",
             json_output=json_output,
-            recovery=f"Fix the folder's permissions, then retry 'smolvm image save {requested}'.",
+            recovery=f"Fix the folder's permissions, then retry '{retry_command}'.",
         )
 
     if not matches:
@@ -135,8 +171,6 @@ def run_image_save(
 
     entry = matches[0]
     archive_name = entry.relative_to(root).as_posix()
-    out_path = Path(output)
-    retry_command = f"smolvm image save {archive_name} -o {shlex.quote(str(out_path))}"
 
     zst_present = (entry / _ROOTFS_ZST).is_file()
     excluded = {_DECOMPRESSED_ROOTFS, _ROOTFS_SIDECAR} if zst_present else set()
@@ -147,52 +181,70 @@ def run_image_save(
         except OSError:
             sidecar_value = None
 
+    warnings: list[str] = []
     files_meta: list[dict[str, Any]] = []
+    # Write to a sibling temp file and rename at the end so a failed save
+    # never destroys an existing archive at the -o path.
+    partial_archive = out_path.with_name(out_path.name + ".partial")
+    compressor = zstandard.ZstdCompressor(threads=-1)
     try:
         tmp_parent = str(out_path.parent) if out_path.parent.is_dir() else None
-        with tempfile.TemporaryDirectory(dir=tmp_parent) as tmp:
-            # (source path on disk, archive member name)
-            staged: list[tuple[Path, str]] = []
+        with (
+            tempfile.TemporaryDirectory(dir=tmp_parent) as tmp,
+            tarfile.open(partial_archive, "w") as tar,
+        ):
+            scratch = Path(tmp) / "member.zst"
             for f in sorted(entry.rglob("*")):
-                if f.is_symlink() or not f.is_file():
+                if f.is_symlink():
+                    warnings.append(
+                        f"Skipped '{f.relative_to(entry).as_posix()}': links are "
+                        "not saved into archives."
+                    )
+                    continue
+                if not f.is_file():
                     continue
                 rel = f.relative_to(entry).as_posix()
                 if rel in excluded or rel == ".build.lock":
                     continue
                 if rel.endswith(".zst"):
                     files_meta.append({"path": rel, "encoding": "raw", "size": f.stat().st_size})
-                    staged.append((f, f"files/{rel}"))
+                    tar.add(f, arcname=f"files/{rel}", recursive=False)
                 else:
-                    compressed = Path(tmp) / f"{len(staged)}.zst"
-                    with open(f, "rb") as src, open(compressed, "wb") as dst:
-                        zstandard.ZstdCompressor().copy_stream(src, dst)
+                    # Compress into one reused scratch file, add, discard —
+                    # scratch usage stays bounded by a single member.
+                    with open(f, "rb") as src, open(scratch, "wb") as dst:
+                        compressor.copy_stream(src, dst)
                     files_meta.append({"path": rel, "encoding": "zstd", "size": f.stat().st_size})
-                    staged.append((compressed, f"files/{rel}.zst"))
+                    tar.add(scratch, arcname=f"files/{rel}", recursive=False)
+                    scratch.unlink()
 
             manifest = {
                 "schema_version": _SCHEMA_VERSION,
                 "saved_by": __version__,
                 "created": datetime.now(timezone.utc).isoformat(),
                 "name": archive_name,
-                "kind": _classify(entry)["kind"] if "/" not in archive_name else "custom",
+                "kind": _entry_kind(entry, root),
                 "rootfs_sidecar": sidecar_value,
                 "files": files_meta,
             }
             manifest_bytes = json.dumps(manifest, indent=2).encode()
-            with tarfile.open(out_path, "w") as tar:
-                info = tarfile.TarInfo("manifest.json")
-                info.size = len(manifest_bytes)
-                tar.addfile(info, io.BytesIO(manifest_bytes))
-                for source, arcname in staged:
-                    tar.add(source, arcname=arcname, recursive=False)
+            info = tarfile.TarInfo(_MANIFEST_MEMBER)
+            info.size = len(manifest_bytes)
+            tar.addfile(info, io.BytesIO(manifest_bytes))
+        partial_archive.replace(out_path)
     except OSError as exc:
-        out_path.unlink(missing_ok=True)
+        with suppress(OSError):
+            partial_archive.unlink(missing_ok=True)
         return _fail(
             command_name,
             f"Could not write '{out_path}': {exc}",
             json_output=json_output,
             recovery=f"Free up disk space or fix permissions, then retry '{retry_command}'.",
         )
+    except BaseException:
+        with suppress(OSError):
+            partial_archive.unlink(missing_ok=True)
+        raise
 
     payload = ImageSavePayload(
         name=archive_name,
@@ -200,6 +252,7 @@ def run_image_save(
         archive_size_bytes=out_path.stat().st_size,
         files=len(files_meta),
         excluded_decompressed_rootfs=zst_present,
+        warnings=warnings,
     )
     if json_output:
         return emit_success(command_name, payload)
@@ -209,6 +262,8 @@ def run_image_save(
         f"({_format_bytes(payload['archive_size_bytes'])}). Load it on another "
         f"machine with 'smolvm image load -i {shlex.quote(str(out_path))}'."
     )
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
     return 0
 
 
@@ -224,11 +279,26 @@ def run_image_load(
     import zstandard
 
     from smolvm.host.disk import decompress_zstd_sparse
+    from smolvm.images.published import _decompressed_rootfs_sidecar_value
 
     root = resolve_image_dir(image_dir)
     in_path = Path(input_file)
     quoted_input = shlex.quote(str(input_file))
     not_an_archive = "Check that the file was created by 'smolvm image save' and is not corrupted."
+
+    def bad_archive(
+        message: str | None = None,
+        *,
+        recovery: str | None = None,
+    ) -> int:
+        return _fail(
+            command_name,
+            message or f"'{in_path}' is not a SmolVM image archive.",
+            json_output=json_output,
+            code="invalid_input",
+            recovery=recovery or not_an_archive,
+            exit_code=2,
+        )
 
     try:
         tar = tarfile.open(in_path, "r:")  # noqa: SIM115 — closed by `with tar:` below
@@ -243,51 +313,35 @@ def run_image_load(
         )
 
     with tar:
-        members = tar.getmembers()
-        if not members or members[0].name != "manifest.json" or not members[0].isreg():
-            return _fail(
-                command_name,
-                f"'{in_path}' is not a SmolVM image archive.",
-                json_output=json_output,
-                code="invalid_input",
-                recovery=not_an_archive,
-                exit_code=2,
-            )
-        manifest_file = tar.extractfile(members[0])
+        # A truncated archive can fail while listing members or reading the
+        # manifest — that's damage, not a crash.
         try:
+            members = tar.getmembers()
+            manifest_members = [m for m in members if m.name == _MANIFEST_MEMBER]
+            if (
+                len(manifest_members) != 1
+                or not manifest_members[0].isreg()
+                or manifest_members[0].size > _MANIFEST_SIZE_CAP
+            ):
+                return bad_archive()
+            manifest_file = tar.extractfile(manifest_members[0])
             manifest = json.load(manifest_file) if manifest_file else None
+        except tarfile.TarError:
+            return bad_archive(f"'{in_path}' is damaged and was not loaded.")
         except ValueError:
             manifest = None
         if not isinstance(manifest, dict):
-            return _fail(
-                command_name,
-                f"'{in_path}' is not a SmolVM image archive.",
-                json_output=json_output,
-                code="invalid_input",
-                recovery=not_an_archive,
-                exit_code=2,
-            )
+            return bad_archive()
 
         schema = manifest.get("schema_version")
         if isinstance(schema, int) and schema > _SCHEMA_VERSION:
-            return _fail(
-                command_name,
+            return bad_archive(
                 "This archive was saved by a newer SmolVM.",
-                json_output=json_output,
-                code="invalid_input",
                 recovery=f"Run 'smolvm update', then retry 'smolvm image load -i {quoted_input}'.",
-                exit_code=2,
             )
         name = manifest.get("name")
         if schema != _SCHEMA_VERSION or not isinstance(name, str) or not _valid_entry_name(name):
-            return _fail(
-                command_name,
-                f"'{in_path}' is not a SmolVM image archive.",
-                json_output=json_output,
-                code="invalid_input",
-                recovery=not_an_archive,
-                exit_code=2,
-            )
+            return bad_archive()
 
         # Only members declared in the manifest, as regular files, at safe
         # relative paths, are ever written to disk — extraction below builds
@@ -299,28 +353,28 @@ def run_image_load(
                 not isinstance(meta, dict)
                 or not isinstance(meta.get("path"), str)
                 or meta.get("encoding") not in {"raw", "zstd"}
+                or not isinstance(meta.get("size"), int)
+                or isinstance(meta.get("size"), bool)
+                or meta["size"] < 0
                 or not _valid_relative_file_path(meta["path"])
             ):
-                return _fail(
-                    command_name,
-                    f"'{in_path}' is not a SmolVM image archive.",
-                    json_output=json_output,
-                    code="invalid_input",
-                    recovery=not_an_archive,
-                    exit_code=2,
-                )
-            suffix = ".zst" if meta["encoding"] == "zstd" else ""
-            allowed[f"files/{meta['path']}{suffix}"] = meta
-        for member in members[1:]:
+                return bad_archive()
+            allowed[f"files/{meta['path']}"] = meta
+        data_members = [m for m in members if m.name != _MANIFEST_MEMBER]
+        for member in data_members:
             if not member.isreg() or member.name not in allowed:
                 return _fail(
                     command_name,
                     f"'{in_path}' contains unexpected entries and was not loaded.",
                     json_output=json_output,
                     code="invalid_input",
-                    recovery="Recreate the archive with 'smolvm image save'.",
+                    recovery="Recreate it on the source machine with "
+                    f"'smolvm image save {name} -o {shlex.quote(in_path.name)}'.",
                     exit_code=2,
                 )
+        missing = set(allowed) - {m.name for m in data_members}
+        if missing:
+            return bad_archive(f"'{in_path}' is incomplete and was not loaded.")
 
         target = root / name
         if target.exists() and not force:
@@ -331,21 +385,30 @@ def run_image_load(
                 recovery=f"Run 'smolvm image load -i {quoted_input} --force' to replace it.",
             )
 
+        manifest_sidecar = manifest.get("rootfs_sidecar")
+        have_sidecar = isinstance(manifest_sidecar, str) and bool(manifest_sidecar)
+
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.parent / f".{target.name}.partial"
         shutil.rmtree(partial, ignore_errors=True)
         try:
             partial.mkdir()
             zst_sha: str | None = None
-            for member in members[1:]:
+            for member in data_members:
                 meta = allowed[member.name]
                 destination = partial / meta["path"]
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 source = tar.extractfile(member)
                 if source is None:
-                    raise OSError(f"could not read '{member.name}' from the archive")
+                    raise tarfile.TarError(f"could not read '{member.name}' from the archive")
                 if meta["encoding"] == "raw":
-                    hasher = hashlib.sha256() if meta["path"] == _ROOTFS_ZST else None
+                    # The digest feeds the sidecar fallback; skip the work
+                    # when the manifest already carries the sidecar value.
+                    hasher = (
+                        hashlib.sha256()
+                        if meta["path"] == _ROOTFS_ZST and not have_sidecar
+                        else None
+                    )
                     with source, open(destination, "wb") as out:
                         while chunk := source.read(_COPY_CHUNK):
                             out.write(chunk)
@@ -360,6 +423,10 @@ def run_image_load(
                             out.write(chunk)
                     decompress_zstd_sparse(tmp_zst, destination)
                     tmp_zst.unlink()
+                if destination.stat().st_size != meta["size"]:
+                    raise zstandard.ZstdError(
+                        f"'{meta['path']}' does not match the size the archive declares"
+                    )
 
             # Recreate what save deliberately left out, byte-compatible with
             # what ensure_published_image validates on the next start.
@@ -367,23 +434,34 @@ def run_image_load(
             rootfs = partial / _DECOMPRESSED_ROOTFS
             if zst.is_file() and not rootfs.is_file():
                 decompress_zstd_sparse(zst, rootfs)
-                sidecar_value = manifest.get("rootfs_sidecar")
-                if not isinstance(sidecar_value, str) or not sidecar_value:
-                    sidecar_value = f"sparse-v1:{zst_sha}" if zst_sha else None
+                sidecar_value: str | None
+                if have_sidecar:
+                    sidecar_value = str(manifest_sidecar)
+                else:
+                    sidecar_value = _decompressed_rootfs_sidecar_value(zst_sha) if zst_sha else None
                 if sidecar_value:
                     (partial / _ROOTFS_SIDECAR).write_text(sidecar_value)
 
             if target.exists():
-                shutil.rmtree(target)
+                _remove_existing_entry(target)
             partial.rename(target)
-        except (OSError, tarfile.TarError, zstandard.ZstdError) as exc:
+        except (tarfile.TarError, zstandard.ZstdError) as exc:
+            shutil.rmtree(partial, ignore_errors=True)
+            return bad_archive(f"'{in_path}' is damaged and was not loaded: {exc}.")
+        except OSError as exc:
             shutil.rmtree(partial, ignore_errors=True)
             return _fail(
                 command_name,
                 f"Could not load the image: {exc}",
                 json_output=json_output,
-                recovery=f"Free up disk space, then retry 'smolvm image load -i {quoted_input}'.",
+                recovery="Free up disk space or fix permissions, then retry "
+                f"'smolvm image load -i {quoted_input}'.",
             )
+        except BaseException:
+            # Ctrl-C and other non-Exception exits must not orphan the
+            # multi-GB staging directory.
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
 
     warnings = _non_default_dir_warnings(root)
     stale_match = _IMAGE_DIR_NAME_RE.match(name)
@@ -397,7 +475,7 @@ def run_image_load(
         name=name,
         path=str(target),
         size_bytes=_total_size(target),
-        files=len(members) - 1,
+        files=len(data_members),
         warnings=warnings,
     )
     if json_output:

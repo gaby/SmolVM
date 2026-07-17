@@ -83,7 +83,7 @@ class TestSaveLoadRoundTrip:
         # The multi-MB decompressed rootfs never travels.
         with tarfile.open(archive) as tar:
             names = tar.getnames()
-        assert names[0] == "manifest.json"
+        assert "manifest.json" in names
         assert "files/rootfs.ext4" not in names
         assert "files/rootfs.ext4.zst" in names
         assert archive.stat().st_size < 64 * 1024
@@ -301,3 +301,204 @@ class TestLoadRejectsMaliciousArchives:
         assert ret == 2
         payload = json.loads(capsys.readouterr().out)
         assert "smolvm image save" in payload["error"]["recovery"]
+
+
+class TestArchiveRobustness:
+    def test_sibling_zst_pair_round_trips(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """x and x.zst in one entry must both survive (regression: member
+        name collision silently dropped one)."""
+        src = tmp_path / "src"
+        entry = src / "oddball"
+        entry.mkdir(parents=True)
+        (entry / "data.txt").write_bytes(b"plain")
+        (entry / "data.txt.zst").write_bytes(zstandard.compress(b"compressed"))
+        archive = tmp_path / "odd.tar"
+
+        assert (
+            main(
+                ["image", "save", "oddball", "--image-dir", str(src), "-o", str(archive), "--json"]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        dest = tmp_path / "dest"
+        assert main(["image", "load", "-i", str(archive), "--image-dir", str(dest), "--json"]) == 0
+        capsys.readouterr()
+
+        loaded = dest / "oddball"
+        assert (loaded / "data.txt").read_bytes() == b"plain"
+        assert (loaded / "data.txt.zst").read_bytes() == zstandard.compress(b"compressed")
+
+    def test_truncated_archive_gets_clean_envelope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A cut-off transfer must produce the error envelope, not a
+        traceback (regression)."""
+        src = tmp_path / "src"
+        _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+        archive = tmp_path / "codex.tar"
+        assert main(["image", "save", "codex", "--image-dir", str(src), "-o", str(archive)]) == 0
+        capsys.readouterr()
+        # Cut into the first member's data (small archives are mostly
+        # zero padding, so a percentage cut may remove nothing real).
+        data = archive.read_bytes()
+        archive.write_bytes(data[:700])
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(tmp_path / "dest"), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+
+    def test_archive_missing_declared_member_is_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """An archive whose manifest promises files it doesn't carry must
+        not load as success (regression)."""
+        archive = tmp_path / "short.tar"
+        _write_archive(
+            archive,
+            {
+                "schema_version": 1,
+                "name": "codex-v0.0.1-amd64-firecracker",
+                "rootfs_sidecar": None,
+                "files": [
+                    {"path": "vmlinux.bin", "encoding": "raw", "size": 4},
+                    {"path": "rootfs.ext4.zst", "encoding": "raw", "size": 4},
+                ],
+            },
+            [("files/vmlinux.bin", b"kern")],
+        )
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(tmp_path / "dest"), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "incomplete" in payload["error"]["message"]
+        assert not (tmp_path / "dest" / "codex-v0.0.1-amd64-firecracker").exists()
+
+    def test_size_mismatch_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        archive = tmp_path / "lying.tar"
+        _write_archive(
+            archive,
+            {
+                "schema_version": 1,
+                "name": "entry",
+                "rootfs_sidecar": None,
+                "files": [{"path": "blob", "encoding": "raw", "size": 3}],
+            },
+            [("files/blob", b"0123456789")],
+        )
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(tmp_path / "dest"), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "damaged" in payload["error"]["message"]
+        assert not (tmp_path / "dest" / "entry").exists()
+
+    def test_load_force_replaces_symlinked_entry(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--force onto a symlinked entry must replace the link, not crash
+        (regression: rmtree refused symlinks)."""
+        src = tmp_path / "src"
+        _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+        archive = tmp_path / "codex.tar"
+        assert main(["image", "save", "codex", "--image-dir", str(src), "-o", str(archive)]) == 0
+        capsys.readouterr()
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep")
+        (dest / "codex-v0.0.1-amd64-firecracker").symlink_to(outside)
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(dest), "--force", "--json"]
+        )
+
+        assert ret == 0
+        capsys.readouterr()
+        loaded = dest / "codex-v0.0.1-amd64-firecracker"
+        assert not loaded.is_symlink()
+        assert (loaded / "vmlinux.bin").is_file()
+        assert (outside / "keep").exists()
+
+    def test_save_to_directory_gets_clean_envelope(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """-o pointing at a folder must error cleanly, not traceback in
+        cleanup (regression)."""
+        src = tmp_path / "src"
+        _make_published_entry(src, "codex-v0.0.1-amd64-firecracker")
+
+        ret = main(
+            ["image", "save", "codex", "--image-dir", str(src), "-o", str(tmp_path), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert "-o" in payload["error"]["message"]
+
+    def test_failed_save_preserves_existing_archive(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A failing save must never destroy a pre-existing file at -o
+        (regression: cleanup unlinked it)."""
+        from unittest.mock import patch
+
+        src = tmp_path / "src"
+        entry = src / "entry"
+        entry.mkdir(parents=True)
+        (entry / "blob").write_bytes(b"x")
+        archive = tmp_path / "precious.tar"
+        archive.write_bytes(b"OLD ARCHIVE")
+
+        with patch("zstandard.ZstdCompressor") as mock_compressor:
+            mock_compressor.return_value.copy_stream.side_effect = OSError(28, "No space left")
+            ret = main(
+                ["image", "save", "entry", "--image-dir", str(src), "-o", str(archive), "--json"]
+            )
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert archive.read_bytes() == b"OLD ARCHIVE"
+        assert not archive.with_name("precious.tar.partial").exists()
+
+    def test_save_warns_about_skipped_links(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        src = tmp_path / "src"
+        entry = src / "entry"
+        entry.mkdir(parents=True)
+        (entry / "blob").write_bytes(b"x")
+        (entry / "link").symlink_to(entry / "blob")
+
+        ret = main(
+            [
+                "image",
+                "save",
+                "entry",
+                "--image-dir",
+                str(src),
+                "-o",
+                str(tmp_path / "e.tar"),
+                "--json",
+            ]
+        )
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert any("link" in w for w in payload["data"]["warnings"])

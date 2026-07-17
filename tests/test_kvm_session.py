@@ -118,6 +118,7 @@ class TestShouldAttemptReexec:
             ["image", "list"],
             ["image", "rm", "codex"],
             ["image", "prune"],
+            ["images"],
         ]
         for argv in skipped:
             assert _kvm_session._should_attempt_reexec(argv) is False, (
