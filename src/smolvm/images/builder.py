@@ -37,6 +37,7 @@ from pathlib import Path
 
 from smolvm.exceptions import ImageError, SmolVMError
 from smolvm.images.boot import BootImage, DirectKernelBoot
+from smolvm.images.manager import resolve_image_dir
 from smolvm.kernels import KernelArch, ensure_base_kernel_for_backend
 from smolvm.runtime.backends import resolve_backend
 from smolvm.runtime.boot_profiles import (
@@ -211,7 +212,7 @@ def _guest_agent_release_asset() -> tuple[str, str, str]:
 
 
 def _guest_agent_binary_cache_dir() -> Path:
-    return Path.home() / ".smolvm" / "images" / "_guest-agent"
+    return resolve_image_dir() / "_guest-agent"
 
 
 def _download_guest_agent_binary() -> Path:
@@ -428,9 +429,9 @@ class ImageBuilder:
 
         Args:
             cache_dir: Directory to store built images.
-                Defaults to ~/.smolvm/images/
+                Defaults to $SMOLVM_IMAGE_DIR or ~/.smolvm/images/
         """
-        self.cache_dir = cache_dir or (Path.home() / ".smolvm" / "images")
+        self.cache_dir = resolve_image_dir(cache_dir)
 
     def check_docker(self) -> bool:
         """Check if Docker is available and the daemon is reachable."""

@@ -13,6 +13,7 @@ from smolvm.cli.commands.options import (
     backend_option,
     boot_timeout_option,
     comm_channel_option,
+    image_dir_option,
     json_option,
     positive_float_type,
     positive_int_type,
@@ -355,7 +356,7 @@ def update(check_only: bool, json_output: bool) -> Any:
     return run_update(check=check_only, json_output=json_output)
 
 
-@cli.command("prune", help="Remove stale image-cache entries.")
+@cli.command("prune", help="Remove stale image-cache entries (alias for 'smolvm image prune').")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed.")
 @click.option("--cache-dir", default=None, hidden=True)
 @json_option
@@ -364,6 +365,101 @@ def prune(dry_run: bool, cache_dir: str | None, json_output: bool) -> Any:
     from smolvm.cli.prune import run_prune
 
     return run_prune(dry_run=dry_run, json_output=json_output, cache_dir=cache_dir)
+
+
+@cli.group(context_settings=CONTEXT_SETTINGS)
+def image() -> None:
+    """Download and manage cached sandbox images."""
+
+
+@image.command("pull")
+@click.argument("preset", metavar="preset")
+@click.option(
+    "--arch",
+    type=click.Choice(["amd64", "arm64"]),
+    default=None,
+    help="Guest CPU architecture; defaults to this machine's.",
+)
+@click.option(
+    "--vmm",
+    type=click.Choice(["firecracker", "qemu", "libkrun"]),
+    default=None,
+    help="Hypervisor the kernel is built for; defaults to this machine's runtime.",
+)
+@click.option(
+    "--os",
+    "os_name",
+    type=click.Choice(["ubuntu", "alpine"]),
+    default=None,
+    help="Guest OS flavour; defaults to ubuntu.",
+)
+@image_dir_option
+@json_option
+def image_pull(
+    preset: str,
+    arch: str | None,
+    vmm: str | None,
+    os_name: str | None,
+    image_dir: str | None,
+    json_output: bool,
+) -> Any:
+    """Download a sandbox image before first use."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_pull
+
+    return run_image_pull(
+        preset=preset,
+        arch=arch,
+        vmm=vmm,
+        os_name=os_name,
+        image_dir=image_dir,
+        json_output=json_output,
+    )
+
+
+@image.command("list")
+@image_dir_option
+@json_option
+def image_list(image_dir: str | None, json_output: bool) -> Any:
+    """Show downloaded images and how much space they use."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_list
+
+    return run_image_list(image_dir=image_dir, json_output=json_output)
+
+
+@image.command("rm")
+@click.argument("name", metavar="name-or-preset")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed.")
+@image_dir_option
+@json_option
+def image_rm(name: str, dry_run: bool, image_dir: str | None, json_output: bool) -> Any:
+    """Remove a downloaded image to free disk space."""
+    _before_command(json_output=json_output)
+    from smolvm.cli.image import run_image_rm
+
+    return run_image_rm(
+        name=name,
+        image_dir=image_dir,
+        dry_run=dry_run,
+        json_output=json_output,
+    )
+
+
+@image.command("prune", help="Remove image caches left behind by older SmolVM versions.")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed.")
+@image_dir_option
+@json_option
+def image_prune(dry_run: bool, image_dir: str | None, json_output: bool) -> Any:
+    _before_command(json_output=json_output)
+    from smolvm.cli.prune import run_prune
+
+    return run_prune(
+        dry_run=dry_run,
+        json_output=json_output,
+        cache_dir=image_dir,
+        command_name="image.prune",
+    )
 
 
 @cli.command("ui", help="Start the local dashboard.")

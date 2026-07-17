@@ -52,6 +52,15 @@ def json_option(fn: F) -> F:
     return click.option("--json", "json_output", is_flag=True, help="Output a JSON envelope.")(fn)
 
 
+def image_dir_option(fn: F) -> F:
+    return click.option(
+        "--image-dir",
+        default=None,
+        metavar="PATH",
+        help="Image cache directory (default: $SMOLVM_IMAGE_DIR or ~/.smolvm/images).",
+    )(fn)
+
+
 def backend_option(*, default: str | None = None) -> Callable[[F], F]:
     return click.option(
         "--backend",

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -42,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 # Chunk size for streaming downloads (8 KB)
 _DOWNLOAD_CHUNK_SIZE = 8192
+
+# Environment variable overriding where images and kernels are cached.
+IMAGE_DIR_ENV = "SMOLVM_IMAGE_DIR"
+
+
+def resolve_image_dir(image_dir: Path | str | None = None) -> Path:
+    """Resolve the image cache directory.
+
+    Priority: explicit argument, then ``$SMOLVM_IMAGE_DIR``, then
+    ``~/.smolvm/images``. The directory is not created here — read-only
+    consumers (listing, pruning) must tolerate a missing directory, and
+    downloads create it at write time.
+    """
+    if image_dir is not None:
+        return Path(image_dir).expanduser()
+    env_dir = os.environ.get(IMAGE_DIR_ENV, "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return Path.home() / ".smolvm" / "images"
 
 
 class ImageSource(BaseModel):
@@ -307,12 +327,12 @@ BUILTIN_IMAGES: dict[str, ImageSource] = {}
 class ImageManager:
     """Manages VM image downloads, caching, and verification.
 
-    Images are cached under ``~/.smolvm/images/<name>/``.
-    Downloads are atomic: written to a temporary file, SHA-256 verified,
-    then renamed into place so a partial download never corrupts the cache.
+    Images are cached under the directory returned by
+    :func:`resolve_image_dir` (``~/.smolvm/images`` unless overridden by
+    ``$SMOLVM_IMAGE_DIR``). Downloads are atomic: written to a temporary
+    file, SHA-256 verified, then renamed into place so a partial download
+    never corrupts the cache.
     """
-
-    DEFAULT_CACHE_DIR = Path.home() / ".smolvm" / "images"
 
     def __init__(
         self,
@@ -326,7 +346,7 @@ class ImageManager:
             registry: Override the built-in image registry.
                 Useful for testing or adding custom images.
         """
-        self.cache_dir = cache_dir or self.DEFAULT_CACHE_DIR
+        self.cache_dir = resolve_image_dir(cache_dir)
         self.registry = registry if registry is not None else dict(BUILTIN_IMAGES)
 
     def list_available(self) -> list[str]:

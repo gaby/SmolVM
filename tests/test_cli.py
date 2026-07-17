@@ -4326,3 +4326,201 @@ class TestPublishedImageLaunchPath:
         mock_vm.stop.assert_called_once()
         mock_vm.delete.assert_called_once()
         mock_vm.close.assert_called_once()
+
+
+class TestCliImage:
+    """Tests for the `smolvm image` command group."""
+
+    def test_image_group_help(self) -> None:
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(build_cli(), ["image", "--help"])
+        assert result.exit_code == 0
+        for verb in ("pull", "list", "rm", "prune"):
+            assert verb in result.output
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_image_pull_json_already_cached(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A cache hit (no download callback fired) reports already_cached."""
+        from smolvm.images.manager import LocalImage
+        from smolvm.images.published import cache_name
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_ensure_published.return_value = LocalImage(
+            name="codex-cache",
+            kernel_path=kernel,
+            rootfs_path=rootfs,
+        )
+
+        ret = main(["image", "pull", "codex", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.pull"
+        assert payload["ok"] is True
+        assert payload["data"]["preset"] == "codex"
+        assert payload["data"]["arch"] == "amd64"
+        assert payload["data"]["vmm"] == "firecracker"
+        assert payload["data"]["os"] == "ubuntu"
+        assert payload["data"]["name"] == cache_name("codex", "amd64", "firecracker")
+        assert payload["data"]["already_cached"] is True
+        mock_ensure_published.assert_called_once()
+        call = mock_ensure_published.call_args
+        assert call.args == ("codex", "amd64", "firecracker", "ubuntu")
+        assert call.kwargs["cache_dir"] == tmp_path
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_image_pull_json_downloads(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A fresh download (callback fired) reports already_cached=False."""
+        from smolvm.images.manager import LocalImage
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+
+        def fake_ensure(*args: object, **kwargs: object) -> LocalImage:
+            on_download = kwargs["on_download"]
+            assert callable(on_download)
+            on_download("kernel", 1024, 2048)
+            on_download("rootfs", 512, 512)
+            return LocalImage(name="codex-cache", kernel_path=kernel, rootfs_path=rootfs)
+
+        mock_ensure_published.side_effect = fake_ensure
+
+        ret = main(["image", "pull", "codex", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["data"]["already_cached"] is False
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="qemu")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="arm64")
+    def test_image_pull_claude_alias(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The public `claude` name maps to the claude-code manifest preset."""
+        from smolvm.images.manager import LocalImage
+
+        kernel = tmp_path / "vmlinux.bin"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_ensure_published.return_value = LocalImage(
+            name="claude-cache", kernel_path=kernel, rootfs_path=rootfs
+        )
+
+        ret = main(["image", "pull", "claude", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["data"]["preset"] == "claude-code"
+        assert mock_ensure_published.call_args.args == ("claude-code", "arm64", "qemu", "ubuntu")
+
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_image_pull_unknown_preset_json(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        ret = main(["image", "pull", "nosuchpreset", "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.pull"
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_input"
+        assert "codex" in payload["error"]["message"]
+
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_image_pull_unpublished_combo_json(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A valid preset with an unpublished os flavour names the default recovery."""
+        ret = main(["image", "pull", "hermes", "--os", "alpine", "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert "smolvm image pull hermes" in payload["error"]["message"]
+
+    @patch(
+        "smolvm.cli.main._host_arch_for_published",
+        side_effect=RuntimeError("Unsupported host architecture for published images: 'mips'."),
+    )
+    def test_image_pull_unsupported_host_json(
+        self,
+        mock_arch: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """An undetectable host platform asks for explicit --arch/--vmm."""
+        ret = main(["image", "pull", "codex", "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+        assert "--arch amd64 --vmm firecracker" in payload["error"]["message"]
+
+    @patch("smolvm.images.published.ensure_published_image")
+    @patch("smolvm.cli.main._vmm_for_host", return_value="firecracker")
+    @patch("smolvm.cli.main._host_arch_for_published", return_value="amd64")
+    def test_image_pull_download_failure_json(
+        self,
+        mock_arch: MagicMock,
+        mock_vmm: MagicMock,
+        mock_ensure_published: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from smolvm.exceptions import ImageError
+
+        mock_ensure_published.side_effect = ImageError("Download failed for https://…: 403")
+
+        ret = main(["image", "pull", "codex", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert "smolvm image pull codex" in payload["error"]["recovery"]
+
+    def test_image_pull_parse_error_command_name(self, capsys: pytest.CaptureFixture) -> None:
+        """Parse-time errors carry the dotted image.pull command name."""
+        ret = main(["image", "pull", "--not-a-flag", "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.pull"
+        assert "smolvm image pull --help" in payload["error"]["recovery"]

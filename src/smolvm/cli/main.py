@@ -3058,6 +3058,7 @@ def _command_name_from_argv(args: Sequence[str]) -> str:
         "windows",
         "browser",
         "server",
+        "image",
         "codex",
         "claude",
         "openclaw",

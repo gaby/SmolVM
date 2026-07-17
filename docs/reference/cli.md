@@ -9,7 +9,7 @@ The CLI creates and manages disposable sandboxes. Run `smolvm COMMAND --help` fo
 | `smolvm setup` | Install or check local runtime dependencies. |
 | `smolvm doctor` | Check whether this machine can run sandboxes. |
 | `smolvm update` | Upgrade to the latest stable release. |
-| `smolvm prune` | Remove stale cached images. |
+| `smolvm prune` | Remove stale cached images (alias for `smolvm image prune`). |
 
 ## Work with sandboxes
 
@@ -36,6 +36,19 @@ Run these in the order you need them:
 ## Start a prepared agent
 
 `smolvm codex start`, `smolvm claude start`, `smolvm pi start`, `smolvm hermes start`, and `smolvm openclaw start` create a sandbox and install that agent. See [Agent presets](../guides/agent-presets.md).
+
+## Manage downloaded images
+
+The first time you start a sandbox or agent, SmolVM downloads the files it boots from and keeps them on disk so later starts are fast. These commands manage that storage:
+
+| Command | Use it to |
+| --- | --- |
+| `smolvm image pull <preset>` | Download an image ahead of time, for example before going offline. |
+| `smolvm image list` | See which images are downloaded and how much space they use. |
+| `smolvm image rm <name>` | Remove a downloaded image to free disk space. |
+| `smolvm image prune` | Remove images left behind by older SmolVM versions. |
+
+Images are stored in `~/.smolvm/images`. To store them somewhere else, set the `SMOLVM_IMAGE_DIR` environment variable, or pass `--image-dir` to any `smolvm image` command.
 
 ## Browser, local services, and Windows
 

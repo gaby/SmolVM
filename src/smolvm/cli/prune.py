@@ -22,7 +22,7 @@ from pathlib import Path
 
 from smolvm import __version__
 from smolvm.cli.output import console_stdout, emit_json
-from smolvm.images.manager import ImageManager
+from smolvm.images.manager import resolve_image_dir
 
 
 def _total_size(path: Path) -> int:
@@ -53,7 +53,7 @@ def find_stale_caches(
     differs from ``current_version`` are considered stale. Unversioned
     directories (e.g. ``s3/``) and the current version are left alone.
     """
-    root = cache_dir or ImageManager.DEFAULT_CACHE_DIR
+    root = resolve_image_dir(cache_dir)
     if not root.is_dir():
         return []
     stale: list[Path] = []
@@ -71,14 +71,15 @@ def run_prune(
     dry_run: bool = False,
     json_output: bool = False,
     cache_dir: str | None = None,
+    command_name: str = "prune",
 ) -> int:
-    """Execute ``smolvm prune``."""
+    """Execute ``smolvm prune`` (also exposed as ``smolvm image prune``)."""
     cache_root = Path(cache_dir) if cache_dir else None
     stale = find_stale_caches(cache_dir=cache_root)
 
     if not stale:
         if json_output:
-            emit_json("prune", 0, data={"removed": [], "freed_bytes": 0})
+            emit_json(command_name, 0, data={"removed": [], "freed_bytes": 0})
         else:
             console = console_stdout()
             console.print("Nothing to prune — cache is clean.")
@@ -94,7 +95,7 @@ def run_prune(
     if dry_run:
         if json_output:
             emit_json(
-                "prune",
+                command_name,
                 0,
                 data={
                     "dry_run": True,
@@ -119,7 +120,7 @@ def run_prune(
 
     if json_output:
         emit_json(
-            "prune",
+            command_name,
             0,
             data={
                 "removed": [str(p) for p in stale],
