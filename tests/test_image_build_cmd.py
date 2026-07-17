@@ -416,3 +416,68 @@ class TestBuildValidation:
         assert ret == 0
         payload = json.loads(capsys.readouterr().out)
         assert any("sub/Dockerfile" in w for w in payload["data"]["warnings"])
+
+
+class TestUpstreamReviewRegressions:
+    def test_leading_dot_tag_rejected(
+        self, build_ctx: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A dot-prefixed tag would build an image invisible to image list
+        (regression)."""
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                ".hidden",
+                str(build_ctx),
+                "--image-dir",
+                str(tmp_path / "cache"),
+                "--json",
+            ]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+
+    @patch("smolvm.images.builder.DockerRootfsBuilder._build_rootfs")
+    @patch("smolvm.images.builder.ensure_base_kernel_for_backend")
+    @patch("smolvm.images.builder.ImageBuilder.check_docker", return_value=True)
+    def test_snippet_paths_are_repr_escaped(
+        self,
+        _mock_docker: MagicMock,
+        mock_kernel: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The printed Python snippet must stay valid for paths containing
+        quotes (regression)."""
+        ctx = tmp_path / 'ctx "quoted"'
+        ctx.mkdir()
+        (ctx / "Dockerfile").write_text("FROM scratch\n")
+        kernel = tmp_path / "vmlinux.image"
+        kernel.write_bytes(b"k")
+        mock_kernel.return_value = kernel
+        mock_build.side_effect = _fake_build_rootfs
+
+        ret = main(
+            [
+                "image",
+                "build",
+                "-t",
+                "myimg",
+                str(ctx),
+                "--backend",
+                "qemu",
+                "--arch",
+                "amd64",
+                "--image-dir",
+                str(tmp_path / "cache"),
+            ]
+        )
+
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "rootfs_path='" in out.replace("\n", "")

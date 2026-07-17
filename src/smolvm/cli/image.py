@@ -150,7 +150,7 @@ def _valid_entry_name(requested: str) -> bool:
     return (
         segments[0] == _CUSTOM_DIR
         and len(segments) in {2, 3}
-        and all(_SAFE_SEGMENT_RE.match(seg) for seg in segments[1:])
+        and all(_SAFE_SEGMENT_RE.match(seg) and not seg.startswith(".") for seg in segments[1:])
     )
 
 
@@ -273,6 +273,17 @@ def _entry_kind(path: Path, root: Path) -> str:
     if _KERNEL_DIR_NAME_RE.match(path.name):
         return "kernel"
     return "other"
+
+
+def _brief_error(exc: BaseException, limit: int = 160) -> str:
+    """One short line of an exception, for user-facing messages.
+
+    Full tracebacks, multi-line output, and long URLs belong in logs, not
+    in error envelopes.
+    """
+    text = str(exc).strip()
+    text = text.splitlines()[0] if text else exc.__class__.__name__
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _classify(path: Path, size_bytes: int | None = None) -> ImageRow:
@@ -711,14 +722,14 @@ def run_image_pull(
     except ImageError as exc:
         return _fail(
             command_name,
-            f"Could not download the image: {exc}",
+            f"Could not download the image: {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Check your network connection and retry '{retry_command}'.",
         )
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not save the image: {exc}",
+            f"Could not save the image: {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Free up disk space or fix permissions on '{root}', "
             f"then retry '{retry_command}'.",
@@ -726,7 +737,7 @@ def run_image_pull(
     except Exception as exc:
         return _fail(
             command_name,
-            f"Could not get the image: {exc}",
+            f"Could not get the image: {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Retry '{retry_command}'.",
         )
@@ -817,7 +828,9 @@ def run_image_pull_all(
                     )
                 )
             except Exception as exc:
-                failed.append(PullFailure(preset=target_preset, os=target_os, error=str(exc)))
+                failed.append(
+                    PullFailure(preset=target_preset, os=target_os, error=_brief_error(exc))
+                )
 
     payload = ImagePullAllPayload(
         arch=resolved_arch,
@@ -874,7 +887,7 @@ def run_image_list(
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not read the image folder '{root}': {exc}",
+            f"Could not read the image folder '{root}': {_brief_error(exc)}",
             json_output=json_output,
             recovery="Fix the folder's permissions and run 'smolvm image list' again.",
         )
@@ -1023,7 +1036,7 @@ def run_image_inspect(
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not read the image folder '{root}': {exc}",
+            f"Could not read the image folder '{root}': {_brief_error(exc)}",
             json_output=json_output,
             recovery="Fix the folder's permissions, then retry "
             f"'smolvm image inspect {requested}'.",
@@ -1118,7 +1131,7 @@ def run_image_rm(
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not read the image folder '{root}': {exc}",
+            f"Could not read the image folder '{root}': {_brief_error(exc)}",
             json_output=json_output,
             recovery=permission_recovery,
         )
@@ -1217,9 +1230,10 @@ def run_image_build(
         tag, context_path, dockerfile, size_mb, build_args, arch, backend, init, image_dir
     )
 
-    if not _SAFE_SEGMENT_RE.match(tag) or tag in {".", ".."}:
-        # The builder's own charset is slightly looser (it allows "." and
-        # ".."), which would let a tag escape the custom/ namespace.
+    if not _SAFE_SEGMENT_RE.match(tag) or tag.startswith("."):
+        # The builder's own charset is slightly looser: ".." would escape
+        # the custom/ namespace, and dot-prefixed names would be hidden by
+        # 'image list'.
         return _fail(
             command_name,
             f"'{tag}' can't be used as an image name. Use letters, numbers, "
@@ -1272,20 +1286,28 @@ def run_image_build(
     # "Dockerfile" (any depth) are reserved by the builder and skipped.
     context: dict[str, DockerContextValue] = {}
     warnings: list[str] = []
-    resolved_dockerfile = dockerfile_path.resolve()
-    for f in sorted(context_dir.rglob("*")):
-        if f.is_symlink() or not f.is_file():
-            continue
-        if f.resolve() == resolved_dockerfile:
-            continue
-        if f.name.lower() == "dockerfile":
-            skipped_path = f.relative_to(context_dir).as_posix()
-            warnings.append(
-                f"Skipped '{skipped_path}': files named Dockerfile can't be "
-                "part of the build context. Rename it to include it."
-            )
-            continue
-        context[f.relative_to(context_dir).as_posix()] = f
+    try:
+        resolved_dockerfile = dockerfile_path.resolve()
+        for f in sorted(context_dir.rglob("*")):
+            if f.is_symlink() or not f.is_file():
+                continue
+            if f.resolve() == resolved_dockerfile:
+                continue
+            if f.name.lower() == "dockerfile":
+                skipped_path = f.relative_to(context_dir).as_posix()
+                warnings.append(
+                    f"Skipped '{skipped_path}': files named Dockerfile can't be "
+                    "part of the build context. Rename it to include it."
+                )
+                continue
+            context[f.relative_to(context_dir).as_posix()] = f
+    except OSError as exc:
+        return _fail(
+            command_name,
+            f"Could not read the folder '{context_path}': {_brief_error(exc)}",
+            json_output=json_output,
+            recovery=f"Fix the folder's permissions, then retry '{retry_command}'.",
+        )
 
     try:
         builder = DockerRootfsBuilder(
@@ -1328,7 +1350,7 @@ def run_image_build(
     except (ImageError, ValueError) as exc:
         return _fail(
             command_name,
-            str(exc),
+            _brief_error(exc, limit=400),
             json_output=json_output,
             code="invalid_input" if isinstance(exc, ValueError) else "runtime_error",
             recovery=f"Fix the problem above, then retry '{retry_command}'.",
@@ -1337,7 +1359,7 @@ def run_image_build(
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not write the image: {exc}",
+            f"Could not write the image: {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Free up disk space, then retry '{retry_command}'.",
         )
@@ -1379,11 +1401,11 @@ def run_image_build(
             f"  kernel: {payload['kernel_path']}\n\n"
             "Boot it from Python with:\n"
             "  [bold]from smolvm import BootImage, DirectKernelBoot, SmolVM\n"
-            f'  image = BootImage(name="{tag}",\n'
-            f'                    rootfs_path="{payload["rootfs_path"]}",\n'
-            f'                    rootfs_format="raw-ext4",\n'
-            f'                    kernel_path="{payload["kernel_path"]}",\n'
-            f'                    boot=DirectKernelBoot(init="{init}"))\n'
+            f"  image = BootImage(name={tag!r},\n"
+            f"                    rootfs_path={payload['rootfs_path']!r},\n"
+            f"                    rootfs_format='raw-ext4',\n"
+            f"                    kernel_path={payload['kernel_path']!r},\n"
+            f"                    boot=DirectKernelBoot(init={init!r}))\n"
             "  with SmolVM.from_image(image) as vm:\n"
             "      vm.start()[/bold]\n\n"
             f"Manage it with 'smolvm image list' and 'smolvm image rm {_CUSTOM_DIR}/{tag}'.",

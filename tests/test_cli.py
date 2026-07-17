@@ -4336,7 +4336,7 @@ class TestCliImage:
 
         result = CliRunner().invoke(build_cli(), ["image", "--help"])
         assert result.exit_code == 0
-        for verb in ("pull", "list", "rm", "prune"):
+        for verb in ("pull", "list", "ls", "inspect", "build", "save", "load", "rm", "prune"):
             assert verb in result.output
 
     @patch("smolvm.images.published.ensure_published_image")

@@ -144,7 +144,12 @@ def run_prune(
         return 0
 
     for path in stale:
-        shutil.rmtree(path)
+        # A stale-named entry may be a symlink; remove the link itself
+        # rather than following it (rmtree refuses symlinks anyway).
+        if path.is_symlink():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
 
     if json_output:
         emit_json(

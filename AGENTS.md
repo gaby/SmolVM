@@ -39,6 +39,10 @@ SmolVM is specifically designed to provide a secure "sandbox" for AI agents to e
 - When adding a new harness or resource, register it as a top-level
   subcommand and put its actions underneath, instead of overloading a
   global verb.
+- Documented exceptions: the top-level `smolvm prune` and `smolvm images`
+  aliases exist for muscle memory (`images` mirrors `docker images`); both
+  delegate to their NOUN-VERB homes (`image prune`, `image list`). Do not
+  add further top-level aliases without discussion.
 
 
 ### Core writing principles

@@ -1011,3 +1011,51 @@ class TestPullAllRecovery:
         recovery = payload["error"]["recovery"]
         assert "smolvm image pull --all" in recovery
         assert "--os" not in recovery
+
+
+class TestUpstreamReviewRegressions:
+    def test_image_ls_parse_error_reports_list_envelope(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Usage errors on the ls alias must report the canonical
+        image.list command (regression: argv fallback said image.ls)."""
+        ret = main(["image", "ls", "--not-a-flag", "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "image.list"
+
+    def test_prune_unlinks_symlinked_stale_entries(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Prune must unlink symlinked entries, not crash rmtree, and must
+        never follow the link (regression)."""
+        real = tmp_path / "real-data"
+        real.mkdir()
+        (real / "keep").write_text("keep")
+        (tmp_path / "codex-v0.0.1-amd64-firecracker").symlink_to(real)
+
+        ret = main(["prune", "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 0
+        capsys.readouterr()
+        assert not (tmp_path / "codex-v0.0.1-amd64-firecracker").exists()
+        assert (real / "keep").exists()
+
+    def test_guest_agent_cache_dir_honors_explicit_cache_dir(self, tmp_path: Path) -> None:
+        """An explicit builder cache_dir must reach the guest-agent cache
+        (regression: it always used the global default)."""
+        from smolvm.images.builder import _guest_agent_binary_cache_dir
+
+        assert _guest_agent_binary_cache_dir(tmp_path) == tmp_path / "_guest-agent"
+
+    @pytest.mark.parametrize("name", ["custom/.hidden", "custom/web/.fp"])
+    def test_dot_prefixed_custom_segments_rejected(
+        self, name: str, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Dot-prefixed custom names would be invisible to image list."""
+        ret = main(["image", "rm", name, "--image-dir", str(tmp_path), "--json"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"

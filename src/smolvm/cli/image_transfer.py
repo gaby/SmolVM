@@ -16,9 +16,10 @@
 
 The archive is a plain tar containing exactly one ``manifest.json``
 (schema_version 1) that describes every ``files/<path>`` member: its
-encoding (``raw`` bytes or a ``zstd`` stream) and its decoded size. Member
-names never carry encoding suffixes, so sibling files like ``x`` and
-``x.zst`` can't collide. Large files travel as zstd streams so sparse
+encoding (``raw`` bytes or a ``zstd`` stream), its decoded size, and the
+SHA-256 digest of the stored bytes, all verified on load. Member names
+never carry encoding suffixes, so sibling files like ``x`` and ``x.zst``
+can't collide. Large files travel as zstd streams so sparse
 rootfs images stay small; the decompressed ``rootfs.ext4`` and its sidecar
 are omitted entirely when the compressed ``rootfs.ext4.zst`` is present and
 are recreated on load, byte-compatible with what ``ensure_published_image``
@@ -30,6 +31,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import re
 import shlex
 import shutil
 import tarfile
@@ -42,6 +45,7 @@ from typing import Any, TypedDict
 from smolvm import __version__
 from smolvm.cli.image import (
     _IMAGE_DIR_NAME_RE,
+    _brief_error,
     _entry_kind,
     _expand_custom_entries,
     _fail,
@@ -82,6 +86,17 @@ class ImageLoadPayload(TypedDict):
     size_bytes: int
     files: int
     warnings: list[str]
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(_COPY_CHUNK):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _valid_relative_file_path(path: str) -> bool:
@@ -147,7 +162,7 @@ def run_image_save(
     except OSError as exc:
         return _fail(
             command_name,
-            f"Could not read the image folder '{root}': {exc}",
+            f"Could not read the image folder '{root}': {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Fix the folder's permissions, then retry '{retry_command}'.",
         )
@@ -172,7 +187,10 @@ def run_image_save(
     entry = matches[0]
     archive_name = entry.relative_to(root).as_posix()
 
-    zst_present = (entry / _ROOTFS_ZST).is_file()
+    zst_path = entry / _ROOTFS_ZST
+    # A symlinked wire file is skipped by the archive loop below, so
+    # treating it as present would produce an archive with no rootfs.
+    zst_present = zst_path.is_file() and not zst_path.is_symlink()
     excluded = {_DECOMPRESSED_ROOTFS, _ROOTFS_SIDECAR} if zst_present else set()
     sidecar_value: str | None = None
     if zst_present and (entry / _ROOTFS_SIDECAR).is_file():
@@ -185,7 +203,7 @@ def run_image_save(
     files_meta: list[dict[str, Any]] = []
     # Write to a sibling temp file and rename at the end so a failed save
     # never destroys an existing archive at the -o path.
-    partial_archive = out_path.with_name(out_path.name + ".partial")
+    partial_archive = out_path.with_name(f"{out_path.name}.partial-{os.getpid()}")
     compressor = zstandard.ZstdCompressor(threads=-1)
     try:
         tmp_parent = str(out_path.parent) if out_path.parent.is_dir() else None
@@ -207,14 +225,28 @@ def run_image_save(
                 if rel in excluded or rel == ".build.lock":
                     continue
                 if rel.endswith(".zst"):
-                    files_meta.append({"path": rel, "encoding": "raw", "size": f.stat().st_size})
+                    files_meta.append(
+                        {
+                            "path": rel,
+                            "encoding": "raw",
+                            "size": f.stat().st_size,
+                            "sha256": _sha256_file(f),
+                        }
+                    )
                     tar.add(f, arcname=f"files/{rel}", recursive=False)
                 else:
                     # Compress into one reused scratch file, add, discard —
                     # scratch usage stays bounded by a single member.
                     with open(f, "rb") as src, open(scratch, "wb") as dst:
                         compressor.copy_stream(src, dst)
-                    files_meta.append({"path": rel, "encoding": "zstd", "size": f.stat().st_size})
+                    files_meta.append(
+                        {
+                            "path": rel,
+                            "encoding": "zstd",
+                            "size": f.stat().st_size,
+                            "sha256": _sha256_file(scratch),
+                        }
+                    )
                     tar.add(scratch, arcname=f"files/{rel}", recursive=False)
                     scratch.unlink()
 
@@ -237,7 +269,7 @@ def run_image_save(
             partial_archive.unlink(missing_ok=True)
         return _fail(
             command_name,
-            f"Could not write '{out_path}': {exc}",
+            f"Could not write '{out_path}': {_brief_error(exc)}",
             json_output=json_output,
             recovery=f"Free up disk space or fix permissions, then retry '{retry_command}'.",
         )
@@ -305,7 +337,7 @@ def run_image_load(
     except (OSError, tarfile.TarError) as exc:
         return _fail(
             command_name,
-            f"Could not open '{in_path}': {exc}",
+            f"Could not open '{in_path}': {_brief_error(exc)}",
             json_output=json_output,
             code="invalid_input",
             recovery=not_an_archive,
@@ -356,6 +388,8 @@ def run_image_load(
                 or not isinstance(meta.get("size"), int)
                 or isinstance(meta.get("size"), bool)
                 or meta["size"] < 0
+                or not isinstance(meta.get("sha256"), str)
+                or not _SHA256_RE.match(meta["sha256"])
                 or not _valid_relative_file_path(meta["path"])
             ):
                 return bad_archive()
@@ -389,7 +423,7 @@ def run_image_load(
         have_sidecar = isinstance(manifest_sidecar, str) and bool(manifest_sidecar)
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.parent / f".{target.name}.partial"
+        partial = target.parent / f".{target.name}.partial-{os.getpid()}"
         shutil.rmtree(partial, ignore_errors=True)
         try:
             partial.mkdir()
@@ -401,32 +435,36 @@ def run_image_load(
                 source = tar.extractfile(member)
                 if source is None:
                     raise tarfile.TarError(f"could not read '{member.name}' from the archive")
+                # Every member's bytes are verified against the manifest
+                # digest before use; the rootfs digest doubles as the
+                # sidecar fallback.
+                hasher = hashlib.sha256()
                 if meta["encoding"] == "raw":
-                    # The digest feeds the sidecar fallback; skip the work
-                    # when the manifest already carries the sidecar value.
-                    hasher = (
-                        hashlib.sha256()
-                        if meta["path"] == _ROOTFS_ZST and not have_sidecar
-                        else None
-                    )
                     with source, open(destination, "wb") as out:
                         while chunk := source.read(_COPY_CHUNK):
                             out.write(chunk)
-                            if hasher is not None:
-                                hasher.update(chunk)
-                    if hasher is not None:
-                        zst_sha = hasher.hexdigest()
+                            hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                    if digest != meta["sha256"]:
+                        raise zstandard.ZstdError(f"'{meta['path']}' failed its integrity check")
                 else:
                     tmp_zst = destination.with_name(destination.name + ".tmp.zst")
                     with source, open(tmp_zst, "wb") as out:
                         while chunk := source.read(_COPY_CHUNK):
                             out.write(chunk)
+                            hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                    if digest != meta["sha256"]:
+                        tmp_zst.unlink()
+                        raise zstandard.ZstdError(f"'{meta['path']}' failed its integrity check")
                     decompress_zstd_sparse(tmp_zst, destination)
                     tmp_zst.unlink()
                 if destination.stat().st_size != meta["size"]:
                     raise zstandard.ZstdError(
                         f"'{meta['path']}' does not match the size the archive declares"
                     )
+                if meta["path"] == _ROOTFS_ZST:
+                    zst_sha = digest
 
             # Recreate what save deliberately left out, byte-compatible with
             # what ensure_published_image validates on the next start.
@@ -452,7 +490,7 @@ def run_image_load(
             shutil.rmtree(partial, ignore_errors=True)
             return _fail(
                 command_name,
-                f"Could not load the image: {exc}",
+                f"Could not load the image: {_brief_error(exc)}",
                 json_output=json_output,
                 recovery="Free up disk space or fix permissions, then retry "
                 f"'smolvm image load -i {quoted_input}'.",

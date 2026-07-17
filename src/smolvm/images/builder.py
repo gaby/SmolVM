@@ -211,17 +211,17 @@ def _guest_agent_release_asset() -> tuple[str, str, str]:
     return url, asset_name, expected_sha256
 
 
-def _guest_agent_binary_cache_dir() -> Path:
-    return resolve_image_dir() / "_guest-agent"
+def _guest_agent_binary_cache_dir(cache_dir: Path | None = None) -> Path:
+    return resolve_image_dir(cache_dir) / "_guest-agent"
 
 
-def _download_guest_agent_binary() -> Path:
+def _download_guest_agent_binary(image_cache_dir: Path | None = None) -> Path:
     """Download and cache the pinned Rust guest-agent binary for installed wheels."""
     from smolvm.images.published import _images_release_tag
 
     url, asset_name, expected_sha256 = _guest_agent_release_asset()
     cache_dir = (
-        _guest_agent_binary_cache_dir()
+        _guest_agent_binary_cache_dir(image_cache_dir)
         / _images_release_tag()
         / to_published_arch(platform.machine())
     )
@@ -269,13 +269,13 @@ def _download_guest_agent_binary() -> Path:
                 tmp_path.unlink()
 
 
-def _guest_agent_binary() -> Path:
+def _guest_agent_binary(cache_dir: Path | None = None) -> Path:
     """Build and return the Rust guest-agent binary used by rootfs builders."""
     configured = _configured_guest_agent_binary()
     if configured is not None:
         return configured
     if not _has_guest_agent_source_checkout():
-        return _download_guest_agent_binary()
+        return _download_guest_agent_binary(cache_dir)
 
     target = _guest_agent_target_triple()
     binary_path = _guest_agent_binary_path()
@@ -2118,7 +2118,7 @@ echo "Device-approver running with PID=${DEVICE_APPROVER_PID}"
             # Write Dockerfile and init script
             (tmp_path / "Dockerfile").write_text(dockerfile_content)
             (tmp_path / "init").write_text(init_script)
-            shutil.copy2(_guest_agent_binary(), tmp_path / _GUEST_AGENT_BUILD_FILE)
+            shutil.copy2(_guest_agent_binary(self.cache_dir), tmp_path / _GUEST_AGENT_BUILD_FILE)
             if extra_files:
                 for filename, content in extra_files.items():
                     (tmp_path / filename).write_text(content)

@@ -367,8 +367,18 @@ class TestArchiveRobustness:
                 "name": "codex-v0.0.1-amd64-firecracker",
                 "rootfs_sidecar": None,
                 "files": [
-                    {"path": "vmlinux.bin", "encoding": "raw", "size": 4},
-                    {"path": "rootfs.ext4.zst", "encoding": "raw", "size": 4},
+                    {
+                        "path": "vmlinux.bin",
+                        "encoding": "raw",
+                        "size": 4,
+                        "sha256": hashlib.sha256(b"kern").hexdigest(),
+                    },
+                    {
+                        "path": "rootfs.ext4.zst",
+                        "encoding": "raw",
+                        "size": 4,
+                        "sha256": hashlib.sha256(b"zstd").hexdigest(),
+                    },
                 ],
             },
             [("files/vmlinux.bin", b"kern")],
@@ -391,7 +401,14 @@ class TestArchiveRobustness:
                 "schema_version": 1,
                 "name": "entry",
                 "rootfs_sidecar": None,
-                "files": [{"path": "blob", "encoding": "raw", "size": 3}],
+                "files": [
+                    {
+                        "path": "blob",
+                        "encoding": "raw",
+                        "size": 3,
+                        "sha256": hashlib.sha256(b"0123456789").hexdigest(),
+                    }
+                ],
             },
             [("files/blob", b"0123456789")],
         )
@@ -475,7 +492,7 @@ class TestArchiveRobustness:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is False
         assert archive.read_bytes() == b"OLD ARCHIVE"
-        assert not archive.with_name("precious.tar.partial").exists()
+        assert not list(archive.parent.glob("precious.tar.partial*"))
 
     def test_save_warns_about_skipped_links(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
@@ -502,3 +519,92 @@ class TestArchiveRobustness:
         assert ret == 0
         payload = json.loads(capsys.readouterr().out)
         assert any("link" in w for w in payload["data"]["warnings"])
+
+
+class TestUpstreamReviewRegressions:
+    def test_symlinked_zst_is_treated_as_absent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A symlinked wire file must not produce an archive with no rootfs
+        (regression: is_file() followed the link, excluding the real one)."""
+        src = tmp_path / "src"
+        entry = src / "entry"
+        entry.mkdir(parents=True)
+        real_zst = tmp_path / "elsewhere.zst"
+        real_zst.write_bytes(zstandard.compress(b"data"))
+        (entry / "rootfs.ext4.zst").symlink_to(real_zst)
+        (entry / "rootfs.ext4").write_bytes(b"decompressed")
+        archive = tmp_path / "e.tar"
+
+        ret = main(
+            ["image", "save", "entry", "--image-dir", str(src), "-o", str(archive), "--json"]
+        )
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["data"]["excluded_decompressed_rootfs"] is False
+        with tarfile.open(archive) as tar:
+            names = tar.getnames()
+        # The real decompressed rootfs travels (zstd-encoded, suffix-free).
+        assert "files/rootfs.ext4" in names
+
+        dest = tmp_path / "dest"
+        assert main(["image", "load", "-i", str(archive), "--image-dir", str(dest), "--json"]) == 0
+        capsys.readouterr()
+        assert (dest / "entry" / "rootfs.ext4").read_bytes() == b"decompressed"
+
+    def test_corrupted_member_bytes_are_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Same-length corruption must fail the per-file digest check
+        (regression: size-only validation let it load)."""
+        archive = tmp_path / "tampered.tar"
+        _write_archive(
+            archive,
+            {
+                "schema_version": 1,
+                "name": "entry",
+                "rootfs_sidecar": None,
+                "files": [
+                    {
+                        "path": "blob",
+                        "encoding": "raw",
+                        "size": 10,
+                        "sha256": hashlib.sha256(b"0123456789").hexdigest(),
+                    }
+                ],
+            },
+            [("files/blob", b"0123456780")],  # same length, one byte off
+        )
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(tmp_path / "dest"), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "damaged" in payload["error"]["message"]
+        assert not (tmp_path / "dest" / "entry").exists()
+
+    def test_manifest_without_sha256_is_rejected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        archive = tmp_path / "nosha.tar"
+        _write_archive(
+            archive,
+            {
+                "schema_version": 1,
+                "name": "entry",
+                "rootfs_sidecar": None,
+                "files": [{"path": "blob", "encoding": "raw", "size": 4}],
+            },
+            [("files/blob", b"data")],
+        )
+
+        ret = main(
+            ["image", "load", "-i", str(archive), "--image-dir", str(tmp_path / "dest"), "--json"]
+        )
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
