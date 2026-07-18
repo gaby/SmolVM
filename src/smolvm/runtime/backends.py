@@ -354,11 +354,17 @@ def ensure_backend_available(
             suggestion is exactly runnable.
 
     Raises:
+        ValueError: If *backend* is not a recognized backend.
         SmolVMError: If the backend's required tooling isn't present.
     """
     if status is None:
         status = _backend_status(backend)
-    if status is None or status.available:
+    if status is None:
+        # An unrecognized backend has no tooling to verify; treat it as a usage
+        # error rather than silently reporting the backend as available.
+        supported = ", ".join(sorted(SUPPORTED_BACKENDS))
+        raise ValueError(f"Unsupported backend '{backend}'. Supported values: {supported}")
+    if status.available:
         return
     message = status.message
     if vm_name and backend == BACKEND_FIRECRACKER:

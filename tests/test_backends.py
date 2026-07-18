@@ -193,6 +193,12 @@ def test_ensure_backend_available_raises_for_missing_libkrun() -> None:
         ensure_backend_available(BACKEND_LIBKRUN)
 
 
+def test_ensure_backend_available_rejects_unknown_backend() -> None:
+    # An unrecognized backend must not silently report success.
+    with pytest.raises(ValueError, match="Unsupported backend 'xen'"):
+        ensure_backend_available("xen")
+
+
 # --- probe details ---------------------------------------------------------
 
 
