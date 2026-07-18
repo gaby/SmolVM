@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 from pathlib import Path
+from typing import NamedTuple
 
 from smolvm.exceptions import SmolVMError
 from smolvm.utils import which  # noqa: F401 — imported for test patching
@@ -37,6 +38,26 @@ SUPPORTED_BACKENDS = {BACKEND_FIRECRACKER, BACKEND_QEMU, BACKEND_LIBKRUN}
 # Kept in sync with ``smolvm.host.manager.HostManager.BIN_DIR``; duplicated here
 # so backend selection stays free of the heavier host-manager import.
 _LOCAL_BIN_DIR = Path.home() / ".smolvm" / "bin"
+_KVM_DEVICE = Path("/dev/kvm")
+
+
+class BackendStatus(NamedTuple):
+    """Result of probing one backend's host tooling.
+
+    Attributes:
+        available: The backend is fully installed and runnable here.
+        primary_present: The backend's main binary/library is present even if a
+            secondary requirement (KVM access, ``qemu-img``) is missing. Used to
+            pick the most-relevant backend to report when none is fully runnable.
+        message: Plain-English recovery when not ``available`` (else ``None``).
+    """
+
+    available: bool
+    primary_present: bool
+    message: str | None
+
+
+# --- low-level probes (patched directly in tests) --------------------------
 
 
 def _qemu_system_candidates() -> tuple[str, ...]:
@@ -49,22 +70,30 @@ def _qemu_system_candidates() -> tuple[str, ...]:
     return ("qemu-system-aarch64", "qemu-system-x86_64")
 
 
-def firecracker_available() -> bool:
-    """Return whether a usable Firecracker binary is installed.
-
-    Looks on ``PATH`` first, then the private ``~/.smolvm/bin`` install dir.
-    """
+def _firecracker_binary_present() -> bool:
+    """Return whether a Firecracker binary is on ``PATH`` or in ``~/.smolvm/bin``."""
     if which("firecracker") is not None:
         return True
     local = _LOCAL_BIN_DIR / "firecracker"
     return local.exists() and os.access(local, os.X_OK)
 
 
-def qemu_available() -> bool:
-    """Return whether QEMU (a system emulator plus ``qemu-img``) is installed."""
-    if which("qemu-img") is None:
-        return False
-    return any(which(candidate) is not None for candidate in _qemu_system_candidates())
+def _kvm_accessible() -> bool:
+    """Return whether ``/dev/kvm`` exists and the current user can read/write it."""
+    return _KVM_DEVICE.exists() and os.access(_KVM_DEVICE, os.R_OK | os.W_OK)
+
+
+def _qemu_system_binary() -> str | None:
+    """Return the first available ``qemu-system-*`` binary name, or ``None``."""
+    for candidate in _qemu_system_candidates():
+        if which(candidate) is not None:
+            return candidate
+    return None
+
+
+def _qemu_img_present() -> bool:
+    """Return whether ``qemu-img`` is on ``PATH``."""
+    return which("qemu-img") is not None
 
 
 def libkrun_available() -> bool:
@@ -76,40 +105,133 @@ def libkrun_available() -> bool:
     return is_available()
 
 
-# Auto-selection preference order per host, most-preferred first. Each entry
-# pairs a backend with the name of its probe (looked up on this module at call
-# time so tests can patch the probes). macOS has no KVM, so Firecracker is not
-# a candidate there.
-_AUTO_PREFERENCE: dict[str, tuple[tuple[str, str], ...]] = {
-    "darwin": (
-        (BACKEND_QEMU, "qemu_available"),
-        (BACKEND_LIBKRUN, "libkrun_available"),
-    ),
-    "_default": (
-        (BACKEND_FIRECRACKER, "firecracker_available"),
-        (BACKEND_QEMU, "qemu_available"),
-        (BACKEND_LIBKRUN, "libkrun_available"),
-    ),
+# --- per-backend status ----------------------------------------------------
+
+
+def firecracker_status() -> BackendStatus:
+    """Probe whether the Firecracker backend can run on this host.
+
+    Firecracker needs both its binary and hardware virtualization
+    (``/dev/kvm``); a binary without KVM access counts as installed-but-not-
+    runnable so selection can prefer a backend that actually works.
+    """
+    if not _firecracker_binary_present():
+        return BackendStatus(False, False, _firecracker_missing_message())
+    if not _kvm_accessible():
+        return BackendStatus(False, True, _firecracker_kvm_message())
+    return BackendStatus(True, True, None)
+
+
+def qemu_status() -> BackendStatus:
+    """Probe whether the QEMU backend can run on this host.
+
+    The QEMU backend needs a ``qemu-system-*`` emulator *and* ``qemu-img`` (for
+    the per-VM disk overlays and snapshots). A system emulator without
+    ``qemu-img`` counts as installed-but-not-runnable.
+    """
+    has_system = _qemu_system_binary() is not None
+    has_img = _qemu_img_present()
+    if has_system and has_img:
+        return BackendStatus(True, True, None)
+    return BackendStatus(
+        False,
+        has_system,
+        _qemu_missing_message(has_system=has_system, has_img=has_img),
+    )
+
+
+def libkrun_status() -> BackendStatus:
+    """Probe whether the libkrun backend can run on this host."""
+    if libkrun_available():
+        return BackendStatus(True, True, None)
+    return BackendStatus(False, False, _libkrun_missing_message())
+
+
+def firecracker_available() -> bool:
+    """Return whether the Firecracker backend is fully runnable here."""
+    return firecracker_status().available
+
+
+def qemu_available() -> bool:
+    """Return whether the QEMU backend is fully runnable here."""
+    return qemu_status().available
+
+
+def _backend_status(backend: str) -> BackendStatus | None:
+    """Return the availability status for a concrete backend, or ``None``."""
+    if backend == BACKEND_FIRECRACKER:
+        return firecracker_status()
+    if backend == BACKEND_QEMU:
+        return qemu_status()
+    if backend == BACKEND_LIBKRUN:
+        return libkrun_status()
+    return None
+
+
+# Auto-selection preference order per host, most-preferred first. macOS has no
+# KVM, so Firecracker is not a candidate there.
+_AUTO_PREFERENCE: dict[str, tuple[str, ...]] = {
+    "darwin": (BACKEND_QEMU, BACKEND_LIBKRUN),
+    "_default": (BACKEND_FIRECRACKER, BACKEND_QEMU, BACKEND_LIBKRUN),
 }
 
 
-def _auto_backend() -> str:
-    """Pick the best installed backend for this host.
+def _auto_backend() -> tuple[str, BackendStatus | None]:
+    """Pick the best backend for this host and return it with its status.
 
-    Prefers Firecracker on Linux and QEMU on macOS, but falls through to the
-    next installed backend when the preferred one isn't present — so ``auto``
-    never resolves to a backend the host can't run. When nothing is detected,
-    returns the platform default and lets the preflight surface the fix.
+    Prefers Firecracker on Linux and QEMU on macOS, and returns the first
+    backend that is fully runnable. When none is fully runnable, it returns the
+    one that is *closest* to runnable (its main binary is present but a
+    secondary requirement is missing) so the preflight can name the exact fix;
+    failing that, the platform default. Returning the status alongside the name
+    lets callers validate without probing a second time.
     """
     system = platform.system().lower()
     preference = _AUTO_PREFERENCE.get(system, _AUTO_PREFERENCE["_default"])
-    for backend, probe_name in preference:
-        if globals()[probe_name]():
+    partial: tuple[str, BackendStatus] | None = None
+    for backend in preference:
+        status = _backend_status(backend)
+        assert status is not None  # preference lists only supported backends
+        if status.available:
             logger.debug("auto backend selection chose %s", backend)
-            return backend
-    fallback = preference[0][0]
+            return backend, status
+        if partial is None and status.primary_present:
+            partial = (backend, status)
+    if partial is not None:
+        logger.debug(
+            "auto backend selection found no fully runnable backend; "
+            "reporting partially-installed %s",
+            partial[0],
+        )
+        return partial
+    fallback = preference[0]
     logger.debug("auto backend selection found no installed backend; defaulting to %s", fallback)
-    return fallback
+    return fallback, _backend_status(fallback)
+
+
+def resolve_backend_status(requested: str | None = None) -> tuple[str, BackendStatus | None]:
+    """Resolve a backend and return it with its availability status.
+
+    Like :func:`resolve_backend`, but also returns the probed
+    :class:`BackendStatus` so a caller can call
+    :func:`ensure_backend_available` without probing the host a second time.
+    For an explicitly-requested backend the status is ``None`` (unprobed) — the
+    check is deferred to :func:`ensure_backend_available`, keeping this cheap for
+    callers that only need the name.
+
+    Raises:
+        ValueError: If the requested backend is unknown.
+    """
+    raw = (requested or os.environ.get("SMOLVM_BACKEND") or BACKEND_AUTO).strip().lower()
+
+    if raw == BACKEND_AUTO:
+        return _auto_backend()
+
+    if raw in SUPPORTED_BACKENDS:
+        return raw, None
+
+    supported = ", ".join(sorted((*SUPPORTED_BACKENDS, BACKEND_AUTO)))
+    raise ValueError(f"Unsupported backend '{raw}'. Supported values: {supported}")
 
 
 def resolve_backend(requested: str | None = None) -> str:
@@ -120,7 +242,7 @@ def resolve_backend(requested: str | None = None) -> str:
     2) ``SMOLVM_BACKEND`` environment variable.
     3) ``auto``: the best backend actually installed on this host
        (Firecracker preferred on Linux, QEMU on macOS), falling back to the
-       next installed backend when the preferred one is missing.
+       next installed backend when the preferred one is missing or can't run.
 
     Args:
         requested: Optional backend string.
@@ -131,16 +253,7 @@ def resolve_backend(requested: str | None = None) -> str:
     Raises:
         ValueError: If backend is unknown.
     """
-    raw = (requested or os.environ.get("SMOLVM_BACKEND") or BACKEND_AUTO).strip().lower()
-
-    if raw == BACKEND_AUTO:
-        return _auto_backend()
-
-    if raw in SUPPORTED_BACKENDS:
-        return raw
-
-    supported = ", ".join(sorted((*SUPPORTED_BACKENDS, BACKEND_AUTO)))
-    raise ValueError(f"Unsupported backend '{raw}'. Supported values: {supported}")
+    return resolve_backend_status(requested)[0]
 
 
 def _firecracker_missing_message() -> str:
@@ -153,8 +266,31 @@ def _firecracker_missing_message() -> str:
     )
 
 
-def _qemu_missing_message() -> str:
-    """Plain-English recovery for missing QEMU tooling."""
+def _firecracker_kvm_message() -> str:
+    """Plain-English recovery for Firecracker present but KVM unusable."""
+    return (
+        "Firecracker needs hardware virtualization (/dev/kvm), which isn't "
+        "available or accessible on this machine. Give your user access with "
+        "'sudo usermod -aG kvm $USER' and start a new login session, or create "
+        "the sandbox with a different backend, e.g. "
+        "'smolvm sandbox create --backend qemu'."
+    )
+
+
+def _qemu_missing_message(*, has_system: bool, has_img: bool) -> str:
+    """Plain-English recovery for missing QEMU tooling.
+
+    Distinguishes a completely-absent QEMU from the case where the system
+    emulator is present but ``qemu-img`` is missing, so the message never
+    claims QEMU is uninstalled when it isn't.
+    """
+    if has_system and not has_img:
+        return (
+            "QEMU is installed but its 'qemu-img' disk tool is missing. Install "
+            "it with 'sudo apt-get install -y qemu-utils' on Debian/Ubuntu, "
+            "'sudo dnf install -y qemu-img' on Fedora/RHEL, or your distro's "
+            "qemu-img package, then run 'smolvm doctor --backend qemu' to confirm."
+        )
     system = platform.system()
     if system == "Darwin":
         install = "Install it with 'brew install qemu'"
@@ -181,7 +317,7 @@ def _libkrun_missing_message() -> str:
     )
 
 
-def ensure_backend_available(backend: str) -> None:
+def ensure_backend_available(backend: str, status: BackendStatus | None = None) -> None:
     """Verify the tooling a resolved backend needs is installed.
 
     Call this before any slow work (such as downloading a base image) so a
@@ -190,13 +326,14 @@ def ensure_backend_available(backend: str) -> None:
 
     Args:
         backend: A resolved backend name (not ``auto``).
+        status: An already-probed :class:`BackendStatus` for *backend* (e.g. from
+            :func:`resolve_backend_status`). Pass it to avoid re-probing the
+            host; omit it to probe now.
 
     Raises:
         SmolVMError: If the backend's required tooling isn't present.
     """
-    if backend == BACKEND_FIRECRACKER and not firecracker_available():
-        raise SmolVMError(_firecracker_missing_message())
-    if backend == BACKEND_QEMU and not qemu_available():
-        raise SmolVMError(_qemu_missing_message())
-    if backend == BACKEND_LIBKRUN and not libkrun_available():
-        raise SmolVMError(_libkrun_missing_message())
+    if status is None:
+        status = _backend_status(backend)
+    if status is not None and not status.available:
+        raise SmolVMError(status.message or f"Backend '{backend}' is not available.")

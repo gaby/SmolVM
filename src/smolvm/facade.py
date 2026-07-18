@@ -82,6 +82,7 @@ from smolvm.runtime.backends import (
     BACKEND_QEMU,
     ensure_backend_available,
     resolve_backend,
+    resolve_backend_status,
 )
 from smolvm.runtime.boot_profiles import (
     KernelBootProfile,
@@ -421,6 +422,11 @@ def _build_local_image_config(
                 f'backend={backend!r} or pass backend="qemu".'
             )
 
+    # Windows guests always run on QEMU; verify its tooling up front so a
+    # missing hypervisor fails fast instead of surfacing during disk overlay
+    # creation or VM start.
+    ensure_backend_available(BACKEND_QEMU)
+
     if ssh_key_path is None:
         from smolvm.utils import ensure_ssh_key
 
@@ -481,10 +487,11 @@ def _build_s3_image_config(
     Downloads the manifest and assets via :class:`ImageManager`, resolves
     boot arguments, and returns a ready-to-use config.
     """
-    resolved_backend = resolve_backend(backend)
+    resolved_backend, backend_status = resolve_backend_status(backend)
     # Verify the backend's tooling before pulling the S3 image, so a missing
-    # hypervisor fails fast instead of after the download.
-    ensure_backend_available(resolved_backend)
+    # hypervisor fails fast instead of after the download. Reuse the status the
+    # resolver already probed rather than probing the host again.
+    ensure_backend_available(resolved_backend, backend_status)
     resolved_ssh_key_path: str | None = ssh_key_path
 
     image_manager = ImageManager()
@@ -573,7 +580,7 @@ def _build_auto_config(
     on_download: Callable[[str, int, int | None], None] | None = None,
 ) -> tuple[VMConfig, str | None]:
     """Build the default SSH-ready VM config used by zero-config flows."""
-    resolved_backend = resolve_backend(backend)
+    resolved_backend, backend_status = resolve_backend_status(backend)
     resolved_os = _normalize_guest_os(os or _default_guest_os_for_backend(resolved_backend))
     if resolved_os is GuestOS.WINDOWS:
         # Auto-config builds a Linux SSH-ready VM from a built or downloaded
@@ -594,8 +601,8 @@ def _build_auto_config(
     # Gate the expensive work: verify the backend's hypervisor tooling is
     # installed before building or downloading a base image, so a missing
     # qemu/firecracker fails fast with an actionable message instead of after
-    # a multi-hundred-MB download.
-    ensure_backend_available(resolved_backend)
+    # a multi-hundred-MB download. Reuse the already-probed status.
+    ensure_backend_available(resolved_backend, backend_status)
 
     if resolved_os is GuestOS.UBUNTU:
         from smolvm.images.published import Vmm, ensure_published_image
@@ -1419,6 +1426,9 @@ class SmolVM:
         resolved_vm_id = _resolve_vm_name(vm_id, prefix=name_prefix)
 
         resolved_backend = _normalize_from_image_backend(image, backend, resolved_vm_id)
+        # Verify the backend's tooling before any kernel download or VM start,
+        # so a missing hypervisor fails fast with an actionable message.
+        ensure_backend_available(resolved_backend)
         resolved_arch = _normalize_from_image_arch(image, arch, resolved_vm_id)
         qemu_network = _normalize_from_image_network(
             backend=resolved_backend,

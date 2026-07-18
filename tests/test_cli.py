@@ -1062,8 +1062,11 @@ class TestCliCreate:
         mock_vm_cls.return_value = vm
 
         # This test covers config building, not host hypervisor detection, so
-        # treat the QEMU backend as installed (preflight is covered elsewhere).
-        with patch("smolvm.facade.ensure_backend_available"):
+        # make QEMU look installed and let the real preflight pass through.
+        with (
+            patch("smolvm.runtime.backends._qemu_system_binary", return_value="qemu-system-x86_64"),
+            patch("smolvm.runtime.backends._qemu_img_present", return_value=True),
+        ):
             ret = main(
                 [
                     "sandbox",
