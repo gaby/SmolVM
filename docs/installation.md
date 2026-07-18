@@ -39,6 +39,6 @@ After booting that image on the real runtime machine, run `smolvm doctor` before
 
 ## What SmolVM selects automatically
 
-When you do not choose a backend, SmolVM uses QEMU on macOS and Firecracker on other hosts. You can inspect a specific choice with `smolvm doctor --backend qemu` or `smolvm doctor --backend firecracker`.
+When you do not choose a backend, SmolVM picks the best one that is actually installed on your machine. It prefers Firecracker on Linux and QEMU on macOS, but if that one is missing it falls back to another installed backend, so it never picks something your machine cannot run. If nothing suitable is installed, `smolvm sandbox create` stops right away and tells you what to install — before downloading anything. You can inspect a specific choice with `smolvm doctor --backend qemu` or `smolvm doctor --backend firecracker`.
 
 **Implementation notes:** supported setup platforms and packaged setup scripts are defined in [`src/smolvm/host/setup.py`](../src/smolvm/host/setup.py); backend selection is in [`src/smolvm/runtime/backends.py`](../src/smolvm/runtime/backends.py) and is covered by [`tests/test_setup.py`](../tests/test_setup.py) and [`tests/test_backends.py`](../tests/test_backends.py).
