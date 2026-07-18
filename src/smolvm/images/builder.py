@@ -37,6 +37,7 @@ from pathlib import Path
 
 from smolvm.exceptions import ImageError, SmolVMError
 from smolvm.images.boot import BootImage, DirectKernelBoot
+from smolvm.images.manager import resolve_image_dir
 from smolvm.kernels import KernelArch, ensure_base_kernel_for_backend
 from smolvm.runtime.backends import resolve_backend
 from smolvm.runtime.boot_profiles import (
@@ -210,17 +211,18 @@ def _guest_agent_release_asset() -> tuple[str, str, str]:
     return url, asset_name, expected_sha256
 
 
-def _guest_agent_binary_cache_dir() -> Path:
-    return Path.home() / ".smolvm" / "images" / "_guest-agent"
+def _guest_agent_binary_cache_dir(cache_dir: Path | None = None) -> Path:
+    """Return the guest-agent subdirectory of the resolved image cache dir."""
+    return resolve_image_dir(cache_dir) / "_guest-agent"
 
 
-def _download_guest_agent_binary() -> Path:
+def _download_guest_agent_binary(image_cache_dir: Path | None = None) -> Path:
     """Download and cache the pinned Rust guest-agent binary for installed wheels."""
     from smolvm.images.published import _images_release_tag
 
     url, asset_name, expected_sha256 = _guest_agent_release_asset()
     cache_dir = (
-        _guest_agent_binary_cache_dir()
+        _guest_agent_binary_cache_dir(image_cache_dir)
         / _images_release_tag()
         / to_published_arch(platform.machine())
     )
@@ -268,13 +270,13 @@ def _download_guest_agent_binary() -> Path:
                 tmp_path.unlink()
 
 
-def _guest_agent_binary() -> Path:
+def _guest_agent_binary(cache_dir: Path | None = None) -> Path:
     """Build and return the Rust guest-agent binary used by rootfs builders."""
     configured = _configured_guest_agent_binary()
     if configured is not None:
         return configured
     if not _has_guest_agent_source_checkout():
-        return _download_guest_agent_binary()
+        return _download_guest_agent_binary(cache_dir)
 
     target = _guest_agent_target_triple()
     binary_path = _guest_agent_binary_path()
@@ -428,9 +430,9 @@ class ImageBuilder:
 
         Args:
             cache_dir: Directory to store built images.
-                Defaults to ~/.smolvm/images/
+                Defaults to $SMOLVM_IMAGE_DIR or ~/.smolvm/images/
         """
-        self.cache_dir = cache_dir or (Path.home() / ".smolvm" / "images")
+        self.cache_dir = resolve_image_dir(cache_dir)
 
     def check_docker(self) -> bool:
         """Check if Docker is available and the daemon is reachable."""
@@ -2160,7 +2162,7 @@ echo "Device-approver running with PID=${DEVICE_APPROVER_PID}"
             # Write Dockerfile and init script
             (tmp_path / "Dockerfile").write_text(dockerfile_content)
             (tmp_path / "init").write_text(init_script)
-            shutil.copy2(_guest_agent_binary(), tmp_path / _GUEST_AGENT_BUILD_FILE)
+            shutil.copy2(_guest_agent_binary(self.cache_dir), tmp_path / _GUEST_AGENT_BUILD_FILE)
             if extra_files:
                 for filename, content in extra_files.items():
                     (tmp_path / filename).write_text(content)
@@ -2253,7 +2255,7 @@ class DockerRootfsBuilder:
         self.dockerfile = dockerfile
         self.context = dict(context or {})
         self.rootfs_size_mb = rootfs_size_mb
-        self.cache_dir = cache_dir or ImageBuilder().cache_dir
+        self.cache_dir = resolve_image_dir(cache_dir)
         self.fingerprint_inputs = dict(fingerprint_inputs or {})
         self.build_args = dict(build_args or {})
         self.docker_platform = docker_platform

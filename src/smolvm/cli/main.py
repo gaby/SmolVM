@@ -3185,12 +3185,17 @@ def _command_name_from_argv(args: Sequence[str]) -> str:
         "windows",
         "browser",
         "server",
+        "image",
         "codex",
         "claude",
         "openclaw",
         "hermes",
         "pi",
     }:
+        if tokens[0] == "image" and tokens[1] == "ls":
+            # "ls" is an alias of "list"; successful runs report
+            # "image.list", so parse errors must too.
+            return "image.list"
         return f"{tokens[0]}.{tokens[1]}"
     return tokens[0]
 

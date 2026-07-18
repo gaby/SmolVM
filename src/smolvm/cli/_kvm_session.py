@@ -69,6 +69,11 @@ _SKIP_FIRST_ARGS: frozenset[str] = frozenset(
         "prune",
         "ui",
         "server",
+        # Image-cache management (pull/list/rm/prune/...) — downloads and
+        # file operations that never open /dev/kvm. "images" is the
+        # docker-style top-level alias for "image list".
+        "image",
+        "images",
     }
 )
 

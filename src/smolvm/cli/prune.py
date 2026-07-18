@@ -16,31 +16,59 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
 
 from smolvm import __version__
 from smolvm.cli.output import console_stdout, emit_json
-from smolvm.images.manager import ImageManager
+from smolvm.images.manager import resolve_image_dir
+
+
+def _size_on_disk(st: os.stat_result) -> int:
+    """Bytes a file actually occupies — sparse-aware where the OS reports it."""
+    blocks = getattr(st, "st_blocks", None)
+    return blocks * 512 if blocks is not None else st.st_size
 
 
 def _total_size(path: Path) -> int:
-    """Recursively sum file sizes under *path*."""
-    if path.is_file():
-        return path.stat().st_size
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    """Recursively sum on-disk usage under *path*.
+
+    Uses allocated blocks rather than apparent size so sparse rootfs
+    images (deliberately decompressed with holes) report what deleting
+    them would actually free. Tolerates files vanishing mid-walk.
+    """
+    total = 0
+    try:
+        if path.is_file():
+            return _size_on_disk(path.stat())
+        for f in path.rglob("*"):
+            try:
+                if f.is_file():
+                    total += _size_on_disk(f.stat())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
 
 
 def _format_bytes(n: int) -> str:
+    value = float(n)
     for unit in ("B", "KiB", "MiB", "GiB"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {unit}"
-        n //= 1024
-    return f"{n:.1f} TiB"
+        if abs(value) < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
 
 
-_VERSION_RE = re.compile(r"-v(\d+\.\d+\.\d+[a-z0-9]*)-")
+# One version fragment shared by every parser of cache-dir names (this
+# module and cli/image.py). Covers plain semver, compact pre-releases
+# ("0.0.14a0"), and dotted suffixes actually shipped ("0.0.24.post3").
+_VERSION_PATTERN = r"\d+\.\d+\.\d+[a-z0-9]*(?:\.[a-z0-9]+)*"
+
+_VERSION_RE = re.compile(rf"-v({_VERSION_PATTERN})-")
 
 
 def find_stale_caches(
@@ -53,7 +81,7 @@ def find_stale_caches(
     differs from ``current_version`` are considered stale. Unversioned
     directories (e.g. ``s3/``) and the current version are left alone.
     """
-    root = cache_dir or ImageManager.DEFAULT_CACHE_DIR
+    root = resolve_image_dir(cache_dir)
     if not root.is_dir():
         return []
     stale: list[Path] = []
@@ -71,14 +99,15 @@ def run_prune(
     dry_run: bool = False,
     json_output: bool = False,
     cache_dir: str | None = None,
+    command_name: str = "prune",
 ) -> int:
-    """Execute ``smolvm prune``."""
+    """Execute ``smolvm prune`` (also exposed as ``smolvm image prune``)."""
     cache_root = Path(cache_dir) if cache_dir else None
     stale = find_stale_caches(cache_dir=cache_root)
 
     if not stale:
         if json_output:
-            emit_json("prune", 0, data={"removed": [], "freed_bytes": 0})
+            emit_json(command_name, 0, data={"removed": [], "freed_bytes": 0})
         else:
             console = console_stdout()
             console.print("Nothing to prune — cache is clean.")
@@ -94,7 +123,7 @@ def run_prune(
     if dry_run:
         if json_output:
             emit_json(
-                "prune",
+                command_name,
                 0,
                 data={
                     "dry_run": True,
@@ -115,11 +144,16 @@ def run_prune(
         return 0
 
     for path in stale:
-        shutil.rmtree(path)
+        # A stale-named entry may be a symlink; remove the link itself
+        # rather than following it (rmtree refuses symlinks anyway).
+        if path.is_symlink():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
 
     if json_output:
         emit_json(
-            "prune",
+            command_name,
             0,
             data={
                 "removed": [str(p) for p in stale],

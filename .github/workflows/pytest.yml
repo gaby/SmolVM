@@ -172,7 +172,7 @@ jobs:
           release_downloads = []
           expected_agent = Path("/tmp/fake-smolvm-guest-agent")
 
-          def fake_download_guest_agent_binary():
+          def fake_download_guest_agent_binary(image_cache_dir=None):
               release_downloads.append("download")
               return expected_agent
 

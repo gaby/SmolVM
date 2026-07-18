@@ -10,7 +10,7 @@ The CLI creates and manages disposable sandboxes. Run `smolvm COMMAND --help` fo
 | `smolvm doctor` | Check whether this machine can run sandboxes. |
 | `smolvm bridge check BRIDGE` | Check an existing Linux bridge before connecting a sandbox to it. |
 | `smolvm update` | Upgrade to the latest stable release. |
-| `smolvm prune` | Remove stale cached images. |
+| `smolvm prune` | Remove stale cached images (alias for `smolvm image prune`). |
 
 ## Work with sandboxes
 
@@ -37,6 +37,23 @@ Run these in the order you need them:
 ## Start a prepared agent
 
 `smolvm codex start`, `smolvm claude start`, `smolvm pi start`, `smolvm hermes start`, and `smolvm openclaw start` create a sandbox and install that agent. See [Agent presets](../guides/agent-presets.md).
+
+## Manage downloaded images
+
+The first time you start a sandbox or agent, SmolVM downloads the files it boots from and keeps them on disk so later starts are fast. These commands manage that storage, and they work like Docker's image commands if you know those:
+
+| Command | Use it to |
+| --- | --- |
+| `smolvm image pull <preset>` | Download an image ahead of time, for example before going offline. |
+| `smolvm image pull --all` | Download every image available for this machine in one go. |
+| `smolvm images` (or `image list` / `image ls`) | See which images are downloaded, when, and how much space they use. |
+| `smolvm image inspect <name>` | See one image in detail: files, checksums, and where it came from. |
+| `smolvm image build -t NAME .` | Build a custom image from a Dockerfile (needs Docker installed). |
+| `smolvm image save <name> -o FILE` / `image load -i FILE` | Copy an image to a machine without internet access. |
+| `smolvm image rm <name>` | Remove a downloaded image to free disk space. |
+| `smolvm image prune` | Remove images left behind by older SmolVM versions. |
+
+Images are stored in `~/.smolvm/images`. To keep them somewhere else, set the `SMOLVM_IMAGE_DIR` environment variable — sandboxes read it too, so images you pull are found when a sandbox starts. The `--image-dir` option points a single `smolvm image` command at a different folder; sandboxes do not read that folder.
 
 ## Browser, local services, and Windows
 
