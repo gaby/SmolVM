@@ -491,7 +491,7 @@ def _build_s3_image_config(
     # Verify the backend's tooling before pulling the S3 image, so a missing
     # hypervisor fails fast instead of after the download. Reuse the status the
     # resolver already probed rather than probing the host again.
-    ensure_backend_available(resolved_backend, backend_status)
+    ensure_backend_available(resolved_backend, backend_status, vm_name=vm_name)
     resolved_ssh_key_path: str | None = ssh_key_path
 
     image_manager = ImageManager()
@@ -602,7 +602,7 @@ def _build_auto_config(
     # installed before building or downloading a base image, so a missing
     # qemu/firecracker fails fast with an actionable message instead of after
     # a multi-hundred-MB download. Reuse the already-probed status.
-    ensure_backend_available(resolved_backend, backend_status)
+    ensure_backend_available(resolved_backend, backend_status, vm_name=vm_name)
 
     if resolved_os is GuestOS.UBUNTU:
         from smolvm.images.published import Vmm, ensure_published_image
@@ -1428,7 +1428,7 @@ class SmolVM:
         resolved_backend = _normalize_from_image_backend(image, backend, resolved_vm_id)
         # Verify the backend's tooling before any kernel download or VM start,
         # so a missing hypervisor fails fast with an actionable message.
-        ensure_backend_available(resolved_backend)
+        ensure_backend_available(resolved_backend, vm_name=resolved_vm_id)
         resolved_arch = _normalize_from_image_arch(image, arch, resolved_vm_id)
         qemu_network = _normalize_from_image_network(
             backend=resolved_backend,

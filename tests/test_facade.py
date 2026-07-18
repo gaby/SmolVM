@@ -433,7 +433,7 @@ class TestVMInit:
     ) -> None:
         """The preflight must reject a missing backend before any image download.
 
-        The class-wide _assume_backend_installed fixture makes backends look
+        The module-wide _assume_backends_installed fixture makes backends look
         installed; here we override qemu to unavailable and assert the builder
         raises immediately without calling ensure_published_image.
         """
@@ -451,6 +451,27 @@ class TestVMInit:
             _build_auto_config(os="ubuntu", backend="qemu")
 
         mock_ensure_published.assert_not_called()
+
+    @patch("smolvm.utils.ensure_ssh_key")
+    def test_autoconfigure_missing_firecracker_names_sandbox_in_recovery(
+        self,
+        mock_ensure_ssh_key: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """The Firecracker preflight recovery command names the sandbox."""
+        priv = tmp_path / "id_ed25519"
+        pub = tmp_path / "id_ed25519.pub"
+        priv.touch()
+        pub.write_text("ssh-ed25519 AAAAExampleKey test@host\n")
+        mock_ensure_ssh_key.return_value = (priv, pub)
+
+        with (
+            patch("smolvm.runtime.backends._firecracker_binary_present", return_value=False),
+            pytest.raises(SmolVMError) as excinfo,
+        ):
+            _build_auto_config(vm_name="sbx-einstein", backend="firecracker")
+
+        assert "smolvm sandbox create --name sbx-einstein --backend qemu" in str(excinfo.value)
 
     def test_firmware_boot_vmconfig_rejects_non_qemu_backend(
         self,

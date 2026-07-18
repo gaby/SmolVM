@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shlex
 from pathlib import Path
 from typing import NamedTuple
 
@@ -189,9 +190,14 @@ def _auto_backend() -> tuple[str, BackendStatus | None]:
     system = platform.system().lower()
     preference = _AUTO_PREFERENCE.get(system, _AUTO_PREFERENCE["_default"])
     partial: tuple[str, BackendStatus] | None = None
-    for backend in preference:
+    fallback_status: BackendStatus | None = None
+    for index, backend in enumerate(preference):
         status = _backend_status(backend)
         assert status is not None  # preference lists only supported backends
+        if index == 0:
+            # preference[0] is the platform default and the final fallback;
+            # remember its status so we don't probe it a second time below.
+            fallback_status = status
         if status.available:
             logger.debug("auto backend selection chose %s", backend)
             return backend, status
@@ -206,7 +212,7 @@ def _auto_backend() -> tuple[str, BackendStatus | None]:
         return partial
     fallback = preference[0]
     logger.debug("auto backend selection found no installed backend; defaulting to %s", fallback)
-    return fallback, _backend_status(fallback)
+    return fallback, fallback_status
 
 
 def resolve_backend_status(requested: str | None = None) -> tuple[str, BackendStatus | None]:
@@ -256,24 +262,33 @@ def resolve_backend(requested: str | None = None) -> str:
     return resolve_backend_status(requested)[0]
 
 
-def _firecracker_missing_message() -> str:
+def _create_with_qemu_command(vm_name: str | None) -> str:
+    """Return the exact 'create with QEMU instead' recovery command.
+
+    Interpolates the sandbox name with ``--name`` when known so the suggested
+    command is runnable as-is rather than a generic placeholder.
+    """
+    if vm_name:
+        return f"smolvm sandbox create --name {shlex.quote(vm_name)} --backend qemu"
+    return "smolvm sandbox create --backend qemu"
+
+
+def _firecracker_missing_message(vm_name: str | None = None) -> str:
     """Plain-English recovery for a missing Firecracker binary."""
     return (
         "Firecracker isn't installed on this machine. Install it and make sure "
         "the 'firecracker' binary is on your PATH (or in ~/.smolvm/bin), or "
-        "create the sandbox with a different backend, e.g. "
-        "'smolvm sandbox create --backend qemu'."
+        f"create the sandbox with a different backend, e.g. '{_create_with_qemu_command(vm_name)}'."
     )
 
 
-def _firecracker_kvm_message() -> str:
+def _firecracker_kvm_message(vm_name: str | None = None) -> str:
     """Plain-English recovery for Firecracker present but KVM unusable."""
     return (
         "Firecracker needs hardware virtualization (/dev/kvm), which isn't "
         "available or accessible on this machine. Give your user access with "
         "'sudo usermod -aG kvm $USER' and start a new login session, or create "
-        "the sandbox with a different backend, e.g. "
-        "'smolvm sandbox create --backend qemu'."
+        f"the sandbox with a different backend, e.g. '{_create_with_qemu_command(vm_name)}'."
     )
 
 
@@ -317,7 +332,12 @@ def _libkrun_missing_message() -> str:
     )
 
 
-def ensure_backend_available(backend: str, status: BackendStatus | None = None) -> None:
+def ensure_backend_available(
+    backend: str,
+    status: BackendStatus | None = None,
+    *,
+    vm_name: str | None = None,
+) -> None:
     """Verify the tooling a resolved backend needs is installed.
 
     Call this before any slow work (such as downloading a base image) so a
@@ -329,11 +349,25 @@ def ensure_backend_available(backend: str, status: BackendStatus | None = None) 
         status: An already-probed :class:`BackendStatus` for *backend* (e.g. from
             :func:`resolve_backend_status`). Pass it to avoid re-probing the
             host; omit it to probe now.
+        vm_name: The sandbox name the caller is creating, if known. When set,
+            the Firecracker recovery command names it with ``--name`` so the
+            suggestion is exactly runnable.
 
     Raises:
         SmolVMError: If the backend's required tooling isn't present.
     """
     if status is None:
         status = _backend_status(backend)
-    if status is not None and not status.available:
-        raise SmolVMError(status.message or f"Backend '{backend}' is not available.")
+    if status is None or status.available:
+        return
+    message = status.message
+    if vm_name and backend == BACKEND_FIRECRACKER:
+        # Rebuild the Firecracker recovery with the real sandbox name.
+        # primary_present distinguishes a missing binary (False) from a present
+        # binary without usable KVM (True), matching firecracker_status().
+        message = (
+            _firecracker_kvm_message(vm_name)
+            if status.primary_present
+            else _firecracker_missing_message(vm_name)
+        )
+    raise SmolVMError(message or f"Backend '{backend}' is not available.")

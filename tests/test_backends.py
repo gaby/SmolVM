@@ -91,6 +91,17 @@ def test_resolve_backend_auto_defaults_to_firecracker_when_nothing_installed() -
         assert resolve_backend("auto") == BACKEND_FIRECRACKER
 
 
+def test_auto_backend_does_not_reprobe_the_fallback() -> None:
+    # Nothing installed: each preferred backend is probed exactly once, and the
+    # platform-default fallback reuses the status probed in the first iteration
+    # instead of probing it again.
+    with _env(), patch("smolvm.runtime.backends._backend_status", wraps=b._backend_status) as spy:
+        backend, status = b._auto_backend()
+    assert backend == BACKEND_FIRECRACKER
+    assert status is not None
+    assert spy.call_count == len(b._AUTO_PREFERENCE["_default"])
+
+
 # --- status threading (single probe) ---------------------------------------
 
 
@@ -154,6 +165,27 @@ def test_ensure_backend_available_raises_for_missing_firecracker() -> None:
 def test_ensure_backend_available_firecracker_present_without_kvm_reports_kvm() -> None:
     with _env(fc_binary=True, kvm=False), pytest.raises(SmolVMError, match="/dev/kvm"):
         ensure_backend_available(BACKEND_FIRECRACKER)
+
+
+def test_firecracker_missing_message_interpolates_sandbox_name() -> None:
+    # The recovery command must name the sandbox with --name so it is runnable.
+    with _env(fc_binary=False), pytest.raises(SmolVMError) as excinfo:
+        ensure_backend_available(BACKEND_FIRECRACKER, vm_name="sbx-einstein")
+    assert "smolvm sandbox create --name sbx-einstein --backend qemu" in str(excinfo.value)
+
+
+def test_firecracker_kvm_message_interpolates_sandbox_name() -> None:
+    with _env(fc_binary=True, kvm=False), pytest.raises(SmolVMError) as excinfo:
+        ensure_backend_available(BACKEND_FIRECRACKER, vm_name="sbx-einstein")
+    assert "smolvm sandbox create --name sbx-einstein --backend qemu" in str(excinfo.value)
+
+
+def test_firecracker_recovery_command_omits_name_when_unknown() -> None:
+    with _env(fc_binary=False), pytest.raises(SmolVMError) as excinfo:
+        ensure_backend_available(BACKEND_FIRECRACKER)
+    message = str(excinfo.value)
+    assert "--name" not in message
+    assert "smolvm sandbox create --backend qemu" in message
 
 
 def test_ensure_backend_available_raises_for_missing_libkrun() -> None:
