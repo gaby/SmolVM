@@ -78,6 +78,18 @@ class TestDiskSizeHelpers:
 class TestVMInit:
     """Tests for VM initialization."""
 
+    @pytest.fixture(autouse=True)
+    def _assume_backend_installed(self):
+        """Treat the resolved backend as installed for builder tests.
+
+        These tests exercise config building and image download/build, not
+        host hypervisor detection (covered in test_backends). Auto-config now
+        preflights backend tooling before the download; stub it out so the
+        builder path runs regardless of what's installed on the test host.
+        """
+        with patch("smolvm.facade.ensure_backend_available"):
+            yield
+
     @patch("smolvm.facade.SmolVMManager")
     def test_create_with_config(
         self,

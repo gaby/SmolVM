@@ -80,6 +80,7 @@ from smolvm.runtime.backends import (
     BACKEND_FIRECRACKER,
     BACKEND_LIBKRUN,
     BACKEND_QEMU,
+    ensure_backend_available,
     resolve_backend,
 )
 from smolvm.runtime.boot_profiles import (
@@ -481,6 +482,9 @@ def _build_s3_image_config(
     boot arguments, and returns a ready-to-use config.
     """
     resolved_backend = resolve_backend(backend)
+    # Verify the backend's tooling before pulling the S3 image, so a missing
+    # hypervisor fails fast instead of after the download.
+    ensure_backend_available(resolved_backend)
     resolved_ssh_key_path: str | None = ssh_key_path
 
     image_manager = ImageManager()
@@ -586,6 +590,12 @@ def _build_auto_config(
     resolved_disk_size_mib = default_disk_size_mib if disk_size_mib is None else disk_size_mib
     if resolved_disk_size_mib < 64:
         raise ValueError("disk_size_mib must be >= 64")
+
+    # Gate the expensive work: verify the backend's hypervisor tooling is
+    # installed before building or downloading a base image, so a missing
+    # qemu/firecracker fails fast with an actionable message instead of after
+    # a multi-hundred-MB download.
+    ensure_backend_available(resolved_backend)
 
     if resolved_os is GuestOS.UBUNTU:
         from smolvm.images.published import Vmm, ensure_published_image

@@ -1061,19 +1061,22 @@ class TestCliCreate:
         vm.info.network.ssh_host_port = 2200
         mock_vm_cls.return_value = vm
 
-        ret = main(
-            [
-                "sandbox",
-                "create",
-                "--name",
-                "project-spacex",
-                "--os",
-                "ubuntu",
-                "--backend",
-                "qemu",
-                "--json",
-            ]
-        )
+        # This test covers config building, not host hypervisor detection, so
+        # treat the QEMU backend as installed (preflight is covered elsewhere).
+        with patch("smolvm.facade.ensure_backend_available"):
+            ret = main(
+                [
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "project-spacex",
+                    "--os",
+                    "ubuntu",
+                    "--backend",
+                    "qemu",
+                    "--json",
+                ]
+            )
 
         assert ret == 0
         preset, arch, vmm, os_ = mock_ensure_published.call_args.args
