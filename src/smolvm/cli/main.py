@@ -47,6 +47,7 @@ from rich.text import Text
 
 from smolvm.cli._kvm_session import maybe_reexec_for_kvm_group
 from smolvm.cli.output import (
+    console_stderr,
     console_stdout,
     emit_error,
     emit_json,
@@ -2507,6 +2508,152 @@ def _run_shell(args: SimpleNamespace) -> int:
         return vm.attach_shell(timeout=args.boot_timeout)
     except Exception as exc:
         return _emit_cli_error(command_name, 1, exc, json_output=False)
+    finally:
+        if vm is not None:
+            vm.close()
+
+
+def _bring_sandbox_up(vm: Any, boot_timeout: float, *, status_console: Any) -> None:
+    """Start or resume a sandbox so a command can run in it.
+
+    Mirrors the connect-command convention used by ``shell``/``ssh``:
+    a stopped sandbox is started and a paused one resumed; an errored
+    sandbox raises with a recovery path. Progress is shown on stderr so
+    it never mixes into captured command output.
+    """
+    if vm.status in {VMState.CREATED, VMState.STOPPED}:
+        with status_console.status(f"Starting sandbox '{vm.vm_id}'...", spinner="dots"):
+            vm.start(boot_timeout=boot_timeout)
+    elif vm.status == VMState.PAUSED:
+        with status_console.status(f"Resuming sandbox '{vm.vm_id}'...", spinner="dots"):
+            vm.resume()
+    elif vm.status == VMState.ERROR:
+        raise RuntimeError(
+            f"Sandbox '{vm.vm_id}' is in error state; inspect its logs with "
+            f"'smolvm sandbox logs {vm.vm_id}', or run "
+            f"'smolvm sandbox delete {vm.vm_id}' then "
+            f"'smolvm sandbox create --name {vm.vm_id}' to recreate it."
+        )
+
+
+def _run_exec(args: SimpleNamespace) -> int:
+    """Handle ``smolvm sandbox exec``."""
+    import shlex
+
+    from smolvm.facade import SmolVM
+
+    vm: SmolVM | None = None
+    command_name = getattr(args, "command_name", "sandbox.exec")
+    json_output = bool(getattr(args, "json", False))
+    try:
+        vm = SmolVM.from_id(args.vm_id)
+        _bring_sandbox_up(vm, args.boot_timeout, status_console=console_stderr())
+
+        cmd_str = shlex.join(args.command)
+        result = vm.run(cmd_str, timeout=args.timeout)
+
+        if json_output:
+            emit_json(
+                command_name,
+                result.exit_code,
+                data={
+                    "exit_code": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                },
+            )
+            return result.exit_code
+
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+            sys.stdout.flush()
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+            sys.stderr.flush()
+        return result.exit_code
+    except Exception as exc:
+        return _emit_cli_error(command_name, 1, exc, json_output=json_output)
+    finally:
+        if vm is not None:
+            vm.close()
+
+
+def _tail_file(path: Path, lines: int) -> tuple[list[str], int]:
+    """Return the last ``lines`` lines of ``path`` and the current byte size.
+
+    The byte size lets ``--follow`` resume reading from where the tail
+    ended without re-printing what was already shown.
+    """
+    data = path.read_bytes()
+    text = data.decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    return all_lines[-lines:], len(data)
+
+
+def _run_logs(args: SimpleNamespace) -> int:
+    """Handle ``smolvm sandbox logs``."""
+    import time
+
+    from smolvm.facade import SmolVM
+
+    command_name = getattr(args, "command_name", "sandbox.logs")
+    json_output = bool(getattr(args, "json", False))
+    vm: SmolVM | None = None
+    try:
+        vm = SmolVM.from_id(args.vm_id)
+        log_path = vm.data_dir / f"{args.vm_id}.log"
+
+        if not log_path.exists():
+            recovery = f"Start it with 'smolvm sandbox start {args.vm_id}' to generate logs."
+            message = f"No logs found for sandbox '{args.vm_id}'. {recovery}"
+            if json_output:
+                return emit_error(command_name, "not_found", message, recovery=recovery)
+            render_error(message)
+            return 1
+
+        tail_lines, offset = _tail_file(log_path, args.tail)
+
+        if json_output:
+            if args.follow:
+                return emit_error(
+                    command_name,
+                    "invalid_input",
+                    "Cannot combine --follow with --json. Run "
+                    f"'smolvm sandbox logs {args.vm_id} --json' without --follow.",
+                    recovery=f"Run 'smolvm sandbox logs {args.vm_id} --json' without --follow.",
+                )
+            emit_json(
+                command_name,
+                0,
+                data={"path": str(log_path), "lines": tail_lines},
+            )
+            return 0
+
+        for line in tail_lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+        if not args.follow:
+            return 0
+
+        try:
+            while True:
+                time.sleep(0.5)
+                size = log_path.stat().st_size
+                if size < offset:
+                    # File was truncated/rotated; restart from the top.
+                    offset = 0
+                if size > offset:
+                    with log_path.open("rb") as handle:
+                        handle.seek(offset)
+                        chunk = handle.read()
+                        offset += len(chunk)
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            return 0
+    except Exception as exc:
+        return _emit_cli_error(command_name, 1, exc, json_output=json_output)
     finally:
         if vm is not None:
             vm.close()

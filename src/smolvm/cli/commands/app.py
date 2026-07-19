@@ -13,6 +13,7 @@ from smolvm.cli.commands.options import (
     backend_option,
     boot_timeout_option,
     comm_channel_option,
+    complete_sandbox_names,
     image_dir_option,
     json_option,
     positive_float_type,
@@ -165,7 +166,7 @@ def sandbox_list(include_all: bool, status_filter: str | None, json_output: bool
 
 
 @sandbox.command("info")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @json_option
 def sandbox_info(vm_id: str, json_output: bool) -> Any:
     """Show details about a sandbox."""
@@ -178,7 +179,7 @@ def sandbox_info(vm_id: str, json_output: bool) -> Any:
 
 
 @sandbox.command("start")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @boot_timeout_option
 @json_option
 def sandbox_start(vm_id: str, boot_timeout: float, json_output: bool) -> Any:
@@ -190,7 +191,7 @@ def sandbox_start(vm_id: str, boot_timeout: float, json_output: bool) -> Any:
 
 
 @sandbox.command("stop")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.option(
     "--timeout",
     type=positive_float_type(),
@@ -208,7 +209,7 @@ def sandbox_stop(vm_id: str, timeout: float, json_output: bool) -> Any:
 
 
 @sandbox.command("pause")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @json_option
 def sandbox_pause(vm_id: str, json_output: bool) -> Any:
     """Pause a running sandbox."""
@@ -217,7 +218,7 @@ def sandbox_pause(vm_id: str, json_output: bool) -> Any:
 
 
 @sandbox.command("resume")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @json_option
 def sandbox_resume(vm_id: str, json_output: bool) -> Any:
     """Resume a paused sandbox."""
@@ -228,7 +229,7 @@ def sandbox_resume(vm_id: str, json_output: bool) -> Any:
 
 
 @sandbox.command("shell")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @boot_timeout_option
 def sandbox_shell(vm_id: str, boot_timeout: float) -> Any:
     """Open a fast shell in a sandbox."""
@@ -243,7 +244,7 @@ def sandbox_shell(vm_id: str, boot_timeout: float) -> Any:
 
 
 @sandbox.command("ssh")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @ssh_auth_options
 @boot_timeout_option
 def sandbox_ssh(vm_id: str, ssh_key: str | None, ssh_user: str, boot_timeout: float) -> Any:
@@ -260,8 +261,75 @@ def sandbox_ssh(vm_id: str, ssh_key: str | None, ssh_user: str, boot_timeout: fl
     )
 
 
+@sandbox.command(
+    "exec",
+    short_help="Run a command in a sandbox and print its output.",
+    context_settings={"ignore_unknown_options": True},
+)
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
+@click.argument("command", nargs=-1, required=True, metavar="-- COMMAND ...")
+@click.option(
+    "--timeout",
+    type=positive_int_type(),
+    default=30,
+    show_default=True,
+    help="Seconds to wait for the command to finish.",
+)
+@boot_timeout_option
+@json_option
+def sandbox_exec(
+    vm_id: str,
+    command: tuple[str, ...],
+    timeout: int,
+    boot_timeout: float,
+    json_output: bool,
+) -> Any:
+    """Run a command in a sandbox and print its output.
+
+    \b
+    Example:
+      smolvm sandbox exec my-sandbox -- ls -la /root
+    """
+    _before_command(json_output=json_output)
+    return _handlers()._run_exec(
+        _ns(
+            command_name="sandbox.exec",
+            vm_id=vm_id,
+            command=command,
+            timeout=timeout,
+            boot_timeout=boot_timeout,
+            json=json_output,
+        )
+    )
+
+
+@sandbox.command("logs")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
+@click.option(
+    "--tail",
+    type=positive_int_type(),
+    default=200,
+    show_default=True,
+    help="Number of lines to show from the end of the log.",
+)
+@click.option("-f", "--follow", is_flag=True, help="Keep printing new log lines as they arrive.")
+@json_option
+def sandbox_logs(vm_id: str, tail: int, follow: bool, json_output: bool) -> Any:
+    """Show a sandbox's boot and console logs."""
+    _before_command(json_output=json_output)
+    return _handlers()._run_logs(
+        _ns(
+            command_name="sandbox.logs",
+            vm_id=vm_id,
+            tail=tail,
+            follow=follow,
+            json=json_output,
+        )
+    )
+
+
 @sandbox.command("delete")
-@click.argument("vm_ids", nargs=-1, metavar="sandbox...")
+@click.argument("vm_ids", nargs=-1, metavar="sandbox...", shell_complete=complete_sandbox_names)
 @click.option("--all", "all_sandboxes", is_flag=True, help="Delete every sandbox.")
 @click.option("--force", is_flag=True, help="Skip the confirmation prompt for --all.")
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted.")
@@ -372,6 +440,33 @@ def update(check_only: bool, json_output: bool) -> Any:
     from smolvm.cli.update import run_update
 
     return run_update(check=check_only, json_output=json_output)
+
+
+@cli.command("completion", short_help="Print a shell tab-completion script.")
+@click.argument("shell", type=click.Choice(["bash", "zsh", "fish"]))
+def completion(shell: str) -> int:
+    """Print a shell tab-completion script for smolvm.
+
+    Completion suggests subcommands, options, and the names of your existing
+    sandboxes. Load it in your current shell, or install it permanently:
+
+    \b
+    bash:  eval "$(smolvm completion bash)"
+           # or persist: smolvm completion bash > ~/.smolvm-completion.bash
+           #             echo 'source ~/.smolvm-completion.bash' >> ~/.bashrc
+    zsh:   eval "$(smolvm completion zsh)"
+           # or persist: smolvm completion zsh > ~/.smolvm-completion.zsh
+           #             echo 'source ~/.smolvm-completion.zsh' >> ~/.zshrc
+    fish:  smolvm completion fish > ~/.config/fish/completions/smolvm.fish
+    """
+    from click.shell_completion import get_completion_class
+
+    completion_cls = get_completion_class(shell)
+    if completion_cls is None:  # pragma: no cover - guarded by click.Choice
+        raise click.UsageError(f"Shell completion is not supported for '{shell}'.")
+    comp = completion_cls(cli, {}, "smolvm", "_SMOLVM_COMPLETE")
+    click.echo(comp.source())
+    return 0
 
 
 @cli.command("prune", help="Remove stale image-cache entries (alias for 'smolvm image prune').")
@@ -647,7 +742,7 @@ def snapshot() -> None:
 
 
 @snapshot.command("create")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.option("--snapshot-id", default=None)
 @click.option(
     "--snapshot-type",
@@ -756,7 +851,7 @@ def file() -> None:
 
 
 @file.command("upload")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("local_path", metavar="local-path")
 @click.argument("guest_path", metavar="guest-path")
 @click.option("--no-create-dirs", is_flag=True)
@@ -792,7 +887,7 @@ def file_upload(
 
 
 @file.command("download")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("guest_path", metavar="guest-path")
 @click.argument("local_path", metavar="local-path")
 @click.option("--no-create-dirs", is_flag=True)
@@ -833,7 +928,7 @@ def env() -> None:
 
 
 @env.command("set")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("pairs", nargs=-1, required=True, metavar="KEY=VALUE...")
 @ssh_auth_options
 @comm_channel_option
@@ -863,7 +958,7 @@ def env_set(
 
 
 @env.command("unset")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("keys", nargs=-1, required=True, metavar="KEY...")
 @ssh_auth_options
 @comm_channel_option
@@ -893,7 +988,7 @@ def env_unset(
 
 
 @env.command("list")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.option("--show-values", is_flag=True)
 @ssh_auth_options
 @comm_channel_option
@@ -928,7 +1023,7 @@ def port() -> None:
 
 
 @port.command("expose")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("mapping", metavar="[host-port:]sandbox-port")
 @ssh_auth_options
 @comm_channel_option
@@ -957,7 +1052,7 @@ def port_expose(
 
 
 @port.command("close")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.argument("mapping", metavar="host-port:sandbox-port")
 @ssh_auth_options
 @comm_channel_option
@@ -986,7 +1081,7 @@ def port_close(
 
 
 @port.command("list")
-@click.argument("vm_id", metavar="sandbox")
+@click.argument("vm_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @ssh_auth_options
 @comm_channel_option
 @json_option
@@ -1137,7 +1232,9 @@ def browser_start(
 
 
 @browser.command("stop")
-@click.argument("session_id", required=False, metavar="sandbox")
+@click.argument(
+    "session_id", required=False, metavar="sandbox", shell_complete=complete_sandbox_names
+)
 @click.option("--all", "all_sessions", is_flag=True)
 def browser_stop(session_id: str | None, all_sessions: bool) -> Any:
     """Stop a browser sandbox."""
@@ -1166,7 +1263,7 @@ def browser_list(status: str | None, json_output: bool) -> Any:
 
 
 @browser.command("open")
-@click.argument("session_id", metavar="sandbox")
+@click.argument("session_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 def browser_open(session_id: str) -> Any:
     """Open a browser view."""
     _before_command()
@@ -1174,7 +1271,7 @@ def browser_open(session_id: str) -> Any:
 
 
 @browser.command("logs")
-@click.argument("session_id", metavar="sandbox")
+@click.argument("session_id", metavar="sandbox", shell_complete=complete_sandbox_names)
 @click.option("--tail", type=int, default=100, show_default=True)
 def browser_logs(session_id: str, tail: int) -> Any:
     """Show recent browser output."""

@@ -116,3 +116,28 @@ def positive_int_type() -> click.IntRange:
 
 def positive_float_type() -> click.FloatRange:
     return click.FloatRange(min=0, min_open=True)
+
+
+def complete_sandbox_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[Any]:
+    """Complete a sandbox-name argument with the user's existing sandboxes.
+
+    Used as a ``shell_complete`` callback. Completion runs in the user's
+    shell on every ``<TAB>``, so it must never raise and must stay cheap:
+    any failure (no state DB yet, backend import error) yields no
+    suggestions rather than a traceback.
+    """
+    from click.shell_completion import CompletionItem
+
+    try:
+        from smolvm.vm import SmolVMManager
+
+        with SmolVMManager() as sdk:
+            names = [vm.vm_id for vm in sdk.list_vms()]
+    except Exception:
+        return []
+
+    return [CompletionItem(name) for name in names if name.startswith(incomplete)]

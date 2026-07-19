@@ -4770,3 +4770,256 @@ class TestCliImage:
         payload = json.loads(capsys.readouterr().out)
         assert payload["command"] == "image.pull"
         assert "smolvm image pull --help" in payload["error"]["recovery"]
+
+
+class TestCliExec:
+    """Tests for `smolvm sandbox exec`."""
+
+    @pytest.fixture
+    def mock_vm_cls(self) -> MagicMock:
+        with patch("smolvm.facade.SmolVM") as m:
+            yield m
+
+    def _setup_vm(self, mock_vm_cls: MagicMock) -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "vm001"
+        vm.status = VMState.RUNNING
+        mock_vm_cls.from_id.return_value = vm
+        return vm
+
+    def test_exec_prints_stdout_and_returns_exit_code(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`sandbox exec` runs the command and passes output/exit code through."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="hi\n", stderr="")
+
+        ret = main(["sandbox", "exec", "vm001", "--", "echo", "hi"])
+
+        assert ret == 0
+        vm.run.assert_called_once_with("echo hi", timeout=30)
+        captured = capsys.readouterr()
+        assert captured.out == "hi\n"
+        vm.close.assert_called_once()
+
+    def test_exec_preserves_quoting(self, mock_vm_cls: MagicMock) -> None:
+        """Command tokens are re-joined with shell quoting preserved."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="", stderr="")
+
+        main(["sandbox", "exec", "vm001", "--", "echo", "hello world"])
+
+        vm.run.assert_called_once_with("echo 'hello world'", timeout=30)
+
+    def test_exec_nonzero_exit_code_propagates(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A failing guest command surfaces its exit code and stderr."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=3, stdout="", stderr="boom\n")
+
+        ret = main(["sandbox", "exec", "vm001", "--", "false"])
+
+        assert ret == 3
+        assert capsys.readouterr().err == "boom\n"
+
+    def test_exec_json_envelope(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--json` emits the command result as a JSON envelope."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="out", stderr="err")
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "echo", "out"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "sandbox.exec"
+        assert payload["data"] == {"exit_code": 0, "stdout": "out", "stderr": "err"}
+
+    def test_exec_custom_timeout(self, mock_vm_cls: MagicMock) -> None:
+        """`--timeout` is forwarded to the facade run call."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="", stderr="")
+
+        main(["sandbox", "exec", "vm001", "--timeout", "5", "--", "sleep", "1"])
+
+        vm.run.assert_called_once_with("sleep 1", timeout=5)
+
+    def test_exec_lookup_failure_prints_error(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A missing sandbox surfaces a human-facing error."""
+        mock_vm_cls.from_id.side_effect = Exception("VM 'missing' not found")
+
+        ret = main(["sandbox", "exec", "missing", "--", "ls"])
+
+        assert ret == 1
+        assert "not found" in capsys.readouterr().err
+
+
+class TestCliLogs:
+    """Tests for `smolvm sandbox logs`."""
+
+    @pytest.fixture
+    def mock_vm_cls(self) -> MagicMock:
+        with patch("smolvm.facade.SmolVM") as m:
+            yield m
+
+    def _setup_vm(self, mock_vm_cls: MagicMock, data_dir: Path) -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "vm001"
+        vm.data_dir = data_dir
+        mock_vm_cls.from_id.return_value = vm
+        return vm
+
+    def test_logs_prints_tail(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`sandbox logs` prints the last N lines of the host log."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("line1\nline2\nline3\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--tail", "2"])
+
+        assert ret == 0
+        assert capsys.readouterr().out == "line2\nline3\n"
+
+    def test_logs_json_payload(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--json` returns the log path and the tailed lines."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\nc\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--tail", "2", "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "sandbox.logs"
+        assert payload["data"]["lines"] == ["b", "c"]
+        assert payload["data"]["path"].endswith("vm001.log")
+
+    def test_logs_missing_file_errors(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A sandbox with no log file yields an actionable error."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+
+        ret = main(["sandbox", "logs", "vm001"])
+
+        assert ret == 1
+        assert "No logs found" in capsys.readouterr().err
+
+    def test_logs_missing_file_json(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Missing-log error is also emitted as a JSON envelope with recovery."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+
+        ret = main(["sandbox", "logs", "vm001", "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
+        assert "smolvm sandbox start vm001" in payload["error"]["recovery"]
+
+    def test_logs_follow_rejected_in_json(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--follow --json` is refused because streaming has no envelope."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("x\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--follow", "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+
+
+class TestCliCompletion:
+    """Tests for `smolvm completion` and dynamic sandbox-name completion."""
+
+    def test_completion_bash_emits_script(self, capsys: pytest.CaptureFixture) -> None:
+        """`smolvm completion bash` prints a sourceable completion script."""
+        ret = main(["completion", "bash"])
+
+        assert ret == 0
+        assert "_SMOLVM_COMPLETE" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+    def test_completion_supported_shells(
+        self,
+        shell: str,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Every advertised shell produces a non-empty script."""
+        ret = main(["completion", shell])
+
+        assert ret == 0
+        assert capsys.readouterr().out.strip()
+
+    def test_completion_invalid_shell(self) -> None:
+        """An unsupported shell is a usage error."""
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(build_cli(), ["completion", "powershell"])
+        assert result.exit_code == 2
+
+    def test_complete_sandbox_names_filters_by_prefix(self) -> None:
+        """The completion callback returns matching sandbox names."""
+        from smolvm.cli.commands.options import complete_sandbox_names
+
+        sdk = MagicMock()
+        sdk.__enter__.return_value = sdk
+        sdk.__exit__.return_value = False
+        sdk.list_vms.return_value = [_make_vm_info("web-1"), _make_vm_info("api-2")]
+
+        with patch("smolvm.vm.SmolVMManager", return_value=sdk):
+            items = complete_sandbox_names(MagicMock(), MagicMock(), "web")
+
+        assert [item.value for item in items] == ["web-1"]
+
+    def test_complete_sandbox_names_never_raises(self) -> None:
+        """A backend failure yields no suggestions instead of a traceback."""
+        from smolvm.cli.commands.options import complete_sandbox_names
+
+        with patch("smolvm.vm.SmolVMManager", side_effect=Exception("no db")):
+            items = complete_sandbox_names(MagicMock(), MagicMock(), "")
+
+        assert items == []
