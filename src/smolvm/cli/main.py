@@ -2584,7 +2584,7 @@ def _run_exec(args: SimpleNamespace) -> int:
                     "code": "command_failed",
                     "message": f"Command exited with status {result.exit_code}.",
                 }
-            with suppress(BrokenPipeError):
+            try:
                 emit_json(
                     command_name,
                     result.exit_code,
@@ -2595,6 +2595,8 @@ def _run_exec(args: SimpleNamespace) -> int:
                     },
                     error=error,
                 )
+            except BrokenPipeError:
+                _suppress_broken_pipe()
             return result.exit_code
 
         # Write each stream under its own guard so a closed stdout pipe does
@@ -2651,11 +2653,14 @@ def _run_logs(args: SimpleNamespace) -> int:
                     f"'smolvm sandbox logs {args.vm_id} --json' without --follow.",
                     recovery=f"Run 'smolvm sandbox logs {args.vm_id} --json' without --follow.",
                 )
-            emit_json(
-                command_name,
-                0,
-                data={"path": str(log_path), "lines": tail_lines},
-            )
+            try:
+                emit_json(
+                    command_name,
+                    0,
+                    data={"path": str(log_path), "lines": tail_lines},
+                )
+            except BrokenPipeError:
+                _suppress_broken_pipe()
             return 0
 
         try:

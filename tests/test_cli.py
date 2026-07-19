@@ -4990,6 +4990,22 @@ class TestCliExec:
         # stderr is still delivered even though the stdout write broke.
         assert capsys.readouterr().err == "err\n"
 
+    def test_exec_json_broken_pipe_suppressed(self, mock_vm_cls: MagicMock) -> None:
+        """A closed pipe during the JSON emit is handled, not left to noise at exit."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="x", stderr="")
+
+        with (
+            patch("smolvm.cli.main.emit_json", side_effect=BrokenPipeError),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--json", "--", "echo", "x"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
 
 class TestCliLogs:
     """Tests for `smolvm sandbox logs`."""
@@ -5120,6 +5136,24 @@ class TestCliLogs:
             patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
         ):
             ret = main(["sandbox", "logs", "vm001"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
+    def test_logs_json_broken_pipe_suppressed(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A closed pipe during the JSON emit does not re-raise via the outer handler."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\n")
+
+        with (
+            patch("smolvm.cli.main.emit_json", side_effect=BrokenPipeError),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "logs", "vm001", "--json"])
 
         assert ret == 0
         suppress_pipe.assert_called_once()

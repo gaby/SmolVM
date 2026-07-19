@@ -119,17 +119,14 @@ def positive_float_type() -> click.FloatRange:
     return click.FloatRange(min=0, min_open=True)
 
 
-def complete_sandbox_names(
-    ctx: click.Context,
-    param: click.Parameter,
-    incomplete: str,
-) -> list[Any]:
-    """Complete a sandbox-name argument with the user's existing sandboxes.
+def _complete_from_state(select: Callable[[Any], Any], incomplete: str) -> list[Any]:
+    """Return prefix-matched CompletionItems from the state store.
 
-    Used as a ``shell_complete`` callback. Completion runs in the user's
-    shell on every ``<TAB>``, so it must never raise and must stay cheap:
-    any failure (no state DB yet, backend import error) yields no
-    suggestions rather than a traceback.
+    Opens the state store directly (not SmolVMManager, which would create
+    disk/snapshot subdirectories just to list names on ``<TAB>``), calls
+    ``select(state)`` to get an iterable of ids, and closes the store.
+    Completion runs in the user's shell on every ``<TAB>``, so this must
+    never raise: any failure yields no suggestions rather than a traceback.
     """
     from click.shell_completion import CompletionItem
 
@@ -138,10 +135,8 @@ def complete_sandbox_names(
         from smolvm.storage import create_state_manager
         from smolvm.vm import resolve_data_dir
 
-        # Use the state store directly rather than SmolVMManager, which would
-        # create disk/snapshot subdirectories just to list names on <TAB>.
         state = create_state_manager(db_path=resolve_data_dir() / "smolvm.db")
-        names = [vm.vm_id for vm in state.list_vms()]
+        ids = list(select(state))
     except Exception:
         return []
     finally:
@@ -149,7 +144,16 @@ def complete_sandbox_names(
             with contextlib.suppress(Exception):
                 state.close()
 
-    return [CompletionItem(name) for name in names if name.startswith(incomplete)]
+    return [CompletionItem(i) for i in ids if i.startswith(incomplete)]
+
+
+def complete_sandbox_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[Any]:
+    """Complete a sandbox-name argument with the user's existing sandboxes."""
+    return _complete_from_state(lambda state: [vm.vm_id for vm in state.list_vms()], incomplete)
 
 
 def complete_browser_session_names(
@@ -160,24 +164,10 @@ def complete_browser_session_names(
     """Complete a browser session-id argument with existing browser sessions.
 
     Browser sandboxes live in their own session-id namespace (distinct from
-    sandbox names), so ``browser`` commands need this rather than
-    :func:`complete_sandbox_names`. Like that helper it must never raise and
-    yields no suggestions on any failure.
+    sandbox names), so ``browser`` commands use this rather than
+    :func:`complete_sandbox_names`.
     """
-    from click.shell_completion import CompletionItem
-
-    state = None
-    try:
-        from smolvm.storage import create_state_manager
-        from smolvm.vm import resolve_data_dir
-
-        state = create_state_manager(db_path=resolve_data_dir() / "smolvm.db")
-        ids = [session.session_id for session in state.list_browser_sessions()]
-    except Exception:
-        return []
-    finally:
-        if state is not None:
-            with contextlib.suppress(Exception):
-                state.close()
-
-    return [CompletionItem(sid) for sid in ids if sid.startswith(incomplete)]
+    return _complete_from_state(
+        lambda state: [session.session_id for session in state.list_browser_sessions()],
+        incomplete,
+    )
