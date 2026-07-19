@@ -275,16 +275,25 @@ def sandbox_ssh(vm_id: str, ssh_key: str | None, ssh_user: str, boot_timeout: fl
     show_default=True,
     help="Seconds to wait for the command to finish.",
 )
+@click.option(
+    "--start",
+    is_flag=True,
+    help="Start the sandbox first if it is not already running.",
+)
 @boot_timeout_option
 @json_option
 def sandbox_exec(
     vm_id: str,
     command: tuple[str, ...],
     timeout: int,
+    start: bool,
     boot_timeout: float,
     json_output: bool,
 ) -> Any:
     """Run a command in a sandbox and print its output.
+
+    The sandbox must already be running. Pass --start to have it started
+    automatically first.
 
     \b
     Example:
@@ -297,6 +306,7 @@ def sandbox_exec(
             vm_id=vm_id,
             command=command,
             timeout=timeout,
+            start=start,
             boot_timeout=boot_timeout,
             json=json_output,
         )

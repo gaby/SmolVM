@@ -4875,6 +4875,58 @@ class TestCliExec:
         assert ret == 1
         assert "not found" in capsys.readouterr().err
 
+    def test_exec_fails_when_not_running(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A stopped sandbox is not started implicitly; exec errors out."""
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+
+        ret = main(["sandbox", "exec", "vm001", "--", "ls"])
+
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "not running" in err
+        vm.run.assert_not_called()
+        vm.start.assert_not_called()
+        vm.close.assert_called_once()
+
+    def test_exec_not_running_json_recovery(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The not-running error carries a JSON recovery that mentions --start."""
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "ls"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "not_running"
+        assert "--start" in payload["error"]["recovery"]
+        vm.run.assert_not_called()
+
+    def test_exec_start_flag_boots_stopped_sandbox(
+        self,
+        mock_vm_cls: MagicMock,
+    ) -> None:
+        """`--start` starts a stopped sandbox before running the command."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+        vm.run.return_value = CommandResult(exit_code=0, stdout="ok\n", stderr="")
+
+        ret = main(["sandbox", "exec", "vm001", "--start", "--", "echo", "ok"])
+
+        assert ret == 0
+        vm.start.assert_called_once()
+        vm.run.assert_called_once_with("echo ok", timeout=30)
+
 
 class TestCliLogs:
     """Tests for `smolvm sandbox logs`."""

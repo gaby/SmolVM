@@ -144,7 +144,7 @@ smolvm sandbox shell my-sandbox
 
 Use `smolvm sandbox ssh my-sandbox` when you specifically need an SSH session.
 
-Run a single command without opening a shell — useful in scripts. Put the command after `--`:
+Run a single command in a running sandbox without opening a shell — useful in scripts. Put the command after `--`, and add `--start` if you want a stopped sandbox started first:
 
 ```bash
 smolvm sandbox exec my-sandbox -- python --version

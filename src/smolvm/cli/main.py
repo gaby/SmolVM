@@ -2547,7 +2547,19 @@ def _run_exec(args: SimpleNamespace) -> int:
     json_output = bool(getattr(args, "json", False))
     try:
         vm = SmolVM.from_id(args.vm_id)
-        _bring_sandbox_up(vm, args.boot_timeout, status_console=console_stderr())
+
+        if args.start:
+            _bring_sandbox_up(vm, args.boot_timeout, status_console=console_stderr())
+        elif vm.status != VMState.RUNNING:
+            recovery = (
+                f"Run 'smolvm sandbox start {args.vm_id}' first, or add --start to "
+                "start it automatically."
+            )
+            message = f"Sandbox '{args.vm_id}' is not running ({vm.status.value}). {recovery}"
+            if json_output:
+                return emit_error(command_name, "not_running", message, recovery=recovery)
+            render_error(message)
+            return 1
 
         cmd_str = shlex.join(args.command)
         result = vm.run(cmd_str, timeout=args.timeout)
