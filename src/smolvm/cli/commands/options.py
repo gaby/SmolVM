@@ -133,13 +133,21 @@ def complete_sandbox_names(
     """
     from click.shell_completion import CompletionItem
 
+    state = None
     try:
-        from smolvm.vm import SmolVMManager
+        from smolvm.storage import create_state_manager
+        from smolvm.vm import resolve_data_dir
 
-        with SmolVMManager() as sdk:
-            names = [vm.vm_id for vm in sdk.list_vms()]
+        # Use the state store directly rather than SmolVMManager, which would
+        # create disk/snapshot subdirectories just to list names on <TAB>.
+        state = create_state_manager(db_path=resolve_data_dir() / "smolvm.db")
+        names = [vm.vm_id for vm in state.list_vms()]
     except Exception:
         return []
+    finally:
+        if state is not None:
+            with contextlib.suppress(Exception):
+                state.close()
 
     return [CompletionItem(name) for name in names if name.startswith(incomplete)]
 

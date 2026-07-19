@@ -2493,7 +2493,10 @@ def _suppress_broken_pipe() -> None:
     """
     with suppress(Exception):
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
 
 
 def _bring_sandbox_up(
@@ -2571,17 +2574,17 @@ def _run_exec(args: SimpleNamespace) -> int:
         cmd_str = shlex.join(args.command)
         result = vm.run(cmd_str, timeout=args.timeout)
 
-        try:
-            if json_output:
-                error = None
-                if result.exit_code != 0:
-                    # Keep the envelope's ok<->error invariant: a non-zero guest
-                    # exit is a failure, so populate error while still returning
-                    # the command's stdout/stderr in data.
-                    error = {
-                        "code": "command_failed",
-                        "message": f"Command exited with status {result.exit_code}.",
-                    }
+        if json_output:
+            error = None
+            if result.exit_code != 0:
+                # Keep the envelope's ok<->error invariant: a non-zero guest
+                # exit is a failure, so populate error while still returning
+                # the command's stdout/stderr in data.
+                error = {
+                    "code": "command_failed",
+                    "message": f"Command exited with status {result.exit_code}.",
+                }
+            with suppress(BrokenPipeError):
                 emit_json(
                     command_name,
                     result.exit_code,
@@ -2592,16 +2595,20 @@ def _run_exec(args: SimpleNamespace) -> int:
                     },
                     error=error,
                 )
-                return result.exit_code
+            return result.exit_code
 
-            if result.stdout:
+        # Write each stream under its own guard so a closed stdout pipe does
+        # not swallow the command's stderr (which may still reach a terminal).
+        if result.stdout:
+            try:
                 sys.stdout.write(result.stdout)
                 sys.stdout.flush()
-            if result.stderr:
+            except BrokenPipeError:
+                _suppress_broken_pipe()
+        if result.stderr:
+            with suppress(BrokenPipeError):
                 sys.stderr.write(result.stderr)
                 sys.stderr.flush()
-        except BrokenPipeError:
-            _suppress_broken_pipe()
         return result.exit_code
     except Exception as exc:
         return _emit_cli_error(command_name, 1, exc, json_output=json_output)

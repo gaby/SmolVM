@@ -4967,6 +4967,29 @@ class TestCliExec:
         assert ret == 0
         suppress_pipe.assert_called_once()
 
+    def test_exec_stderr_survives_broken_stdout(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A closed stdout pipe must not swallow the command's stderr."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="out", stderr="err\n")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe"),
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--", "x"])
+
+        assert ret == 0
+        # stderr is still delivered even though the stdout write broke.
+        assert capsys.readouterr().err == "err\n"
+
 
 class TestCliLogs:
     """Tests for `smolvm sandbox logs`."""
@@ -5135,21 +5158,25 @@ class TestCliCompletion:
         """The completion callback returns matching sandbox names."""
         from smolvm.cli.commands.options import complete_sandbox_names
 
-        sdk = MagicMock()
-        sdk.__enter__.return_value = sdk
-        sdk.__exit__.return_value = False
-        sdk.list_vms.return_value = [_make_vm_info("web-1"), _make_vm_info("api-2")]
+        state = MagicMock()
+        state.list_vms.return_value = [_make_vm_info("web-1"), _make_vm_info("api-2")]
 
-        with patch("smolvm.vm.SmolVMManager", return_value=sdk):
+        with (
+            patch("smolvm.storage.create_state_manager", return_value=state),
+            patch("smolvm.vm.resolve_data_dir", return_value=Path("/tmp")),
+        ):
             items = complete_sandbox_names(MagicMock(), MagicMock(), "web")
 
         assert [item.value for item in items] == ["web-1"]
+        # The lighter state store is used, not SmolVMManager (which would
+        # create disk/snapshot dirs just to complete a name).
+        state.close.assert_called_once()
 
     def test_complete_sandbox_names_never_raises(self) -> None:
         """A backend failure yields no suggestions instead of a traceback."""
         from smolvm.cli.commands.options import complete_sandbox_names
 
-        with patch("smolvm.vm.SmolVMManager", side_effect=Exception("no db")):
+        with patch("smolvm.storage.create_state_manager", side_effect=Exception("no db")):
             items = complete_sandbox_names(MagicMock(), MagicMock(), "")
 
         assert items == []
