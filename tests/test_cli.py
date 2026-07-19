@@ -2153,6 +2153,7 @@ class TestCliShell:
         capsys: pytest.CaptureFixture,
     ) -> None:
         vm = MagicMock()
+        vm.vm_id = "vm001"
         vm.status = VMState.ERROR
         mock_vm_cls.from_id.return_value = vm
 
@@ -2165,7 +2166,7 @@ class TestCliShell:
         vm.close.assert_called_once()
         err = " ".join(capsys.readouterr().err.replace("│", "").split())
         assert "error state" in err
-        assert "inspect the sandbox logs" in err
+        assert "smolvm sandbox logs vm001" in err
         assert "smolvm sandbox delete vm001" in err
         assert "smolvm sandbox create --name vm001" in err
 
@@ -4927,6 +4928,45 @@ class TestCliExec:
         vm.start.assert_called_once()
         vm.run.assert_called_once_with("echo ok", timeout=30)
 
+    def test_exec_json_nonzero_populates_error(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A non-zero guest exit keeps the envelope's ok<->error invariant."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=2, stdout="partial", stderr="nope")
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "false"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "command_failed"
+        assert "2" in payload["error"]["message"]
+        # stdout/stderr are still available to the consumer on failure.
+        assert payload["data"] == {"exit_code": 2, "stdout": "partial", "stderr": "nope"}
+
+    def test_exec_broken_pipe_exits_cleanly(self, mock_vm_cls: MagicMock) -> None:
+        """A reader closing the pipe (`| head`) does not surface as an error."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="data", stderr="")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--", "echo", "data"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
 
 class TestCliLogs:
     """Tests for `smolvm sandbox logs`."""
@@ -5023,6 +5063,44 @@ class TestCliLogs:
         payload = json.loads(capsys.readouterr().out)
         assert payload["error"]["code"] == "invalid_input"
 
+    def test_logs_follow_no_trailing_newline_keeps_line_intact(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """--follow must not append a newline to a final line still being written."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("Booting")  # no trailing newline
+
+        # KeyboardInterrupt breaks out of the follow loop immediately after the
+        # initial tail is printed, so the test does not block.
+        with patch("time.sleep", side_effect=KeyboardInterrupt):
+            ret = main(["sandbox", "logs", "vm001", "--follow"])
+
+        assert ret == 0
+        assert capsys.readouterr().out == "Booting"
+
+    def test_logs_broken_pipe_exits_cleanly(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A reader closing the pipe (`| head`) does not surface as an error."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\n")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "logs", "vm001"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
 
 class TestCliCompletion:
     """Tests for `smolvm completion` and dynamic sandbox-name completion."""
@@ -5073,5 +5151,34 @@ class TestCliCompletion:
 
         with patch("smolvm.vm.SmolVMManager", side_effect=Exception("no db")):
             items = complete_sandbox_names(MagicMock(), MagicMock(), "")
+
+        assert items == []
+
+    def test_complete_browser_session_names_uses_browser_namespace(self) -> None:
+        """Browser completion lists browser session ids, not sandbox vm_ids."""
+        from smolvm.cli.commands.options import complete_browser_session_names
+
+        state = MagicMock()
+        session_a = MagicMock()
+        session_a.session_id = "brs-alpha"
+        session_b = MagicMock()
+        session_b.session_id = "brs-beta"
+        state.list_browser_sessions.return_value = [session_a, session_b]
+
+        with (
+            patch("smolvm.storage.create_state_manager", return_value=state),
+            patch("smolvm.vm.resolve_data_dir", return_value=Path("/tmp")),
+        ):
+            items = complete_browser_session_names(MagicMock(), MagicMock(), "brs-a")
+
+        assert [item.value for item in items] == ["brs-alpha"]
+        state.close.assert_called_once()
+
+    def test_complete_browser_session_names_never_raises(self) -> None:
+        """A failure to open the state store yields no suggestions."""
+        from smolvm.cli.commands.options import complete_browser_session_names
+
+        with patch("smolvm.storage.create_state_manager", side_effect=Exception("no db")):
+            items = complete_browser_session_names(MagicMock(), MagicMock(), "")
 
         assert items == []

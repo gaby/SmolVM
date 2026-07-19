@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import platform
 from collections.abc import Callable, Mapping
 from functools import wraps
@@ -141,3 +142,34 @@ def complete_sandbox_names(
         return []
 
     return [CompletionItem(name) for name in names if name.startswith(incomplete)]
+
+
+def complete_browser_session_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[Any]:
+    """Complete a browser session-id argument with existing browser sessions.
+
+    Browser sandboxes live in their own session-id namespace (distinct from
+    sandbox names), so ``browser`` commands need this rather than
+    :func:`complete_sandbox_names`. Like that helper it must never raise and
+    yields no suggestions on any failure.
+    """
+    from click.shell_completion import CompletionItem
+
+    state = None
+    try:
+        from smolvm.storage import create_state_manager
+        from smolvm.vm import resolve_data_dir
+
+        state = create_state_manager(db_path=resolve_data_dir() / "smolvm.db")
+        ids = [session.session_id for session in state.list_browser_sessions()]
+    except Exception:
+        return []
+    finally:
+        if state is not None:
+            with contextlib.suppress(Exception):
+                state.close()
+
+    return [CompletionItem(sid) for sid in ids if sid.startswith(incomplete)]

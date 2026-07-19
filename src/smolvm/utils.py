@@ -175,6 +175,25 @@ async def async_run_command(
     )
 
 
+def tail_file(path: Path, line_count: int) -> tuple[list[str], int, bool]:
+    """Return the tail of a UTF-8 text file.
+
+    Reads ``path`` and returns ``(lines, size, ends_with_newline)`` where
+    ``lines`` is the last ``line_count`` lines (all lines if the file is
+    shorter, empty if ``line_count <= 0``), ``size`` is the file's byte
+    length, and ``ends_with_newline`` says whether the content ends with a
+    line break. ``size`` lets a caller that streams later appends resume
+    from exactly where these lines end, and ``ends_with_newline`` lets it
+    avoid inserting a spurious break mid-line.
+    """
+    data = path.read_bytes()
+    text = data.decode("utf-8", errors="replace")
+    ends_with_newline = text.endswith(("\n", "\r"))
+    if line_count <= 0:
+        return [], len(data), ends_with_newline
+    return text.splitlines()[-line_count:], len(data), ends_with_newline
+
+
 def which(binary: str) -> Path | None:
     """Find a binary on the system PATH.
 

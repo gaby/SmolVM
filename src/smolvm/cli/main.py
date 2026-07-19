@@ -2432,29 +2432,13 @@ def _run_ssh(args: SimpleNamespace) -> int:
             ssh_key_path=args.ssh_key,
         )
 
-        console = console_stdout()
-        if vm.status in {VMState.CREATED, VMState.STOPPED}:
-            with console.status(f"Starting sandbox '{args.vm_id}'...", spinner="dots") as status:
-                vm.start(boot_timeout=args.boot_timeout)
-                status.update("Waiting for SSH...")
-                vm.wait_for_ssh(timeout=args.boot_timeout)
-        elif vm.status == VMState.PAUSED:
-            with console.status(f"Resuming sandbox '{args.vm_id}'...", spinner="dots") as status:
-                vm.resume()
-                status.update("Waiting for SSH...")
-                vm.wait_for_ssh(timeout=args.boot_timeout)
-        elif vm.status == VMState.ERROR:
-            raise RuntimeError(
-                f"VM '{args.vm_id}' is in error state. Recreate it or inspect the VM logs "
-                "before attaching."
-            )
-        else:
-            with console.status("Waiting for SSH...", spinner="dots"):
-                vm.wait_for_ssh(timeout=args.boot_timeout)
-            completed = subprocess.run(vm._ssh_attach_command(), check=False)
-            if completed.returncode != 0:
-                _hint_if_vm_crashed(vm)
-            return completed.returncode
+        _bring_sandbox_up(
+            vm,
+            args.boot_timeout,
+            status_console=console_stdout(),
+            ready_message="Waiting for SSH...",
+            wait=lambda: vm.wait_for_ssh(timeout=args.boot_timeout),
+        )
         completed = subprocess.run(vm._ssh_attach_command(), check=False)
         if completed.returncode != 0:
             _hint_if_vm_crashed(vm)
@@ -2483,28 +2467,13 @@ def _run_shell(args: SimpleNamespace) -> int:
         vm = SmolVM.from_id(args.vm_id)
         vm.ensure_shell_supported()
 
-        console = console_stdout()
-        if vm.status in {VMState.CREATED, VMState.STOPPED}:
-            with console.status(f"Starting sandbox '{args.vm_id}'...", spinner="dots") as status:
-                vm.start(boot_timeout=args.boot_timeout)
-                status.update("Opening shell...")
-                vm.wait_for_shell(timeout=args.boot_timeout)
-            return vm.attach_shell(timeout=args.boot_timeout)
-        if vm.status == VMState.PAUSED:
-            with console.status(f"Resuming sandbox '{args.vm_id}'...", spinner="dots") as status:
-                vm.resume()
-                status.update("Opening shell...")
-                vm.wait_for_shell(timeout=args.boot_timeout)
-            return vm.attach_shell(timeout=args.boot_timeout)
-        if vm.status == VMState.ERROR:
-            raise RuntimeError(
-                f"Sandbox '{args.vm_id}' is in error state; inspect the sandbox logs, or run "
-                f"'smolvm sandbox delete {args.vm_id}' then "
-                f"'smolvm sandbox create --name {args.vm_id}' to recreate it."
-            )
-
-        with console.status("Opening shell...", spinner="dots"):
-            vm.wait_for_shell(timeout=args.boot_timeout)
+        _bring_sandbox_up(
+            vm,
+            args.boot_timeout,
+            status_console=console_stdout(),
+            ready_message="Opening shell...",
+            wait=lambda: vm.wait_for_shell(timeout=args.boot_timeout),
+        )
         return vm.attach_shell(timeout=args.boot_timeout)
     except Exception as exc:
         return _emit_cli_error(command_name, 1, exc, json_output=False)
@@ -2513,20 +2482,51 @@ def _run_shell(args: SimpleNamespace) -> int:
             vm.close()
 
 
-def _bring_sandbox_up(vm: Any, boot_timeout: float, *, status_console: Any) -> None:
-    """Start or resume a sandbox so a command can run in it.
+def _suppress_broken_pipe() -> None:
+    """Silence the interpreter's exit-time flush after a reader closed.
 
-    Mirrors the connect-command convention used by ``shell``/``ssh``:
-    a stopped sandbox is started and a paused one resumed; an errored
-    sandbox raises with a recovery path. Progress is shown on stderr so
-    it never mixes into captured command output.
+    When output is piped into a consumer that exits early (``| head``),
+    the next write to stdout raises ``BrokenPipeError`` and Python would
+    also re-raise it while flushing at shutdown. Pointing stdout at
+    ``os.devnull`` makes the shutdown flush a no-op so the command exits
+    quietly, matching how standard tools behave under a closed pipe.
+    """
+    with suppress(Exception):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+
+
+def _bring_sandbox_up(
+    vm: Any,
+    boot_timeout: float,
+    *,
+    status_console: Any,
+    ready_message: str | None = None,
+    wait: Callable[[], Any] | None = None,
+) -> None:
+    """Start or resume a sandbox so it can be used.
+
+    A stopped sandbox is started and a paused one resumed; an errored
+    sandbox raises with a recovery path. When ``wait`` is given it is
+    called once the sandbox is up (and for an already-running sandbox) to
+    block until it is reachable, showing ``ready_message`` on the spinner.
+    Progress renders on ``status_console`` so callers that need a clean
+    stdout can direct it to stderr.
     """
     if vm.status in {VMState.CREATED, VMState.STOPPED}:
-        with status_console.status(f"Starting sandbox '{vm.vm_id}'...", spinner="dots"):
+        with status_console.status(f"Starting sandbox '{vm.vm_id}'...", spinner="dots") as spinner:
             vm.start(boot_timeout=boot_timeout)
+            if wait is not None:
+                if ready_message:
+                    spinner.update(ready_message)
+                wait()
     elif vm.status == VMState.PAUSED:
-        with status_console.status(f"Resuming sandbox '{vm.vm_id}'...", spinner="dots"):
+        with status_console.status(f"Resuming sandbox '{vm.vm_id}'...", spinner="dots") as spinner:
             vm.resume()
+            if wait is not None:
+                if ready_message:
+                    spinner.update(ready_message)
+                wait()
     elif vm.status == VMState.ERROR:
         raise RuntimeError(
             f"Sandbox '{vm.vm_id}' is in error state; inspect its logs with "
@@ -2534,6 +2534,9 @@ def _bring_sandbox_up(vm: Any, boot_timeout: float, *, status_console: Any) -> N
             f"'smolvm sandbox delete {vm.vm_id}' then "
             f"'smolvm sandbox create --name {vm.vm_id}' to recreate it."
         )
+    elif wait is not None:
+        with status_console.status(ready_message or "Connecting...", spinner="dots"):
+            wait()
 
 
 def _run_exec(args: SimpleNamespace) -> int:
@@ -2547,6 +2550,10 @@ def _run_exec(args: SimpleNamespace) -> int:
     json_output = bool(getattr(args, "json", False))
     try:
         vm = SmolVM.from_id(args.vm_id)
+        # Pull the latest persisted state so the running check below and the
+        # --start decision don't act on a status cached at from_id() time.
+        with suppress(Exception):
+            vm.refresh()
 
         if args.start:
             _bring_sandbox_up(vm, args.boot_timeout, status_console=console_stderr())
@@ -2564,24 +2571,37 @@ def _run_exec(args: SimpleNamespace) -> int:
         cmd_str = shlex.join(args.command)
         result = vm.run(cmd_str, timeout=args.timeout)
 
-        if json_output:
-            emit_json(
-                command_name,
-                result.exit_code,
-                data={
-                    "exit_code": result.exit_code,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                },
-            )
-            return result.exit_code
+        try:
+            if json_output:
+                error = None
+                if result.exit_code != 0:
+                    # Keep the envelope's ok<->error invariant: a non-zero guest
+                    # exit is a failure, so populate error while still returning
+                    # the command's stdout/stderr in data.
+                    error = {
+                        "code": "command_failed",
+                        "message": f"Command exited with status {result.exit_code}.",
+                    }
+                emit_json(
+                    command_name,
+                    result.exit_code,
+                    data={
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    },
+                    error=error,
+                )
+                return result.exit_code
 
-        if result.stdout:
-            sys.stdout.write(result.stdout)
-            sys.stdout.flush()
-        if result.stderr:
-            sys.stderr.write(result.stderr)
-            sys.stderr.flush()
+            if result.stdout:
+                sys.stdout.write(result.stdout)
+                sys.stdout.flush()
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+        except BrokenPipeError:
+            _suppress_broken_pipe()
         return result.exit_code
     except Exception as exc:
         return _emit_cli_error(command_name, 1, exc, json_output=json_output)
@@ -2590,23 +2610,13 @@ def _run_exec(args: SimpleNamespace) -> int:
             vm.close()
 
 
-def _tail_file(path: Path, lines: int) -> tuple[list[str], int]:
-    """Return the last ``lines`` lines of ``path`` and the current byte size.
-
-    The byte size lets ``--follow`` resume reading from where the tail
-    ended without re-printing what was already shown.
-    """
-    data = path.read_bytes()
-    text = data.decode("utf-8", errors="replace")
-    all_lines = text.splitlines()
-    return all_lines[-lines:], len(data)
-
-
 def _run_logs(args: SimpleNamespace) -> int:
     """Handle ``smolvm sandbox logs``."""
+    import codecs
     import time
 
     from smolvm.facade import SmolVM
+    from smolvm.utils import tail_file
 
     command_name = getattr(args, "command_name", "sandbox.logs")
     json_output = bool(getattr(args, "json", False))
@@ -2623,7 +2633,7 @@ def _run_logs(args: SimpleNamespace) -> int:
             render_error(message)
             return 1
 
-        tail_lines, offset = _tail_file(log_path, args.tail)
+        tail_lines, offset, ends_with_newline = tail_file(log_path, args.tail)
 
         if json_output:
             if args.follow:
@@ -2641,28 +2651,41 @@ def _run_logs(args: SimpleNamespace) -> int:
             )
             return 0
 
-        for line in tail_lines:
-            sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-
-        if not args.follow:
-            return 0
-
         try:
+            body = "\n".join(tail_lines)
+            if body:
+                sys.stdout.write(body)
+                # Terminate the last line unless we are about to --follow a file
+                # whose final line had no newline yet; adding one there would
+                # split a line the guest is still writing.
+                if ends_with_newline or not args.follow:
+                    sys.stdout.write("\n")
+            sys.stdout.flush()
+
+            if not args.follow:
+                return 0
+
+            # Decode incrementally so a multi-byte UTF-8 character split across
+            # a read boundary is buffered rather than mangled.
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
             while True:
                 time.sleep(0.5)
                 size = log_path.stat().st_size
                 if size < offset:
                     # File was truncated/rotated; restart from the top.
                     offset = 0
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
                 if size > offset:
                     with log_path.open("rb") as handle:
                         handle.seek(offset)
                         chunk = handle.read()
                         offset += len(chunk)
-                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.write(decoder.decode(chunk))
                     sys.stdout.flush()
         except KeyboardInterrupt:
+            return 0
+        except BrokenPipeError:
+            _suppress_broken_pipe()
             return 0
     except Exception as exc:
         return _emit_cli_error(command_name, 1, exc, json_output=json_output)

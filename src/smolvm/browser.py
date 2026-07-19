@@ -750,13 +750,13 @@ class _BrowserSandbox:
 
     @staticmethod
     def _tail_local_file(path: Path, line_count: int) -> str:
+        from smolvm.utils import tail_file
+
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines, _, _ = tail_file(path, line_count)
         except OSError as e:
             return f"<failed to read {path}: {e}>"
-        if line_count <= 0:
-            return ""
-        return "\n".join(lines[-line_count:])
+        return "\n".join(lines)
 
 
 class _DesktopSandbox(_BrowserSandbox):
