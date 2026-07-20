@@ -70,6 +70,16 @@ class TestTailFile:
         assert size == 0
         assert ends_with_newline is False
 
+    def test_invalid_utf8_replaced(self, tmp_path) -> None:
+        # A corrupt log (invalid UTF-8 bytes) must decode with replacement
+        # characters rather than raising.
+        p = tmp_path / "log.txt"
+        p.write_bytes(b"good\n\xff\xfe bad\n")
+        lines, size, _ = tail_file(p, 5)
+        assert lines[0] == "good"
+        assert "�" in lines[1]
+        assert size == p.stat().st_size
+
 
 class TestRunCommand:
     """Tests for run_command utility."""

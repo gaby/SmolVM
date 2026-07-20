@@ -77,7 +77,8 @@ eval "$(smolvm completion bash)"
 # zsh — add to ~/.zshrc
 eval "$(smolvm completion zsh)"
 
-# fish — write once to the completions folder
+# fish — create the folder once, then write the completion file
+mkdir -p ~/.config/fish/completions
 smolvm completion fish > ~/.config/fish/completions/smolvm.fish
 ```
 
