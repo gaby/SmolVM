@@ -5193,6 +5193,9 @@ class TestCliCompletion:
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("ZDOTDIR", raising=False)
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        # The suite may run as root (containers); without this the sudo-aware
+        # home resolution would ignore the monkeypatched HOME.
+        monkeypatch.delenv("SUDO_USER", raising=False)
         return tmp_path
 
     def test_completion_install_bash_writes_script_and_rc_line(
@@ -5262,7 +5265,141 @@ class TestCliCompletion:
         ret = main(["completion", "bash", "--install"])
 
         assert ret == 1
-        assert "Could not set up tab completion" in capsys.readouterr().err
+        err = " ".join(capsys.readouterr().err.split())
+        assert "Could not set up tab completion" in err
+        # Plain English, not a raw exception repr with errno codes.
+        assert "Errno" not in err
+
+    def test_completion_install_quotes_path_with_apostrophe(self, fake_home: Path) -> None:
+        """A home path containing a single quote yields a shell-safe source line."""
+        import shlex
+
+        quirky_home = fake_home / "o'brien"
+        quirky_home.mkdir()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("HOME", str(quirky_home))
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = quirky_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = (quirky_home / ".bashrc").read_text()
+        assert f"source {shlex.quote(str(script_path))}" in bashrc
+
+    def test_completion_install_reenables_commented_line(self, fake_home: Path) -> None:
+        """A commented-out managed line is replaced by an active one, not kept."""
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(f"# source {script_path}  # smolvm tab completion\nalias ll='ls -la'\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        assert f"source {script_path}  # smolvm tab completion" in content
+        assert f"# source {script_path}" not in content
+        # User content is untouched.
+        assert "alias ll='ls -la'" in content
+
+    def test_completion_install_replaces_stale_managed_line(self, fake_home: Path) -> None:
+        """A managed line pointing at an old path is replaced, not duplicated."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(
+            "source /old/home/.smolvm/completions/smolvm.bash  # smolvm tab completion\n"
+        )
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        assert "/old/home/" not in content
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert content.count("# smolvm tab completion") == 1
+        assert str(script_path) in content
+
+    def test_completion_install_respects_user_written_line(self, fake_home: Path) -> None:
+        """A source line the user wrote themselves is honored, not duplicated."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text("source ~/.smolvm/completions/smolvm.bash\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        # No managed line added; the user's own line is untouched.
+        assert "# smolvm tab completion" not in content
+        assert content == "source ~/.smolvm/completions/smolvm.bash\n"
+
+    def test_completion_install_preserves_non_utf8_rc(self, fake_home: Path) -> None:
+        """An rc file with undecodable bytes is appended to without corruption."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_bytes(b"alias x='y'\n\xff\xfe raw bytes\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        raw = bashrc.read_bytes()
+        assert b"\xff\xfe raw bytes" in raw
+        assert b"# smolvm tab completion" in raw
+
+    def test_completion_install_creates_missing_zdotdir(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ZDOTDIR pointing at a not-yet-existing directory is created, not an error."""
+        zdotdir = tmp_path / "zdot-missing"
+        monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        assert (zdotdir / ".zshrc").exists()
+
+    def test_completion_install_zsh_script_guards_compinit(self, fake_home: Path) -> None:
+        """The installed zsh script initializes compinit before compdef runs."""
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        script = (fake_home / ".smolvm" / "completions" / "smolvm.zsh").read_text()
+        # The compinit guard must run before click's `compdef` registration.
+        assert "autoload -Uz compinit" in script
+        assert script.index("autoload -Uz compinit") < script.index("compdef _smolvm_completion")
+
+    def test_completion_install_bash_on_macos_uses_bash_profile(
+        self,
+        fake_home: Path,
+    ) -> None:
+        """On macOS, bash login shells read ~/.bash_profile, so install targets it."""
+        with patch("smolvm.cli.completion.platform.system", return_value="Darwin"):
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        assert (fake_home / ".bash_profile").exists()
+        assert not (fake_home / ".bashrc").exists()
+
+    def test_completion_install_under_sudo_targets_real_user_home(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Under sudo, files land in the invoking user's home, not root's."""
+        sudo_home = tmp_path / "real-user"
+        sudo_home.mkdir()
+        sudo_info = MagicMock()
+        sudo_info.pw_dir = str(sudo_home)
+        sudo_info.pw_uid = os.getuid()
+        sudo_info.pw_gid = os.getgid()
+
+        with patch("smolvm.vm._get_sudo_user_info", return_value=sudo_info):
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = sudo_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert script_path.exists()
+        assert str(script_path) in (sudo_home / ".bashrc").read_text()
+        # Nothing written into the (fake) root home.
+        assert not (fake_home / ".bashrc").exists()
 
     def test_complete_sandbox_names_filters_by_prefix(self) -> None:
         """The completion callback returns matching sandbox names."""
