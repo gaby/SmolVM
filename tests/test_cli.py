@@ -5188,6 +5188,82 @@ class TestCliCompletion:
         result = CliRunner().invoke(build_cli(), ["completion", "powershell"])
         assert result.exit_code == 2
 
+    @pytest.fixture
+    def fake_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ZDOTDIR", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        return tmp_path
+
+    def test_completion_install_bash_writes_script_and_rc_line(
+        self,
+        fake_home: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`completion bash --install` persists the script and sources it from ~/.bashrc."""
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert "_SMOLVM_COMPLETE" in script_path.read_text()
+        bashrc = (fake_home / ".bashrc").read_text()
+        assert str(script_path) in bashrc
+        out = " ".join(capsys.readouterr().out.split())
+        assert "Open a new shell" in out
+
+    def test_completion_install_is_idempotent(self, fake_home: Path) -> None:
+        """Re-running --install refreshes the script without duplicating the rc line."""
+        main(["completion", "bash", "--install"])
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = (fake_home / ".bashrc").read_text()
+        assert bashrc.count(str(script_path)) == 1
+
+    def test_completion_install_zsh_respects_zdotdir(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`completion zsh --install` writes the source line to $ZDOTDIR/.zshrc."""
+        zdotdir = tmp_path / "zdot"
+        zdotdir.mkdir()
+        monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.zsh"
+        assert str(script_path) in (zdotdir / ".zshrc").read_text()
+
+    def test_completion_install_fish_writes_autoload_file(self, fake_home: Path) -> None:
+        """`completion fish --install` creates the autoloaded completions file."""
+        ret = main(["completion", "fish", "--install"])
+
+        assert ret == 0
+        target = fake_home / ".config" / "fish" / "completions" / "smolvm.fish"
+        assert "smolvm" in target.read_text()
+        # fish autoloads the directory; no startup-file edit should happen.
+        assert not (fake_home / ".bashrc").exists()
+
+    def test_completion_install_failure_names_recovery(
+        self,
+        fake_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A write failure yields an actionable error, not a traceback."""
+        blocker = fake_home / "not-a-dir"
+        blocker.write_text("")
+        monkeypatch.setenv("HOME", str(blocker))
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 1
+        assert "Could not set up tab completion" in capsys.readouterr().err
+
     def test_complete_sandbox_names_filters_by_prefix(self) -> None:
         """The completion callback returns matching sandbox names."""
         from smolvm.cli.commands.options import complete_sandbox_names

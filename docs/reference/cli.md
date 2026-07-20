@@ -68,7 +68,15 @@ Images are stored in `~/.smolvm/images`. To keep them somewhere else, set the `S
 
 ## Shell completion
 
-Turn on tab completion so your shell can finish `smolvm` commands, options, and the names of your existing sandboxes as you type. Pick the line for your shell:
+Turn on tab completion so your shell can finish `smolvm` commands, options, and the names of your existing sandboxes as you type. One command sets it up:
+
+```bash
+smolvm completion bash --install   # also works with: zsh, fish
+```
+
+Open a new shell afterward, then type `smolvm sandbox ssh` followed by a space and press Tab to complete a sandbox name.
+
+Prefer to wire it up yourself? Run the same command without `--install` to print the script, then load it your own way:
 
 ```bash
 # bash — add to ~/.bashrc
@@ -81,8 +89,6 @@ eval "$(smolvm completion zsh)"
 mkdir -p ~/.config/fish/completions
 smolvm completion fish > ~/.config/fish/completions/smolvm.fish
 ```
-
-Open a new shell afterward, then type `smolvm sandbox ssh` followed by a space and press Tab to complete a sandbox name.
 
 ## Common options
 

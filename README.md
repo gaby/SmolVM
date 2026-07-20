@@ -156,7 +156,7 @@ If something goes wrong, read the sandbox's logs (add `--follow` to watch them l
 smolvm sandbox logs my-sandbox
 ```
 
-Tip: turn on tab completion so your shell can finish commands and sandbox names for you — add `eval "$(smolvm completion bash)"` (or `zsh`) to your shell startup file. See the [CLI reference](docs/reference/cli.md#shell-completion) for fish and other details.
+Tip: turn on tab completion so your shell can finish commands and sandbox names for you — run `smolvm completion bash --install` (or `zsh`, `fish`) once. See the [CLI reference](docs/reference/cli.md#shell-completion) for details.
 
 ## Windows sandbox
 

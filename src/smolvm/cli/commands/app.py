@@ -453,21 +453,28 @@ def update(check_only: bool, json_output: bool) -> Any:
     return run_update(check=check_only, json_output=json_output)
 
 
-@cli.command("completion", short_help="Print a shell tab-completion script.")
+@cli.command("completion", short_help="Print or install a shell tab-completion script.")
 @click.argument("shell", type=click.Choice(["bash", "zsh", "fish"]))
-def completion(shell: str) -> int:
-    """Print a shell tab-completion script for smolvm.
+@click.option(
+    "--install",
+    "install",
+    is_flag=True,
+    help="Set up completion for the shell in one step instead of printing the script.",
+)
+def completion(shell: str, install: bool) -> int:
+    """Print or install a shell tab-completion script for smolvm.
 
     Completion suggests subcommands, options, and the names of your existing
-    sandboxes. Load it in your current shell, or install it permanently:
+    sandboxes. The quickest setup is one command:
+
+    \b
+      smolvm completion bash --install   # also: zsh, fish
+
+    Without --install the script is printed so you can wire it up yourself:
 
     \b
     bash:  eval "$(smolvm completion bash)"
-           # or persist: smolvm completion bash > ~/.smolvm-completion.bash
-           #             echo 'source ~/.smolvm-completion.bash' >> ~/.bashrc
     zsh:   eval "$(smolvm completion zsh)"
-           # or persist: smolvm completion zsh > ~/.smolvm-completion.zsh
-           #             echo 'source ~/.smolvm-completion.zsh' >> ~/.zshrc
     fish:  smolvm completion fish > ~/.config/fish/completions/smolvm.fish
     """
     from click.shell_completion import get_completion_class
@@ -476,7 +483,12 @@ def completion(shell: str) -> int:
     if completion_cls is None:  # pragma: no cover - guarded by click.Choice
         raise click.UsageError(f"Shell completion is not supported for '{shell}'.")
     comp = completion_cls(cli, {}, "smolvm", "_SMOLVM_COMPLETE")
-    click.echo(comp.source())
+    script = comp.source()
+    if install:
+        from smolvm.cli.completion import run_completion_install
+
+        return run_completion_install(shell, script)
+    click.echo(script)
     return 0
 
 
