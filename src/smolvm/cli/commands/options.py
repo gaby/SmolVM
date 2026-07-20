@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import platform
 from collections.abc import Callable, Mapping
 from functools import wraps
@@ -116,3 +117,57 @@ def positive_int_type() -> click.IntRange:
 
 def positive_float_type() -> click.FloatRange:
     return click.FloatRange(min=0, min_open=True)
+
+
+def _complete_from_state(select: Callable[[Any], Any], incomplete: str) -> list[Any]:
+    """Return prefix-matched CompletionItems from the state store.
+
+    Opens the state store directly (not SmolVMManager, which would create
+    disk/snapshot subdirectories just to list names on ``<TAB>``), calls
+    ``select(state)`` to get an iterable of ids, and closes the store.
+    Completion runs in the user's shell on every ``<TAB>``, so this must
+    never raise: any failure yields no suggestions rather than a traceback.
+    """
+    from click.shell_completion import CompletionItem
+
+    state = None
+    try:
+        from smolvm.storage import create_state_manager
+        from smolvm.vm import resolve_data_dir
+
+        state = create_state_manager(db_path=resolve_data_dir() / "smolvm.db")
+        ids = list(select(state))
+    except Exception:
+        return []
+    finally:
+        if state is not None:
+            with contextlib.suppress(Exception):
+                state.close()
+
+    return [CompletionItem(i) for i in ids if i.startswith(incomplete)]
+
+
+def complete_sandbox_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[Any]:
+    """Complete a sandbox-name argument with the user's existing sandboxes."""
+    return _complete_from_state(lambda state: [vm.vm_id for vm in state.list_vms()], incomplete)
+
+
+def complete_browser_session_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[Any]:
+    """Complete a browser session-id argument with existing browser sessions.
+
+    Browser sandboxes live in their own session-id namespace (distinct from
+    sandbox names), so ``browser`` commands use this rather than
+    :func:`complete_sandbox_names`.
+    """
+    return _complete_from_state(
+        lambda state: [session.session_id for session in state.list_browser_sessions()],
+        incomplete,
+    )

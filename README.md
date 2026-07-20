@@ -144,6 +144,20 @@ smolvm sandbox shell my-sandbox
 
 Use `smolvm sandbox ssh my-sandbox` when you specifically need an SSH session.
 
+Run a single command in a running sandbox without opening a shell — useful in scripts. Put the command after `--`, and add `--start` if you want a stopped sandbox started first:
+
+```bash
+smolvm sandbox exec my-sandbox -- python --version
+```
+
+If something goes wrong, read the sandbox's logs (add `--follow` to watch them live):
+
+```bash
+smolvm sandbox logs my-sandbox
+```
+
+Tip: turn on tab completion so your shell can finish commands and sandbox names for you — run `smolvm completion bash --install` (or `zsh`, `fish`) once. See the [CLI reference](docs/reference/cli.md#shell-completion) for details.
+
 ## Windows sandbox
 
 SmolVM can boot a Windows 11 guest as well as Linux. Hand it a Windows image and you get the same Python and CLI you use for Linux — run PowerShell, upload files, set environment variables, and run many sandboxes in parallel from one baseline image.

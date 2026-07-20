@@ -21,6 +21,8 @@ Run these in the order you need them:
 | `smolvm sandbox create` | Create a sandbox. Add `--network bridge --bridge BRIDGE` only when the sandbox should appear as a separate computer on that network. |
 | `smolvm sandbox list` / `info` | Find or inspect sandboxes. |
 | `smolvm sandbox shell` / `ssh` | Open a shell. `shell` uses SmolVM's fast control channel when available; `ssh` explicitly uses SSH. |
+| `smolvm sandbox exec` | Run one command inside a running sandbox and print its output — handy for scripts and agents. Put the command after `--`, e.g. `smolvm sandbox exec my-sandbox -- ls -la`. Add `--start` to start the sandbox first if it isn't running. |
+| `smolvm sandbox logs` | Show a sandbox's boot and console logs. Add `--follow` to keep printing new lines. |
 | `smolvm sandbox start` / `stop` | Start or stop a sandbox. |
 | `smolvm sandbox pause` / `resume` | Temporarily freeze and continue a running sandbox. |
 | `smolvm sandbox delete` | Remove one or more sandboxes. |
@@ -63,6 +65,30 @@ Images are stored in `~/.smolvm/images`. To keep them somewhere else, set the `S
 | `smolvm ui` | Start the local dashboard. |
 | `smolvm server start` | Start the local HTTP API. |
 | `smolvm windows build-image` | Build a Windows qcow2 image. |
+
+## Shell completion
+
+Turn on tab completion so your shell can finish `smolvm` commands, options, and the names of your existing sandboxes as you type. One command sets it up:
+
+```bash
+smolvm completion bash --install   # also works with: zsh, fish
+```
+
+Open a new shell afterward, then type `smolvm sandbox ssh` followed by a space and press Tab to complete a sandbox name.
+
+Prefer to wire it up yourself? Run the same command without `--install` to print the script, then load it your own way:
+
+```bash
+# bash — add to ~/.bashrc
+eval "$(smolvm completion bash)"
+
+# zsh — add to ~/.zshrc
+eval "$(smolvm completion zsh)"
+
+# fish — create the folder once, then write the completion file
+mkdir -p ~/.config/fish/completions
+smolvm completion fish > ~/.config/fish/completions/smolvm.fish
+```
 
 ## Common options
 

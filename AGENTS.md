@@ -43,6 +43,9 @@ SmolVM is specifically designed to provide a secure "sandbox" for AI agents to e
   aliases exist for muscle memory (`images` mirrors `docker images`); both
   delegate to their NOUN-VERB homes (`image prune`, `image list`). Do not
   add further top-level aliases without discussion.
+- `smolvm completion <shell>` is an accepted top-level meta-command (like
+  `git`/`gh` completion): it acts on the CLI itself rather than a sandbox
+  resource, so it sits outside the NOUN-VERB rule by design.
 
 
 ### Core writing principles

@@ -20,7 +20,65 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from smolvm.exceptions import SmolVMError
-from smolvm.utils import ensure_ssh_key, run_command, which
+from smolvm.utils import ensure_ssh_key, run_command, tail_file, which
+
+
+class TestTailFile:
+    """Tests for ``tail_file``."""
+
+    def test_returns_last_n_lines_and_size(self, tmp_path) -> None:
+        p = tmp_path / "log.txt"
+        p.write_text("a\nb\nc\nd\n")
+        lines, size, ends_with_newline = tail_file(p, 2)
+        assert lines == ["c", "d"]
+        assert size == p.stat().st_size
+        assert ends_with_newline is True
+
+    def test_no_trailing_newline(self, tmp_path) -> None:
+        p = tmp_path / "log.txt"
+        p.write_text("a\nb")
+        lines, _, ends_with_newline = tail_file(p, 5)
+        assert lines == ["a", "b"]
+        assert ends_with_newline is False
+
+    def test_crlf_normalized_to_single_lines(self, tmp_path) -> None:
+        p = tmp_path / "log.txt"
+        p.write_text("a\r\nb\r\n")
+        lines, _, _ = tail_file(p, 5)
+        assert lines == ["a", "b"]
+
+    def test_does_not_split_on_non_newline_separators(self, tmp_path) -> None:
+        # \x0c (form feed) and \x85 (NEL) are line boundaries to str.splitlines()
+        # but must not inflate the line count for a log line that contains them.
+        p = tmp_path / "log.txt"
+        p.write_text("first\x0cstill-first\x85same\nsecond\n")
+        lines, _, _ = tail_file(p, 5)
+        assert lines == ["first\x0cstill-first\x85same", "second"]
+
+    def test_zero_or_negative_count_returns_no_lines(self, tmp_path) -> None:
+        p = tmp_path / "log.txt"
+        p.write_text("a\nb\n")
+        lines, size, _ = tail_file(p, 0)
+        assert lines == []
+        assert size == p.stat().st_size
+
+    def test_empty_file(self, tmp_path) -> None:
+        p = tmp_path / "log.txt"
+        p.write_text("")
+        lines, size, ends_with_newline = tail_file(p, 10)
+        assert lines == []
+        assert size == 0
+        assert ends_with_newline is False
+
+    def test_invalid_utf8_replaced(self, tmp_path) -> None:
+        # A corrupt log (invalid UTF-8 bytes) must decode with replacement
+        # characters rather than raising.
+        p = tmp_path / "log.txt"
+        p.write_bytes(b"good\n\xff\xfe bad\n")
+        lines, size, _ = tail_file(p, 5)
+        assert lines[0] == "good"
+        assert "�" in lines[1]
+        assert size == p.stat().st_size
 
 
 class TestRunCommand:

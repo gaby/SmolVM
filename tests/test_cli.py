@@ -2153,6 +2153,7 @@ class TestCliShell:
         capsys: pytest.CaptureFixture,
     ) -> None:
         vm = MagicMock()
+        vm.vm_id = "vm001"
         vm.status = VMState.ERROR
         mock_vm_cls.from_id.return_value = vm
 
@@ -2165,7 +2166,7 @@ class TestCliShell:
         vm.close.assert_called_once()
         err = " ".join(capsys.readouterr().err.replace("│", "").split())
         assert "error state" in err
-        assert "inspect the sandbox logs" in err
+        assert "smolvm sandbox logs vm001" in err
         assert "smolvm sandbox delete vm001" in err
         assert "smolvm sandbox create --name vm001" in err
 
@@ -4770,3 +4771,740 @@ class TestCliImage:
         payload = json.loads(capsys.readouterr().out)
         assert payload["command"] == "image.pull"
         assert "smolvm image pull --help" in payload["error"]["recovery"]
+
+
+class TestCliExec:
+    """Tests for `smolvm sandbox exec`."""
+
+    @pytest.fixture
+    def mock_vm_cls(self) -> MagicMock:
+        with patch("smolvm.facade.SmolVM") as m:
+            yield m
+
+    def _setup_vm(self, mock_vm_cls: MagicMock) -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "vm001"
+        vm.status = VMState.RUNNING
+        mock_vm_cls.from_id.return_value = vm
+        return vm
+
+    def test_exec_prints_stdout_and_returns_exit_code(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`sandbox exec` runs the command and passes output/exit code through."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="hi\n", stderr="")
+
+        ret = main(["sandbox", "exec", "vm001", "--", "echo", "hi"])
+
+        assert ret == 0
+        vm.run.assert_called_once_with("echo hi", timeout=30)
+        captured = capsys.readouterr()
+        assert captured.out == "hi\n"
+        vm.close.assert_called_once()
+
+    def test_exec_preserves_quoting(self, mock_vm_cls: MagicMock) -> None:
+        """Command tokens are re-joined with shell quoting preserved."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="", stderr="")
+
+        main(["sandbox", "exec", "vm001", "--", "echo", "hello world"])
+
+        vm.run.assert_called_once_with("echo 'hello world'", timeout=30)
+
+    def test_exec_nonzero_exit_code_propagates(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A failing guest command surfaces its exit code and stderr."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=3, stdout="", stderr="boom\n")
+
+        ret = main(["sandbox", "exec", "vm001", "--", "false"])
+
+        assert ret == 3
+        assert capsys.readouterr().err == "boom\n"
+
+    def test_exec_json_envelope(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--json` emits the command result as a JSON envelope."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="out", stderr="err")
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "echo", "out"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "sandbox.exec"
+        assert payload["data"] == {"exit_code": 0, "stdout": "out", "stderr": "err"}
+
+    def test_exec_custom_timeout(self, mock_vm_cls: MagicMock) -> None:
+        """`--timeout` is forwarded to the facade run call."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="", stderr="")
+
+        main(["sandbox", "exec", "vm001", "--timeout", "5", "--", "sleep", "1"])
+
+        vm.run.assert_called_once_with("sleep 1", timeout=5)
+
+    def test_exec_lookup_failure_prints_error(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A missing sandbox surfaces a human-facing error."""
+        mock_vm_cls.from_id.side_effect = Exception("VM 'missing' not found")
+
+        ret = main(["sandbox", "exec", "missing", "--", "ls"])
+
+        assert ret == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_exec_fails_when_not_running(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A stopped sandbox is not started implicitly; exec errors out."""
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+
+        ret = main(["sandbox", "exec", "vm001", "--", "ls"])
+
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "not running" in err
+        vm.run.assert_not_called()
+        vm.start.assert_not_called()
+        vm.close.assert_called_once()
+
+    def test_exec_not_running_json_recovery(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """The not-running error carries a JSON recovery that mentions --start."""
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "ls"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "not_running"
+        assert "--start" in payload["error"]["recovery"]
+        vm.run.assert_not_called()
+
+    def test_exec_start_flag_boots_stopped_sandbox(
+        self,
+        mock_vm_cls: MagicMock,
+    ) -> None:
+        """`--start` starts a stopped sandbox before running the command."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.status = VMState.STOPPED
+        vm.run.return_value = CommandResult(exit_code=0, stdout="ok\n", stderr="")
+
+        ret = main(["sandbox", "exec", "vm001", "--start", "--", "echo", "ok"])
+
+        assert ret == 0
+        vm.start.assert_called_once()
+        vm.run.assert_called_once_with("echo ok", timeout=30)
+
+    def test_exec_json_nonzero_populates_error(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A non-zero guest exit keeps the envelope's ok<->error invariant."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=2, stdout="partial", stderr="nope")
+
+        ret = main(["sandbox", "exec", "vm001", "--json", "--", "false"])
+
+        assert ret == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "command_failed"
+        assert "2" in payload["error"]["message"]
+        # stdout/stderr are still available to the consumer on failure.
+        assert payload["data"] == {"exit_code": 2, "stdout": "partial", "stderr": "nope"}
+
+    def test_exec_broken_pipe_exits_cleanly(self, mock_vm_cls: MagicMock) -> None:
+        """A reader closing the pipe (`| head`) does not surface as an error."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="data", stderr="")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--", "echo", "data"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
+    def test_exec_stderr_survives_broken_stdout(
+        self,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A closed stdout pipe must not swallow the command's stderr."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="out", stderr="err\n")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe"),
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--", "x"])
+
+        assert ret == 0
+        # stderr is still delivered even though the stdout write broke.
+        assert capsys.readouterr().err == "err\n"
+
+    def test_exec_json_broken_pipe_suppressed(self, mock_vm_cls: MagicMock) -> None:
+        """A closed pipe during the JSON emit is handled, not left to noise at exit."""
+        from smolvm.types import CommandResult
+
+        vm = self._setup_vm(mock_vm_cls)
+        vm.run.return_value = CommandResult(exit_code=0, stdout="x", stderr="")
+
+        with (
+            patch("smolvm.cli.main.emit_json", side_effect=BrokenPipeError),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "exec", "vm001", "--json", "--", "echo", "x"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
+
+class TestCliLogs:
+    """Tests for `smolvm sandbox logs`."""
+
+    @pytest.fixture
+    def mock_vm_cls(self) -> MagicMock:
+        with patch("smolvm.facade.SmolVM") as m:
+            yield m
+
+    def _setup_vm(self, mock_vm_cls: MagicMock, data_dir: Path) -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "vm001"
+        vm.data_dir = data_dir
+        mock_vm_cls.from_id.return_value = vm
+        return vm
+
+    def test_logs_prints_tail(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`sandbox logs` prints the last N lines of the host log."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("line1\nline2\nline3\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--tail", "2"])
+
+        assert ret == 0
+        assert capsys.readouterr().out == "line2\nline3\n"
+
+    def test_logs_json_payload(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--json` returns the log path and the tailed lines."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\nc\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--tail", "2", "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "sandbox.logs"
+        assert payload["data"]["lines"] == ["b", "c"]
+        assert payload["data"]["path"].endswith("vm001.log")
+
+    def test_logs_missing_file_errors(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A sandbox with no log file yields an actionable error."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+
+        ret = main(["sandbox", "logs", "vm001"])
+
+        assert ret == 1
+        assert "No logs found" in capsys.readouterr().err
+
+    def test_logs_missing_file_json(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Missing-log error is also emitted as a JSON envelope with recovery."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+
+        ret = main(["sandbox", "logs", "vm001", "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
+        assert "smolvm sandbox start vm001" in payload["error"]["recovery"]
+
+    def test_logs_follow_rejected_in_json(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`--follow --json` is refused because streaming has no envelope."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("x\n")
+
+        ret = main(["sandbox", "logs", "vm001", "--follow", "--json"])
+
+        assert ret == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"]["code"] == "invalid_input"
+
+    def test_logs_follow_no_trailing_newline_keeps_line_intact(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """--follow must not append a newline to a final line still being written."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("Booting")  # no trailing newline
+
+        # KeyboardInterrupt breaks out of the follow loop immediately after the
+        # initial tail is printed, so the test does not block.
+        with patch("time.sleep", side_effect=KeyboardInterrupt):
+            ret = main(["sandbox", "logs", "vm001", "--follow"])
+
+        assert ret == 0
+        assert capsys.readouterr().out == "Booting"
+
+    def test_logs_broken_pipe_exits_cleanly(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A reader closing the pipe (`| head`) does not surface as an error."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\n")
+        fake_stdout = MagicMock()
+        fake_stdout.write.side_effect = BrokenPipeError()
+
+        with (
+            patch("smolvm.cli.main.sys.stdout", fake_stdout),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "logs", "vm001"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
+    def test_logs_json_broken_pipe_suppressed(
+        self,
+        mock_vm_cls: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A closed pipe during the JSON emit does not re-raise via the outer handler."""
+        self._setup_vm(mock_vm_cls, tmp_path)
+        (tmp_path / "vm001.log").write_text("a\nb\n")
+
+        with (
+            patch("smolvm.cli.main.emit_json", side_effect=BrokenPipeError),
+            patch("smolvm.cli.main._suppress_broken_pipe") as suppress_pipe,
+        ):
+            ret = main(["sandbox", "logs", "vm001", "--json"])
+
+        assert ret == 0
+        suppress_pipe.assert_called_once()
+
+
+class TestCliCompletion:
+    """Tests for `smolvm completion` and dynamic sandbox-name completion."""
+
+    def test_completion_bash_emits_script(self, capsys: pytest.CaptureFixture) -> None:
+        """`smolvm completion bash` prints a sourceable completion script."""
+        ret = main(["completion", "bash"])
+
+        assert ret == 0
+        assert "_SMOLVM_COMPLETE" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+    def test_completion_supported_shells(
+        self,
+        shell: str,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Every advertised shell produces a non-empty script."""
+        ret = main(["completion", shell])
+
+        assert ret == 0
+        assert capsys.readouterr().out.strip()
+
+    def test_completion_invalid_shell(self) -> None:
+        """An unsupported shell is a usage error."""
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(build_cli(), ["completion", "powershell"])
+        assert result.exit_code == 2
+
+    @pytest.fixture
+    def fake_home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("ZDOTDIR", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        # The suite may run as root (containers); without this the sudo-aware
+        # home resolution would ignore the monkeypatched HOME.
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        return tmp_path
+
+    def test_completion_install_bash_writes_script_and_rc_line(
+        self,
+        fake_home: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """`completion bash --install` persists the script and sources it from ~/.bashrc."""
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert "_SMOLVM_COMPLETE" in script_path.read_text()
+        bashrc = (fake_home / ".bashrc").read_text()
+        assert str(script_path) in bashrc
+        out = " ".join(capsys.readouterr().out.split())
+        assert "Open a new shell" in out
+
+    def test_completion_install_is_idempotent(self, fake_home: Path) -> None:
+        """Re-running --install refreshes the script without duplicating the rc line."""
+        main(["completion", "bash", "--install"])
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = (fake_home / ".bashrc").read_text()
+        assert bashrc.count(str(script_path)) == 1
+
+    def test_completion_install_zsh_respects_zdotdir(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`completion zsh --install` writes the source line to $ZDOTDIR/.zshrc."""
+        zdotdir = tmp_path / "zdot"
+        zdotdir.mkdir()
+        monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.zsh"
+        assert str(script_path) in (zdotdir / ".zshrc").read_text()
+
+    def test_completion_install_fish_writes_autoload_file(self, fake_home: Path) -> None:
+        """`completion fish --install` creates the autoloaded completions file."""
+        ret = main(["completion", "fish", "--install"])
+
+        assert ret == 0
+        target = fake_home / ".config" / "fish" / "completions" / "smolvm.fish"
+        assert "smolvm" in target.read_text()
+        # fish autoloads the directory; no startup-file edit should happen.
+        assert not (fake_home / ".bashrc").exists()
+
+    def test_completion_install_failure_names_recovery(
+        self,
+        fake_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """A write failure yields an actionable error, not a traceback."""
+        blocker = fake_home / "not-a-dir"
+        blocker.write_text("")
+        monkeypatch.setenv("HOME", str(blocker))
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 1
+        err = " ".join(capsys.readouterr().err.split())
+        assert "Could not set up tab completion" in err
+        # Plain English, not a raw exception repr with errno codes.
+        assert "Errno" not in err
+
+    def test_completion_install_quotes_path_with_apostrophe(self, fake_home: Path) -> None:
+        """A home path containing a single quote yields a shell-safe source line."""
+        import shlex
+
+        quirky_home = fake_home / "o'brien"
+        quirky_home.mkdir()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("HOME", str(quirky_home))
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = quirky_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = (quirky_home / ".bashrc").read_text()
+        assert f"source {shlex.quote(str(script_path))}" in bashrc
+
+    def test_completion_install_reenables_commented_line(self, fake_home: Path) -> None:
+        """A commented-out managed line is replaced by an active one, not kept."""
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(f"# source {script_path}  # smolvm tab completion\nalias ll='ls -la'\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        assert f"source {script_path}  # smolvm tab completion" in content
+        assert f"# source {script_path}" not in content
+        # User content is untouched.
+        assert "alias ll='ls -la'" in content
+
+    def test_completion_install_replaces_stale_managed_line(self, fake_home: Path) -> None:
+        """A managed line pointing at an old path is replaced, not duplicated."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(
+            "source /old/home/.smolvm/completions/smolvm.bash  # smolvm tab completion\n"
+        )
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        assert "/old/home/" not in content
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert content.count("# smolvm tab completion") == 1
+        assert str(script_path) in content
+
+    def test_completion_install_respects_user_written_line(self, fake_home: Path) -> None:
+        """A source line the user wrote themselves is honored, not duplicated."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text("source ~/.smolvm/completions/smolvm.bash\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        content = bashrc.read_text()
+        # No managed line added; the user's own line is untouched.
+        assert "# smolvm tab completion" not in content
+        assert content == "source ~/.smolvm/completions/smolvm.bash\n"
+
+    def test_completion_install_preserves_non_utf8_rc(self, fake_home: Path) -> None:
+        """An rc file with undecodable bytes is appended to without corruption."""
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_bytes(b"alias x='y'\n\xff\xfe raw bytes\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        raw = bashrc.read_bytes()
+        assert b"\xff\xfe raw bytes" in raw
+        assert b"# smolvm tab completion" in raw
+
+    def test_completion_install_creates_missing_zdotdir(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ZDOTDIR pointing at a not-yet-existing directory is created, not an error."""
+        zdotdir = tmp_path / "zdot-missing"
+        monkeypatch.setenv("ZDOTDIR", str(zdotdir))
+
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        assert (zdotdir / ".zshrc").exists()
+
+    def test_completion_install_zsh_script_guards_compinit(self, fake_home: Path) -> None:
+        """The installed zsh script initializes compinit before compdef runs."""
+        ret = main(["completion", "zsh", "--install"])
+
+        assert ret == 0
+        script = (fake_home / ".smolvm" / "completions" / "smolvm.zsh").read_text()
+        # The compinit guard must run before click's `compdef` registration.
+        assert "autoload -Uz compinit" in script
+        assert script.index("autoload -Uz compinit") < script.index("compdef _smolvm_completion")
+
+    def test_completion_install_bash_on_macos_uses_bash_profile(
+        self,
+        fake_home: Path,
+    ) -> None:
+        """On macOS, bash login shells read ~/.bash_profile, so install targets it."""
+        with patch("smolvm.cli.completion.platform.system", return_value="Darwin"):
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        assert (fake_home / ".bash_profile").exists()
+        assert not (fake_home / ".bashrc").exists()
+
+    def test_completion_install_under_sudo_targets_real_user_home(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Under sudo, files land in the invoking user's home, not root's."""
+        sudo_home = tmp_path / "real-user"
+        sudo_home.mkdir()
+        sudo_info = MagicMock()
+        sudo_info.pw_dir = str(sudo_home)
+        sudo_info.pw_uid = os.getuid()
+        sudo_info.pw_gid = os.getgid()
+
+        with patch("smolvm.vm._get_sudo_user_info", return_value=sudo_info):
+            ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        script_path = sudo_home / ".smolvm" / "completions" / "smolvm.bash"
+        assert script_path.exists()
+        assert str(script_path) in (sudo_home / ".bashrc").read_text()
+        # Nothing written into the (fake) root home.
+        assert not (fake_home / ".bashrc").exists()
+
+    def test_completion_install_collapses_duplicate_managed_lines(
+        self,
+        fake_home: Path,
+    ) -> None:
+        """Two identical managed lines (e.g. concurrent installs) collapse to one."""
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        line = f"source {script_path}  # smolvm tab completion"
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(f"{line}\n{line}\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        assert bashrc.read_text().count("# smolvm tab completion") == 1
+
+    def test_completion_install_sudo_chowns_created_ancestors(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every directory created below the user's home is chowned, however deep."""
+        sudo_home = tmp_path / "real-user"
+        sudo_home.mkdir()
+        # A custom fish config dir several levels deep inside the user's home.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(sudo_home / "nested" / "cfg"))
+        sudo_info = MagicMock()
+        sudo_info.pw_dir = str(sudo_home)
+        sudo_info.pw_uid = os.getuid()
+        sudo_info.pw_gid = os.getgid()
+
+        chowned: list[str] = []
+        with (
+            patch("smolvm.vm._get_sudo_user_info", return_value=sudo_info),
+            patch(
+                "smolvm.cli.completion.os.chown",
+                side_effect=lambda p, *_: chowned.append(str(p)),
+            ),
+        ):
+            ret = main(["completion", "fish", "--install"])
+
+        assert ret == 0
+        base = sudo_home / "nested" / "cfg" / "fish" / "completions"
+        for expected in (
+            base / "smolvm.fish",
+            base,
+            base.parent,
+            sudo_home / "nested" / "cfg",
+            sudo_home / "nested",
+        ):
+            assert str(expected) in chowned
+
+    def test_complete_sandbox_names_filters_by_prefix(self) -> None:
+        """The completion callback returns matching sandbox names."""
+        from smolvm.cli.commands.options import complete_sandbox_names
+
+        state = MagicMock()
+        state.list_vms.return_value = [_make_vm_info("web-1"), _make_vm_info("api-2")]
+
+        with (
+            patch("smolvm.storage.create_state_manager", return_value=state),
+            patch("smolvm.vm.resolve_data_dir", return_value=Path("/tmp")),
+        ):
+            items = complete_sandbox_names(MagicMock(), MagicMock(), "web")
+
+        assert [item.value for item in items] == ["web-1"]
+        # The lighter state store is used, not SmolVMManager (which would
+        # create disk/snapshot dirs just to complete a name).
+        state.close.assert_called_once()
+
+    def test_complete_sandbox_names_never_raises(self) -> None:
+        """A backend failure yields no suggestions instead of a traceback."""
+        from smolvm.cli.commands.options import complete_sandbox_names
+
+        with patch("smolvm.storage.create_state_manager", side_effect=Exception("no db")):
+            items = complete_sandbox_names(MagicMock(), MagicMock(), "")
+
+        assert items == []
+
+    def test_complete_browser_session_names_uses_browser_namespace(self) -> None:
+        """Browser completion lists browser session ids, not sandbox vm_ids."""
+        from smolvm.cli.commands.options import complete_browser_session_names
+
+        state = MagicMock()
+        session_a = MagicMock()
+        session_a.session_id = "brs-alpha"
+        session_b = MagicMock()
+        session_b.session_id = "brs-beta"
+        state.list_browser_sessions.return_value = [session_a, session_b]
+
+        with (
+            patch("smolvm.storage.create_state_manager", return_value=state),
+            patch("smolvm.vm.resolve_data_dir", return_value=Path("/tmp")),
+        ):
+            items = complete_browser_session_names(MagicMock(), MagicMock(), "brs-a")
+
+        assert [item.value for item in items] == ["brs-alpha"]
+        state.close.assert_called_once()
+
+    def test_complete_browser_session_names_never_raises(self) -> None:
+        """A failure to open the state store yields no suggestions."""
+        from smolvm.cli.commands.options import complete_browser_session_names
+
+        with patch("smolvm.storage.create_state_manager", side_effect=Exception("no db")):
+            items = complete_browser_session_names(MagicMock(), MagicMock(), "")
+
+        assert items == []
