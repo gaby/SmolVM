@@ -81,7 +81,7 @@ eval "$(smolvm completion zsh)"
 smolvm completion fish > ~/.config/fish/completions/smolvm.fish
 ```
 
-Open a new shell afterward, then type `smolvm sandbox ssh ` and press Tab to complete a sandbox name.
+Open a new shell afterward, then type `smolvm sandbox ssh` followed by a space and press Tab to complete a sandbox name.
 
 ## Common options
 

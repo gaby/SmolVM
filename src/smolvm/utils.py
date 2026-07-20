@@ -191,7 +191,14 @@ def tail_file(path: Path, line_count: int) -> tuple[list[str], int, bool]:
     ends_with_newline = text.endswith(("\n", "\r"))
     if line_count <= 0:
         return [], len(data), ends_with_newline
-    return text.splitlines()[-line_count:], len(data), ends_with_newline
+    # Split only on newlines. str.splitlines() also breaks on other Unicode
+    # and control separators (\v, \f, \x1c-\x1e, \x85,  ,  ), which
+    # would inflate the line count for logs that legitimately contain them.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.endswith("\n"):
+        normalized = normalized[:-1]  # no trailing empty line, matching splitlines
+    lines = normalized.split("\n") if normalized else []
+    return lines[-line_count:], len(data), ends_with_newline
 
 
 def which(binary: str) -> Path | None:

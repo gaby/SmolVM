@@ -1244,7 +1244,7 @@ def browser_start(
 
 @browser.command("stop")
 @click.argument(
-    "session_id", required=False, metavar="sandbox", shell_complete=complete_browser_session_names
+    "session_id", required=False, metavar="session", shell_complete=complete_browser_session_names
 )
 @click.option("--all", "all_sessions", is_flag=True)
 def browser_stop(session_id: str | None, all_sessions: bool) -> Any:
@@ -1274,7 +1274,7 @@ def browser_list(status: str | None, json_output: bool) -> Any:
 
 
 @browser.command("open")
-@click.argument("session_id", metavar="sandbox", shell_complete=complete_browser_session_names)
+@click.argument("session_id", metavar="session", shell_complete=complete_browser_session_names)
 def browser_open(session_id: str) -> Any:
     """Open a browser view."""
     _before_command()
@@ -1282,7 +1282,7 @@ def browser_open(session_id: str) -> Any:
 
 
 @browser.command("logs")
-@click.argument("session_id", metavar="sandbox", shell_complete=complete_browser_session_names)
+@click.argument("session_id", metavar="session", shell_complete=complete_browser_session_names)
 @click.option("--tail", type=int, default=100, show_default=True)
 def browser_logs(session_id: str, tail: int) -> Any:
     """Show recent browser output."""
