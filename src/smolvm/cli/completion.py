@@ -64,6 +64,23 @@ def _user_home() -> Path:
     return Path.home()
 
 
+def _with_ancestors_below(path: Path, stop: Path) -> list[Path]:
+    """Return ``path`` plus every ancestor strictly below ``stop``.
+
+    ``mkdir(parents=True)`` may create a whole chain of directories (a
+    custom ``XDG_CONFIG_HOME`` or ``ZDOTDIR`` several levels deep), so
+    ownership fixes must cover the full chain, not a fixed number of
+    parent levels. For a path outside ``stop`` only the path itself is
+    returned.
+    """
+    targets = [path]
+    current = path.parent
+    while current != stop and current != current.parent and current.is_relative_to(stop):
+        targets.append(current)
+        current = current.parent
+    return targets
+
+
 def _chown_to_sudo_user(paths: list[Path]) -> None:
     """Give files created while running under sudo back to the real user."""
     from smolvm.vm import _get_sudo_user_info
@@ -133,20 +150,21 @@ def _install_rc_line(shell: str, rc_path: Path, script_path: Path) -> str:
 
     kept = [line for line in lines if _MARKER not in line]
     marker_lines = [line for line in lines if _MARKER in line]
-    active = managed_line in marker_lines
-    stale = [line for line in marker_lines if line != managed_line]
     user_written = any(
         f"completions/smolvm.{shell}" in line and not line.lstrip().startswith("#") for line in kept
     )
 
-    if active and not stale:
+    # Exact-list comparison so duplicated copies of the current line still
+    # fall through to the rewrite below and get collapsed to one.
+    if marker_lines == [managed_line]:
         return (
             f"Tab completion for {shell} is already set up in '{rc_path}'. "
             "Open a new shell if it isn't active."
         )
 
     if user_written:
-        if stale:
+        if marker_lines:
+            # The user's own line loads the script; ours are redundant.
             _write_rc(rc_path, kept)
         return (
             f"Tab completion for {shell} is already loaded by a line you added "
@@ -182,11 +200,12 @@ def run_completion_install(shell: str, script: str) -> int:
     """
     console = console_stdout()
     try:
+        home = _user_home()
         if shell == "fish":
             target = _fish_completions_dir() / "smolvm.fish"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(script, encoding="utf-8")
-            _chown_to_sudo_user([target.parent.parent, target.parent, target])
+            _chown_to_sudo_user(_with_ancestors_below(target, home))
             console.print(
                 f"Tab completion for fish is set up at '{target}'. Open a new shell to use it."
             )
@@ -195,7 +214,7 @@ def run_completion_install(shell: str, script: str) -> int:
         if shell == "zsh":
             script = _ZSH_COMPINIT_GUARD + script
 
-        script_path = _user_home() / ".smolvm" / "completions" / f"smolvm.{shell}"
+        script_path = home / ".smolvm" / "completions" / f"smolvm.{shell}"
         script_path.parent.mkdir(parents=True, exist_ok=True)
         script_path.write_text(script, encoding="utf-8")
 
@@ -203,9 +222,9 @@ def run_completion_install(shell: str, script: str) -> int:
         rc_existed = rc_path.exists()
         message = _install_rc_line(shell, rc_path, script_path)
 
-        chown_targets = [script_path.parent.parent, script_path.parent, script_path]
+        chown_targets = _with_ancestors_below(script_path, home)
         if not rc_existed and rc_path.exists():
-            chown_targets.append(rc_path)
+            chown_targets.extend(_with_ancestors_below(rc_path, home))
         _chown_to_sudo_user(chown_targets)
 
         console.print(message)

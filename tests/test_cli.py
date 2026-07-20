@@ -5401,6 +5401,58 @@ class TestCliCompletion:
         # Nothing written into the (fake) root home.
         assert not (fake_home / ".bashrc").exists()
 
+    def test_completion_install_collapses_duplicate_managed_lines(
+        self,
+        fake_home: Path,
+    ) -> None:
+        """Two identical managed lines (e.g. concurrent installs) collapse to one."""
+        script_path = fake_home / ".smolvm" / "completions" / "smolvm.bash"
+        line = f"source {script_path}  # smolvm tab completion"
+        bashrc = fake_home / ".bashrc"
+        bashrc.write_text(f"{line}\n{line}\n")
+
+        ret = main(["completion", "bash", "--install"])
+
+        assert ret == 0
+        assert bashrc.read_text().count("# smolvm tab completion") == 1
+
+    def test_completion_install_sudo_chowns_created_ancestors(
+        self,
+        fake_home: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every directory created below the user's home is chowned, however deep."""
+        sudo_home = tmp_path / "real-user"
+        sudo_home.mkdir()
+        # A custom fish config dir several levels deep inside the user's home.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(sudo_home / "nested" / "cfg"))
+        sudo_info = MagicMock()
+        sudo_info.pw_dir = str(sudo_home)
+        sudo_info.pw_uid = os.getuid()
+        sudo_info.pw_gid = os.getgid()
+
+        chowned: list[str] = []
+        with (
+            patch("smolvm.vm._get_sudo_user_info", return_value=sudo_info),
+            patch(
+                "smolvm.cli.completion.os.chown",
+                side_effect=lambda p, *_: chowned.append(str(p)),
+            ),
+        ):
+            ret = main(["completion", "fish", "--install"])
+
+        assert ret == 0
+        base = sudo_home / "nested" / "cfg" / "fish" / "completions"
+        for expected in (
+            base / "smolvm.fish",
+            base,
+            base.parent,
+            sudo_home / "nested" / "cfg",
+            sudo_home / "nested",
+        ):
+            assert str(expected) in chowned
+
     def test_complete_sandbox_names_filters_by_prefix(self) -> None:
         """The completion callback returns matching sandbox names."""
         from smolvm.cli.commands.options import complete_sandbox_names
