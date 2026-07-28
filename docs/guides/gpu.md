@@ -81,7 +81,7 @@ smolvm sandbox create --name train --gpu 0000:01:00.0 --gpu 0000:02:00.0
 smolvm sandbox snapshot create train --snapshot-type disk
 ```
 
-**Your computer may limit reserved memory.** A sandbox using a graphics card has to keep all its memory reserved. If your computer's limit is lower than the sandbox size, SmolVM says so before starting and suggests `ulimit -l unlimited`.
+**Your computer may limit reserved memory.** A sandbox using a graphics card has to keep all its memory reserved. If your computer's limit is lower than the sandbox size, SmolVM says so before starting. `ulimit -l unlimited` lifts it for the current terminal when your account is allowed to go that high; if it answers "Operation not permitted", add `* - memlock unlimited` to `/etc/security/limits.conf` and log in again.
 
 **Sandboxes with a card start a little slower.** They use a more compatible virtual machine layout, because the faster one SmolVM normally picks has nowhere to plug a card in.
 

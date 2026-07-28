@@ -777,6 +777,31 @@ class TestGpuPassthroughArgs:
         assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0" in cmd
         assert not any("multifunction" in arg for arg in cmd)
 
+    def test_unrelated_group_member_gets_its_own_slot(self, tmp_path: Path) -> None:
+        """A machine can isolate an unrelated device alongside the card.
+
+        That device numbers its own functions from 0, exactly like the card
+        does, so packing both into one guest slot would emit the same address
+        and the same id twice and QEMU would refuse to start.
+        """
+        card = _gpu_card(
+            address="0000:08:00.0",
+            functions=("0000:08:00.0", "0000:07:00.0", "0000:08:00.1"),
+        )
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
+
+        devices = [arg for arg in cmd if arg.startswith("vfio-pci,")]
+        addresses = [arg.split("addr=")[1].split(",")[0] for arg in devices]
+        ids = [arg.split("id=")[1].split(",")[0] for arg in devices]
+
+        assert len(set(addresses)) == len(addresses), addresses
+        assert len(set(ids)) == len(ids), ids
+        # The card keeps the first slot with its audio part beside it; the
+        # unrelated device moves to the next one.
+        assert any("host=0000:08:00.0" in arg and "addr=0x10.0" in arg for arg in devices)
+        assert any("host=0000:08:00.1" in arg and "addr=0x10.1" in arg for arg in devices)
+        assert any("host=0000:07:00.0" in arg and "addr=0x11.0" in arg for arg in devices)
+
     def test_two_cards_land_on_separate_slots(self, tmp_path: Path) -> None:
         cards = [
             _gpu_card(),

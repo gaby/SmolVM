@@ -20,7 +20,7 @@ card and on a workstation with two.
 """
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -382,10 +382,15 @@ class TestSandboxGuards:
             ),
         )
 
-    def _manager(self):
+    def _manager(self, *, other_vms=()):
         from smolvm.vm import SmolVMManager
 
-        return SmolVMManager.__new__(SmolVMManager)
+        manager = SmolVMManager.__new__(SmolVMManager)
+        # The card checks read the inventory to see whether another sandbox
+        # already has the card; an empty one is the default for these tests.
+        manager.state = MagicMock()
+        manager.state.list_vms.return_value = list(other_vms)
+        return manager
 
     def test_start_is_blocked_when_the_card_is_gone(self, tmp_path: Path) -> None:
         """Hardware moves; a saved sandbox may start on a machine without it."""
@@ -433,6 +438,64 @@ class TestSandboxGuards:
             pytest.raises(SmolVMError, match="ulimit -l unlimited"),
         ):
             self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
+
+    def test_start_is_blocked_when_another_sandbox_has_the_card(
+        self, tmp_path: Path, gpu_device
+    ) -> None:
+        """A lent card still looks free on the host, so only the inventory knows."""
+        from smolvm.exceptions import SmolVMError
+        from smolvm.types import VMState
+
+        holder = self._vm_info(tmp_path)
+        holder = holder.model_copy(update={"vm_id": "busy", "status": VMState.RUNNING})
+
+        manager = self._manager(other_vms=[holder])
+        with (
+            patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()),
+            pytest.raises(SmolVMError, match="already in use by sandbox 'busy'"),
+        ):
+            manager._check_gpus(self._vm_info(tmp_path).config, "gputest")
+
+    def test_a_stopped_sandbox_does_not_hold_the_card(self, tmp_path: Path, gpu_device) -> None:
+        """Stopping a sandbox gives the card back, so it must not block a start."""
+        from smolvm.types import VMState
+
+        stopped = self._vm_info(tmp_path)
+        stopped = stopped.model_copy(update={"vm_id": "idle", "status": VMState.STOPPED})
+
+        manager = self._manager(other_vms=[stopped])
+        with (
+            patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()),
+            patch("smolvm.host.gpu.memlock_headroom_ok", return_value=True),
+        ):
+            manager._check_gpus(self._vm_info(tmp_path).config, "gputest")
+
+    def test_a_shared_audio_part_also_blocks_a_start(self, tmp_path: Path, gpu_device) -> None:
+        """Two sandboxes cannot share any address handed over, not just the card."""
+        from smolvm.exceptions import SmolVMError
+        from smolvm.types import GpuPassthrough, VMState
+
+        holder = self._vm_info(tmp_path)
+        overlapping = GpuPassthrough(
+            address="0000:01:00.1",
+            functions=("0000:01:00.1",),
+            vendor_id="10de",
+            device_id="2684",
+        )
+        holder = holder.model_copy(
+            update={
+                "vm_id": "busy",
+                "status": VMState.RUNNING,
+                "config": holder.config.model_copy(update={"gpus": [overlapping]}),
+            }
+        )
+
+        manager = self._manager(other_vms=[holder])
+        with (
+            patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()),
+            pytest.raises(SmolVMError, match="'0000:01:00.1' is already in use"),
+        ):
+            manager._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
     def test_a_sandbox_without_a_card_skips_every_check(self, tmp_path: Path) -> None:
         """The check must not touch the host for the overwhelmingly common case."""

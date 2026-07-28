@@ -1274,16 +1274,53 @@ class SmolVMManager:
                     {"vm_id": vm_id, "gpu": card.address},
                 )
 
+        # A card belongs to one sandbox at a time. Nothing in the hardware
+        # state says who has it — a card lent to a running sandbox still looks
+        # free to `smolvm gpu list` — so the only place to notice is the
+        # inventory. Without this the second sandbox reaches the emulator and
+        # dies with a "device busy" line that names no sandbox.
+        self._check_gpus_not_lent_out(config, vm_id)
+
         # A sandbox holding a graphics card keeps all its memory reserved,
         # and the operating system caps how much one user may reserve. Below
         # that cap the emulator dies partway through startup.
+        #
+        # 'ulimit -l unlimited' only works when the account is already allowed
+        # to go that high, which most Linux logins are not — so the message
+        # names the permanent fix too, or it would send half its readers to a
+        # command that answers "Operation not permitted".
         if not memlock_headroom_ok(config.memory):
             raise SmolVMError(
-                "This machine limits how much memory a sandbox can reserve, which a "
-                "graphics card needs. Run 'ulimit -l unlimited', then start the "
-                f"sandbox with 'smolvm sandbox start {vm_id}'.",
+                f"This machine won't let sandbox '{vm_id}' reserve the {config.memory} MiB "
+                "of memory a graphics card needs. Raise the limit with "
+                "'ulimit -l unlimited', or add '* - memlock unlimited' to "
+                f"/etc/security/limits.conf and log in again, then run "
+                f"'smolvm sandbox start {vm_id}'.",
                 {"vm_id": vm_id, "memory_mib": config.memory},
             )
+
+    def _check_gpus_not_lent_out(self, config: VMConfig, vm_id: str) -> None:
+        """Fail if another sandbox is already using one of these cards.
+
+        Every address handed over counts, not just the card's own: a sandbox
+        holding a card also holds the parts the machine isolates with it, and
+        two sandboxes cannot share any of them.
+        """
+        wanted = {function for card in config.gpus for function in card.functions}
+
+        for other in self.state.list_vms():
+            if other.vm_id == vm_id or other.status not in (VMState.RUNNING, VMState.PAUSED):
+                continue
+            for card in other.config.gpus:
+                clash = wanted.intersection(card.functions)
+                if not clash:
+                    continue
+                raise SmolVMError(
+                    f"The graphics card at '{sorted(clash)[0]}' is already in use by "
+                    f"sandbox '{other.vm_id}'. Run 'smolvm sandbox stop {other.vm_id}', "
+                    f"then start '{vm_id}' again.",
+                    {"vm_id": vm_id, "gpu": sorted(clash)[0], "held_by": other.vm_id},
+                )
 
     def _ensure_snapshot_supported(
         self,

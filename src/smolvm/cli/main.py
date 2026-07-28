@@ -873,7 +873,7 @@ def _build_and_boot_with_progress(
     writable_mounts: bool = False,
     network_mode: str | None = None,
     bridge_name: str | None = None,
-    gpus: Sequence[str] | None = None,
+    gpus: Sequence[Any] | None = None,
 ) -> object:
     """Build a VM config and boot it, showing a Rich progress bar.
 
@@ -1028,10 +1028,42 @@ def _resolve_gpu_passthrough(gpu_selections: Sequence[str] | None) -> list[Any] 
 
 
 def _apply_gpu_passthrough(config: Any, cards: Sequence[Any] | None) -> Any:
-    """Record already-resolved graphics cards on a VMConfig."""
+    """Record already-resolved graphics cards on a VMConfig.
+
+    The result is re-validated. ``model_copy`` writes the field without
+    running any validator, and the sandbox rules that live on VMConfig — QEMU
+    only, no ``microvm`` machine, no Windows guest, no address named twice —
+    are exactly what has to run here. Skipping them would create a sandbox
+    whose saved settings can no longer be read back, which breaks every later
+    command that lists sandboxes.
+    """
     if not cards:
         return config
-    return config.model_copy(update={"gpus": list(cards)})
+
+    from pydantic import ValidationError as _PydanticValidationError
+
+    updated = config.model_copy(update={"gpus": list(cards)})
+    try:
+        # Paths on an existing config were already checked when it was built;
+        # re-checking would reject a rootfs the builder is still writing.
+        return config.model_validate(updated, context={"validate_paths": False})
+    except _PydanticValidationError as exc:
+        raise ValueError(_first_validation_message(exc)) from exc
+
+
+def _first_validation_message(exc: Any) -> str:
+    """Return the plain-English text of the first pydantic error.
+
+    Pydantic renders a multi-line report with a documentation link; that is
+    the wrong shape for a CLI message, and the sandbox rules already phrase
+    themselves as one sentence the user can act on.
+    """
+    errors = exc.errors()
+    if not errors:
+        return str(exc)
+    message = str(errors[0].get("msg", "")).strip()
+    # Pydantic prefixes messages raised from a validator with "Value error, ".
+    return message.removeprefix("Value error, ") or str(exc)
 
 
 def _run_bridge_check(args: SimpleNamespace) -> int:

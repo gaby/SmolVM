@@ -5730,6 +5730,60 @@ class TestCreateWithGpu:
         combined = " ".join((capsys.readouterr().err + capsys.readouterr().out).split())
         assert "No graphics card found at '0000:09:00.0'" in combined
 
+    @patch("smolvm.facade.SmolVM")
+    @patch("smolvm.facade._build_auto_config")
+    def test_a_rejected_combination_never_creates_a_sandbox(
+        self,
+        mock_build_auto_config: MagicMock,
+        mock_vm_cls: MagicMock,
+        capsys: pytest.CaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        gpu_device,
+    ) -> None:
+        """Recording a card must re-check the sandbox rules.
+
+        Writing the field without validating created a sandbox whose saved
+        settings could not be read back, which then broke every command that
+        lists sandboxes — including the one that would delete it.
+        """
+        from smolvm.types import VMConfig
+
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+        kernel = tmp_path / "vmlinux"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        mock_build_auto_config.return_value = (
+            VMConfig(
+                vm_id="gputest",
+                kernel_path=kernel,
+                rootfs_path=rootfs,
+                backend="qemu",
+                qemu_machine="microvm",
+            ),
+            "/tmp/key",
+        )
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
+            ret = main(
+                [
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "gputest",
+                    "--gpu",
+                    "auto",
+                    "--qemu-machine",
+                    "microvm",
+                ]
+            )
+
+        assert ret != 0
+        mock_vm_cls.assert_not_called()
+        combined = " ".join((capsys.readouterr().err + capsys.readouterr().out).split())
+        assert "can't use a graphics card" in combined
+
     def test_card_still_in_use_reports_the_blocker(
         self, capsys: pytest.CaptureFixture, gpu_device
     ) -> None:

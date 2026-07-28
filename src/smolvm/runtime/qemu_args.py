@@ -144,32 +144,53 @@ def _gpu_device_args(vm_info: VMInfo) -> list[str]:
     Empty for the overwhelmingly common case of a sandbox without a card, so
     the rest of the command line is untouched.
 
-    Each card lands on its own guest slot, and the function numbers within
-    that slot mirror the host's. That matters: a graphics card's audio part
-    sits at function 1 on the real hardware, and guest drivers look for it in
-    the same place. When a card has more than one part, the first is marked
-    ``multifunction`` so the guest enumerates the rest.
+    Parts of the *same* piece of host hardware share one guest slot, and their
+    function numbers within it mirror the host's. That matters: a graphics
+    card's audio part sits at function 1 on the real hardware, and guest
+    drivers look for it in the same place. The lowest function of a shared
+    slot is marked ``multifunction`` so the guest enumerates the rest.
+
+    A card's hand-over set is not always one piece of hardware, though. The
+    machine can isolate an unrelated device in the same group — common on
+    consumer boards — and that device carries its own function numbers,
+    usually starting at 0 like the card does. Putting it in the card's slot
+    would collide, so each distinct piece of host hardware gets its own slot.
 
     ``x-vga`` is deliberately absent — it is for handing a card the guest's
     own screen, and SmolVM sandboxes are headless.
     """
     args: list[str] = []
+    slot = _GPU_FIRST_GUEST_SLOT
     for index, card in enumerate(vm_info.config.gpus):
-        slot = _GPU_FIRST_GUEST_SLOT + index
-        multifunction = len(card.functions) > 1
+        # Group by everything left of the function digit: "0000:01:00.1" and
+        # "0000:01:00.0" are the same piece of hardware, "0000:02:00.0" is
+        # not. dict preserves insertion order, so the card itself — always
+        # first in `functions` — keeps the lowest slot.
+        by_hardware: dict[str, list[str]] = {}
         for function in card.functions:
-            # "0000:01:00.1" -> 1. Validated by GpuPassthrough, so the split
-            # and int() cannot fail here.
-            function_number = int(function.rsplit(".", 1)[1])
-            options = [
-                "vfio-pci",
-                f"host={function}",
-                f"id=smolvm-gpu{index}-{function_number}",
-                f"addr=0x{slot:x}.{function_number}",
-            ]
-            if multifunction and function == card.address:
-                options.append("multifunction=on")
-            args.extend(["-device", ",".join(options)])
+            by_hardware.setdefault(function.rsplit(".", 1)[0], []).append(function)
+
+        # Ids count the parts handed over, not their host function numbers:
+        # two parts of different host hardware can both be function 0, and a
+        # repeated id makes QEMU refuse to start.
+        part_number = 0
+        for functions in by_hardware.values():
+            multifunction = len(functions) > 1
+            for function in functions:
+                # "0000:01:00.1" -> 1. Validated by GpuPassthrough, so the
+                # split and int() cannot fail here.
+                function_number = int(function.rsplit(".", 1)[1])
+                options = [
+                    "vfio-pci",
+                    f"host={function}",
+                    f"id=smolvm-gpu{index}-{part_number}",
+                    f"addr=0x{slot:x}.{function_number}",
+                ]
+                if multifunction and function == functions[0]:
+                    options.append("multifunction=on")
+                args.extend(["-device", ",".join(options)])
+                part_number += 1
+            slot += 1
     return args
 
 
