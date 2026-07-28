@@ -1251,6 +1251,24 @@ def bridge_check(bridge_name: str, json_output: bool) -> Any:
 
 
 @cli.group(context_settings=CONTEXT_SETTINGS)
+def gpu() -> None:
+    """See which graphics cards a sandbox can use."""
+
+
+@gpu.command("list")
+@json_option
+def gpu_list(json_output: bool) -> Any:
+    """List the graphics cards on this machine."""
+    _before_command(json_output=json_output)
+    return _handlers()._run_gpu_list(
+        _ns(
+            command_name="gpu.list",
+            json=json_output,
+        )
+    )
+
+
+@cli.group(context_settings=CONTEXT_SETTINGS)
 def windows() -> None:
     """Build Windows guest images."""
 

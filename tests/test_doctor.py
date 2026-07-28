@@ -361,6 +361,95 @@ class TestDoctorQemu:
             generate_doctor_report(backend="qemu")
 
 
+class TestGpuPassthroughCheck:
+    """Tests for the user-facing graphics-card doctor row."""
+
+    def _device(self, *, ready: bool):
+        from smolvm.host.gpu import GpuDevice
+
+        return GpuDevice(
+            address="0000:01:00.0",
+            vendor_id="10de",
+            device_id="2684",
+            vendor_name="NVIDIA",
+            driver="vfio-pci" if ready else "nvidia",
+            iommu_group=12,
+            group_members=("0000:01:00.0",),
+            ready=ready,
+            blocker=None if ready else "still in use",
+        )
+
+    def test_machine_without_a_card_says_nothing(self) -> None:
+        """Most machines have no card; a warning there would be pure noise."""
+        from smolvm.host.doctor import _check_gpu_passthrough
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+            assert _check_gpu_passthrough() is None
+
+    def test_ready_card_passes(self) -> None:
+        from smolvm.host.doctor import _check_gpu_passthrough
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=True)]):
+            check = _check_gpu_passthrough()
+
+        assert check is not None
+        assert check.status == "pass"
+
+    def test_blocked_card_warns_and_points_at_gpu_list(self) -> None:
+        from smolvm.host.doctor import _check_gpu_passthrough
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=False)]):
+            check = _check_gpu_passthrough()
+
+        assert check is not None
+        assert check.status == "warn"
+        assert check.fix is not None and "smolvm gpu list" in check.fix
+
+    @patch("smolvm.host.doctor.platform.system", return_value="Linux")
+    @patch("smolvm.host.doctor.subprocess.run")
+    @patch("smolvm.host.doctor.which")
+    @patch(
+        "smolvm.host.doctor._find_qemu_binary",
+        return_value=("qemu-system-x86_64", Path("/usr/bin/qemu-system-x86_64")),
+    )
+    def test_row_is_absent_from_the_qemu_report_without_a_card(
+        self,
+        _mock_find_qemu: MagicMock,
+        mock_which: MagicMock,
+        mock_run: MagicMock,
+        _mock_system: MagicMock,
+    ) -> None:
+        mock_which.side_effect = lambda binary: Path(f"/usr/bin/{binary}")
+        mock_run.return_value = MagicMock(stdout="QEMU emulator version 8.2.0", stderr="")
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+            report = generate_doctor_report(backend="qemu")
+
+        assert "gpu-passthrough" not in {check.name for check in report.checks}
+
+    @patch("smolvm.host.doctor.platform.system", return_value="Linux")
+    @patch("smolvm.host.doctor.subprocess.run")
+    @patch("smolvm.host.doctor.which")
+    @patch(
+        "smolvm.host.doctor._find_qemu_binary",
+        return_value=("qemu-system-x86_64", Path("/usr/bin/qemu-system-x86_64")),
+    )
+    def test_row_appears_in_the_qemu_report_with_a_card(
+        self,
+        _mock_find_qemu: MagicMock,
+        mock_which: MagicMock,
+        mock_run: MagicMock,
+        _mock_system: MagicMock,
+    ) -> None:
+        mock_which.side_effect = lambda binary: Path(f"/usr/bin/{binary}")
+        mock_run.return_value = MagicMock(stdout="QEMU emulator version 8.2.0", stderr="")
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=True)]):
+            report = generate_doctor_report(backend="qemu")
+
+        assert "gpu-passthrough" in {check.name for check in report.checks}
+
+
 class TestKvmRuntimeCheck:
     """Tests for the user-facing kvm doctor row."""
 

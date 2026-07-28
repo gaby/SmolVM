@@ -590,6 +590,38 @@ def check_worker_node_security() -> list[DoctorCheck]:
     return checks
 
 
+def _check_gpu_passthrough() -> DoctorCheck | None:
+    """Report whether a graphics card is free for sandboxes.
+
+    Returns ``None`` — meaning "say nothing" — when the machine has no
+    graphics card SmolVM could ever hand over. Most machines are in that
+    state, and a warning there would be noise about a feature the user never
+    asked for.
+    """
+    from smolvm.host.gpu import list_host_gpus
+
+    try:
+        devices = list_host_gpus()
+    except Exception:  # pragma: no cover - defensive; sysfs reads are guarded
+        return None
+    if not devices:
+        return None
+
+    ready = [device for device in devices if device.ready]
+    if ready:
+        return DoctorCheck(
+            name="gpu-passthrough",
+            status="pass",
+            detail=f"{len(ready)} of {len(devices)} card(s) free for sandboxes",
+        )
+    return DoctorCheck(
+        name="gpu-passthrough",
+        status="warn",
+        detail="no graphics card is free for sandboxes yet",
+        fix="Run 'smolvm gpu list' for the one-time setup steps",
+    )
+
+
 def generate_doctor_report(backend: str | None = None) -> DoctorReport:
     """Collect diagnostics for the selected runtime backend."""
     requested = (backend or BACKEND_AUTO).strip().lower()
@@ -716,6 +748,10 @@ def generate_doctor_report(backend: str | None = None) -> DoctorReport:
 
         checks.append(_check_command("qemu-img", "qemu"))
         checks.append(_check_command("ssh", "openssh-client"))
+
+        gpu_check = _check_gpu_passthrough()
+        if gpu_check is not None:
+            checks.append(gpu_check)
     elif resolved == BACKEND_VZ:
         from smolvm.host.lume import (
             LUME_VERSION,

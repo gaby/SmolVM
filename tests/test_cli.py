@@ -32,6 +32,7 @@ from smolvm.cli.main import (
     build_cli,
     main,
 )
+from smolvm.host.gpu import GpuDevice
 from smolvm.types import (
     BrowserSessionState,
     GuestOS,
@@ -5553,3 +5554,104 @@ class TestCliCompletion:
             items = complete_browser_session_names(MagicMock(), MagicMock(), "")
 
         assert items == []
+
+
+def _gpu_device(
+    address: str = "0000:01:00.0",
+    *,
+    ready: bool = True,
+    blocker: str | None = None,
+    driver: str | None = "vfio-pci",
+    functions: tuple[str, ...] = ("0000:01:00.0", "0000:01:00.1"),
+) -> GpuDevice:
+    """Build a real GpuDevice for CLI rendering tests."""
+    return GpuDevice(
+        address=address,
+        vendor_id="10de",
+        device_id="2684",
+        vendor_name="NVIDIA",
+        driver=driver,
+        iommu_group=12,
+        group_members=functions,
+        ready=ready,
+        blocker=blocker,
+    )
+
+
+class TestGpuList:
+    """`smolvm gpu list` reports host graphics cards."""
+
+    def test_empty_machine_is_not_an_error(self, capsys: pytest.CaptureFixture) -> None:
+        """Having no graphics card is normal, so exit 0 with a plain message."""
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+            ret = main(["gpu", "list"])
+
+        assert ret == 0
+        assert "didn't find a graphics card" in capsys.readouterr().out
+
+    def test_ready_card_shows_the_create_command(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            ret = main(["gpu", "list"])
+
+        assert ret == 0
+        output = capsys.readouterr().out
+        assert "0000:01:00.0" in output
+        assert "NVIDIA" in output
+        assert "smolvm sandbox create --gpu 0000:01:00.0" in output
+
+    def test_blocked_card_shows_the_reason_and_setup_steps(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        blocked = _gpu_device(
+            ready=False,
+            driver="nvidia",
+            blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
+        )
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
+            ret = main(["gpu", "list"])
+
+        assert ret == 0
+        # Rich wraps to the terminal width, so compare on collapsed whitespace
+        # rather than letting a line break fail a content assertion.
+        output = " ".join(capsys.readouterr().out.split())
+        assert "still in use by this machine" in output
+        assert "One-time setup on this machine" in output
+
+    def test_setup_steps_are_hidden_when_everything_is_ready(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Don't lecture a user whose machine is already configured."""
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            main(["gpu", "list"])
+
+        assert "One-time setup" not in capsys.readouterr().out
+
+    def test_json_envelope_carries_every_field(self, capsys: pytest.CaptureFixture) -> None:
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            ret = main(["gpu", "list", "--json"])
+
+        assert ret == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["command"] == "gpu.list"
+        card = payload["data"]["gpus"][0]
+        assert card["address"] == "0000:01:00.0"
+        assert card["vendor"] == "NVIDIA"
+        assert card["ready"] is True
+        assert card["functions"] == ["0000:01:00.0", "0000:01:00.1"]
+        assert payload["data"]["setup_steps"], "JSON callers need the steps too"
+
+    def test_json_reports_the_blocker(self, capsys: pytest.CaptureFixture) -> None:
+        blocked = _gpu_device(ready=False, driver="nvidia", blocker="still in use")
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
+            main(["gpu", "list", "--json"])
+
+        card = json.loads(capsys.readouterr().out)["data"]["gpus"][0]
+        assert card["ready"] is False
+        assert card["blocker"] == "still in use"
+
+    def test_help_describes_the_command(self, capsys: pytest.CaptureFixture) -> None:
+        ret = main(["gpu", "--help"])
+
+        assert ret == 0
+        assert "List the graphics cards on this machine." in capsys.readouterr().out

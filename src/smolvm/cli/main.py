@@ -61,6 +61,7 @@ from smolvm.types import BrowserSessionState, DesktopEndpoint, GuestOS, VMState
 if TYPE_CHECKING:
     from smolvm.cli.service import CLIService
     from smolvm.facade import SmolVM as FacadeVM
+    from smolvm.host.gpu import GpuDevice
     from smolvm.images.published import Arch, Vmm
     from smolvm.storage import StateManagerProtocol
     from smolvm.types import BrowserSessionInfo, SnapshotInfo, VMConfig, VMInfo
@@ -1021,6 +1022,114 @@ def _run_bridge_check(args: SimpleNamespace) -> int:
         return 0 if inspection.ok else 1
     except Exception as exc:
         return _emit_cli_error("bridge.check", 1, exc, json_output=json_output)
+
+
+# One-time steps for freeing a graphics card. Printed by `smolvm gpu list`
+# whenever something is blocked, so every other GPU message in the CLI can
+# stay one sentence and point here instead of repeating all of this.
+_GPU_SETUP_STEPS = (
+    "Turn on hardware isolation in this machine's firmware settings "
+    "(often called VT-d, AMD-Vi, or IOMMU).",
+    "Add 'intel_iommu=on' (Intel) or 'amd_iommu=on' (AMD) plus 'iommu=pt' to "
+    "this machine's startup options, then restart.",
+    "Tell the machine to leave the card alone at startup by adding "
+    "'vfio-pci.ids=VENDOR:DEVICE' with the ids shown above, then restart.",
+    "Add yourself to the 'vfio' group and start a new login session.",
+)
+
+
+def _gpu_row(device: GpuDevice) -> dict[str, Any]:
+    """Return the JSON shape for one graphics card."""
+    return {
+        "address": device.address,
+        "vendor_id": device.vendor_id,
+        "device_id": device.device_id,
+        "vendor": device.vendor_name,
+        "description": device.description,
+        "driver": device.driver,
+        "iommu_group": device.iommu_group,
+        "functions": list(device.group_members),
+        "ready": device.ready,
+        "blocker": device.blocker,
+    }
+
+
+def _render_gpu_list(devices: list[GpuDevice]) -> None:
+    """Render the human-facing graphics-card list."""
+    console = console_stdout()
+    table = Table(title="Graphics cards on this machine")
+    table.add_column("Address")
+    table.add_column("Card")
+    table.add_column("Ids")
+    table.add_column("Used by")
+    table.add_column("Available")
+
+    for device in devices:
+        available = Text("yes", style="green") if device.ready else Text("no", style="yellow")
+        table.add_row(
+            device.address,
+            device.description,
+            f"{device.vendor_id}:{device.device_id}",
+            device.driver or "nothing",
+            available,
+        )
+    console.print(table)
+
+    ready = [device for device in devices if device.ready]
+    if ready:
+        console.print(
+            f"Use one with: smolvm sandbox create --gpu {ready[0].address}",
+        )
+
+    blocked = [device for device in devices if not device.ready]
+    if not blocked:
+        return
+
+    console.print()
+    console.print(Text("Not available yet:", style="bold yellow"))
+    for device in blocked:
+        console.print(f"  • {device.address} — {device.blocker}")
+
+    console.print()
+    console.print(Text("One-time setup on this machine:", style="bold"))
+    for number, step in enumerate(_GPU_SETUP_STEPS, start=1):
+        console.print(f"  {number}. {step}")
+    console.print()
+    console.print("Each step needs administrator access and changes this machine, not a sandbox.")
+
+
+def _run_gpu_list(args: SimpleNamespace) -> int:
+    """Handle ``smolvm gpu list``."""
+    from smolvm.host.gpu import list_host_gpus
+
+    json_output = getattr(args, "json", False)
+    try:
+        devices = list_host_gpus()
+    except Exception as exc:
+        return _emit_cli_error("gpu.list", 1, exc, json_output=json_output)
+
+    if json_output:
+        emit_json(
+            "gpu.list",
+            0,
+            data={
+                "gpus": [_gpu_row(device) for device in devices],
+                "setup_steps": list(_GPU_SETUP_STEPS),
+            },
+        )
+        return 0
+
+    if not devices:
+        # No card is a normal state on most machines, not an error.
+        render_empty(
+            "Graphics cards",
+            "SmolVM didn't find a graphics card it can give to a sandbox on this "
+            "machine. Sandboxes still work without one.",
+        )
+        return 0
+
+    _render_gpu_list(devices)
+    return 0
 
 
 def _run_create(args: SimpleNamespace) -> int:
