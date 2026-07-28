@@ -380,17 +380,15 @@ class TestGpuPassthroughCheck:
         assert check is not None
         assert check.status == "pass"
 
-    def test_blocked_card_warns_and_points_at_gpu_list(self, gpu_device) -> None:
+    def test_card_that_is_not_set_up_says_nothing(self, gpu_device) -> None:
+        """Every machine with a screen has a graphics chip, so a card the user
+        never intended to lend must not become a warning on their laptop."""
         from smolvm.host.doctor import _check_gpu_passthrough
 
         with patch(
             "smolvm.host.gpu.list_host_gpus", return_value=[gpu_device(blocker="still in use")]
         ):
-            check = _check_gpu_passthrough()
-
-        assert check is not None
-        assert check.status == "warn"
-        assert check.fix is not None and "smolvm gpu list" in check.fix
+            assert _check_gpu_passthrough() is None
 
     @patch("smolvm.host.doctor.platform.system", return_value="Linux")
     @patch("smolvm.host.doctor.subprocess.run")

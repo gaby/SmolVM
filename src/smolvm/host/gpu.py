@@ -29,11 +29,12 @@ Two details drive the shape of the API:
 - **Cards come in groups.** The hardware isolates devices in "IOMMU groups",
   and VFIO hands over a whole group at a time. A discrete graphics card is
   almost always grouped with its own HDMI audio function, so asking for
-  ``0000:01:00.0`` really means asking for ``0000:01:00.1`` too. See
-  :func:`assignable_functions`.
-- **Everything is testable.** Each entry point takes ``sysfs_root`` so tests
-  can build a fake ``/sys`` tree in a temporary directory instead of depending
-  on whatever hardware the test machine happens to have.
+  ``0000:01:00.0`` really means asking for ``0000:01:00.1`` too — that set is
+  :attr:`GpuDevice.group_members`.
+- **Everything is testable.** Each entry point takes ``sysfs_root`` and
+  ``vfio_dev_root`` so tests can build a fake ``/sys`` tree and a fake
+  ``/dev/vfio`` in a temporary directory, instead of depending on whatever
+  hardware the test machine happens to have.
 """
 
 from __future__ import annotations
@@ -48,7 +49,11 @@ from pathlib import Path
 PCI_ADDRESS_PATTERN = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 DEFAULT_SYSFS_ROOT = Path("/sys")
-_VFIO_DEV_ROOT = Path("/dev/vfio")
+
+# Where the kernel exposes one openable file per isolation group. Separate
+# from sysfs because it lives under /dev, and injectable for the same reason
+# sysfs_root is: readiness must be testable without real hardware.
+DEFAULT_VFIO_DEV_ROOT = Path("/dev/vfio")
 
 # The driver name a card must be attached to before a sandbox can use it.
 VFIO_DRIVER = "vfio-pci"
@@ -233,19 +238,20 @@ def iommu_enabled(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> bool:
         return False
 
 
-def _vfio_group_accessible(group: int) -> bool:
+def _vfio_group_accessible(group: int, vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT) -> bool:
     """Return whether this user can drive the VFIO device for *group*.
 
     Mirrors the ``/dev/kvm`` probe in :mod:`smolvm.runtime.backends`: the
     file existing is not enough, the current user has to be able to open it.
     """
-    node = _VFIO_DEV_ROOT / str(group)
+    node = vfio_dev_root / str(group)
     return node.exists() and os.access(node, os.R_OK | os.W_OK)
 
 
 def _blocker(
     *,
     sysfs_root: Path,
+    vfio_dev_root: Path,
     address: str,
     iommu_on: bool,
     iommu_group: int | None,
@@ -268,19 +274,31 @@ def _blocker(
             "machine, so a sandbox can't use it safely."
         )
 
-    in_use = (
-        f"The graphics card at '{address}' is still in use by this machine. "
-        "Run 'smolvm gpu list' for the one-time steps to free it."
-    )
-
     # Every member of the group has to be free, not just the card itself.
     # A group whose listing was unreadable falls back to the card alone, so
     # this loop always checks at least the card.
     for member in members or (address,):
-        if _read_driver(sysfs_root / "bus" / "pci" / "devices" / member) == VFIO_DRIVER:
+        member_driver = _read_driver(sysfs_root / "bus" / "pci" / "devices" / member)
+        if member_driver == VFIO_DRIVER:
             continue
+        # "Nothing is using it" and "something else is using it" are different
+        # problems with different fixes, and saying "still in use" about a
+        # card the table just listed as used by nothing reads as a bug.
+        if member_driver is None:
+            subject = (
+                f"The graphics card at '{address}' isn't set up for sandboxes yet"
+                if member == address
+                else (
+                    f"The graphics card at '{address}' is grouped with '{member}', "
+                    "which isn't set up for sandboxes yet"
+                )
+            )
+            return f"{subject}. Run 'smolvm gpu list' for the one-time setup steps."
         if member == address:
-            return in_use
+            return (
+                f"The graphics card at '{address}' is still in use by this machine. "
+                "Run 'smolvm gpu list' for the one-time steps to free it."
+            )
         # Naming the exact device that is holding the group back is the
         # difference between a five-minute fix and a lost afternoon.
         return (
@@ -288,7 +306,7 @@ def _blocker(
             "still in use by this machine. Run 'smolvm gpu list' to see what to free."
         )
 
-    if not _vfio_group_accessible(iommu_group):
+    if not _vfio_group_accessible(iommu_group, vfio_dev_root):
         return (
             f"You don't have permission to use the graphics card at '{address}'. "
             "Add yourself to the 'vfio' group, then start a new login session."
@@ -297,7 +315,9 @@ def _blocker(
     return None
 
 
-def _build_device(sysfs_root: Path, address: str, *, iommu_on: bool) -> GpuDevice | None:
+def _build_device(
+    sysfs_root: Path, address: str, *, iommu_on: bool, vfio_dev_root: Path
+) -> GpuDevice | None:
     """Return a :class:`GpuDevice` for *address*, or ``None`` if not a GPU."""
     device_dir = sysfs_root / "bus" / "pci" / "devices" / address
     class_id = _read_class(device_dir)
@@ -319,6 +339,7 @@ def _build_device(sysfs_root: Path, address: str, *, iommu_on: bool) -> GpuDevic
         group_members=members,
         blocker=_blocker(
             sysfs_root=sysfs_root,
+            vfio_dev_root=vfio_dev_root,
             address=address,
             iommu_on=iommu_on,
             iommu_group=iommu_group,
@@ -349,7 +370,10 @@ def _assignable_members(sysfs_root: Path, address: str, group: int | None) -> tu
     return (address, *assignable)
 
 
-def list_host_gpus(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> list[GpuDevice]:
+def list_host_gpus(
+    sysfs_root: Path = DEFAULT_SYSFS_ROOT,
+    vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT,
+) -> list[GpuDevice]:
     """Return every graphics card on this machine, ready or not.
 
     Cards that are not ready are still returned, carrying a ``blocker`` that
@@ -370,13 +394,17 @@ def list_host_gpus(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> list[GpuDevice]:
     for name in entries:
         if not PCI_ADDRESS_PATTERN.match(name):
             continue
-        device = _build_device(sysfs_root, name, iommu_on=iommu_on)
+        device = _build_device(sysfs_root, name, iommu_on=iommu_on, vfio_dev_root=vfio_dev_root)
         if device is not None:
             found.append(device)
     return found
 
 
-def find_gpu(address: str, sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> GpuDevice:
+def find_gpu(
+    address: str,
+    sysfs_root: Path = DEFAULT_SYSFS_ROOT,
+    vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT,
+) -> GpuDevice:
     """Return the graphics card at *address*.
 
     Goes straight to the device's own directory rather than scanning the
@@ -388,7 +416,12 @@ def find_gpu(address: str, sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> GpuDevice:
     """
     wanted = _normalize_address(address)
     device = (
-        _build_device(sysfs_root, wanted, iommu_on=iommu_enabled(sysfs_root))
+        _build_device(
+            sysfs_root,
+            wanted,
+            iommu_on=iommu_enabled(sysfs_root),
+            vfio_dev_root=vfio_dev_root,
+        )
         if PCI_ADDRESS_PATTERN.match(wanted)
         else None
     )
@@ -403,6 +436,7 @@ def find_gpu(address: str, sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> GpuDevice:
 def resolve_gpu_selection(
     selection: str,
     sysfs_root: Path = DEFAULT_SYSFS_ROOT,
+    vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT,
 ) -> GpuDevice:
     """Return the card named by a ``--gpu`` value.
 
@@ -415,7 +449,7 @@ def resolve_gpu_selection(
             a card that is not ready. Every message is user-facing.
     """
     if selection.strip().lower() == "auto":
-        ready = [device for device in list_host_gpus(sysfs_root) if device.ready]
+        ready = [device for device in list_host_gpus(sysfs_root, vfio_dev_root) if device.ready]
         if not ready:
             raise ValueError(
                 "No graphics card on this machine is free for sandboxes. "
@@ -429,7 +463,7 @@ def resolve_gpu_selection(
             )
         return ready[0]
 
-    device = find_gpu(selection, sysfs_root)
+    device = find_gpu(selection, sysfs_root, vfio_dev_root)
     if not device.ready:
         raise ValueError(device.blocker or f"The graphics card at '{device.address}' isn't ready.")
     return device

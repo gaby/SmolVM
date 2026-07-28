@@ -77,12 +77,13 @@ def sysfs(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def vfio_accessible(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend every VFIO group node exists and is usable by this user.
+    """Pretend every isolation group is openable by this user.
 
-    The node lives at a fixed ``/dev`` path that a fake sysfs tree cannot
-    stand in for, so readiness tests patch the probe directly.
+    Most tests here are about classification, not permissions, so they stub
+    the probe out. ``TestVfioDeviceAccess`` covers the real thing against a
+    fake ``/dev/vfio``.
     """
-    monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group: True)
+    monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group, root=None: True)
 
 
 def _nvidia_pair(sysfs: Path, *, driver: str | None, group: int = 12) -> None:
@@ -196,7 +197,7 @@ class TestReadiness:
         self, sysfs: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _nvidia_pair(sysfs, driver="vfio-pci")
-        monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group: False)
+        monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group, root=None: False)
 
         card = gpu.list_host_gpus(sysfs)[0]
 
@@ -546,3 +547,63 @@ class TestSandboxGuards:
             self._manager()._ensure_snapshot_supported(self._vm_info(tmp_path), SnapshotType.FULL)
 
         assert "smolvm sandbox snapshot create gputest --snapshot-type disk" in str(excinfo.value)
+
+
+class TestVfioDeviceAccess:
+    """Readiness against a fake ``/dev/vfio``, with nothing stubbed out."""
+
+    def test_ready_when_the_group_node_is_openable(self, sysfs: Path, tmp_path: Path) -> None:
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        vfio_dev = tmp_path / "dev-vfio"
+        vfio_dev.mkdir()
+        (vfio_dev / "12").write_text("")
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs, vfio_dev)
+
+        assert card.ready is True
+
+    def test_blocked_when_the_group_node_is_absent(self, sysfs: Path, tmp_path: Path) -> None:
+        """Everything else is set up, but this user cannot open the group."""
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        vfio_dev = tmp_path / "dev-vfio"
+        vfio_dev.mkdir()
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs, vfio_dev)
+
+        assert card.ready is False
+        assert "permission" in card.blocker
+
+    def test_listing_honours_the_injected_device_root(self, sysfs: Path, tmp_path: Path) -> None:
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        vfio_dev = tmp_path / "dev-vfio"
+        vfio_dev.mkdir()
+        (vfio_dev / "12").write_text("")
+
+        assert gpu.list_host_gpus(sysfs, vfio_dev)[0].ready is True
+
+
+class TestUnboundCardMessage:
+    """A card nothing has claimed is not the same as one still in use."""
+
+    def test_card_with_no_driver_is_not_called_in_use(
+        self, sysfs: Path, vfio_accessible: None
+    ) -> None:
+        """The table shows 'Used by: nothing'; the reason must agree."""
+        _write_device(sysfs, "0000:01:00.0", class_id=CLASS_VGA, iommu_group=12)
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert card.driver is None
+        assert "still in use" not in card.blocker
+        assert "isn't set up for sandboxes yet" in card.blocker
+
+    def test_grouped_device_with_no_driver_is_named(
+        self, sysfs: Path, vfio_accessible: None
+    ) -> None:
+        _write_device(sysfs, "0000:01:00.0", class_id=CLASS_VGA, driver="vfio-pci", iommu_group=12)
+        _write_device(sysfs, "0000:01:00.1", class_id=CLASS_AUDIO, iommu_group=12)
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert "0000:01:00.1" in card.blocker
+        assert "isn't set up for sandboxes yet" in card.blocker

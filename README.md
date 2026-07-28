@@ -385,6 +385,9 @@ other computer:
 smolvm sandbox exec train -- apt-get install -y nvidia-driver-550
 ```
 
+Installing a driver currently needs a sandbox image you supply with
+`--image`; the built-in images cannot load one yet.
+
 If a card is not available yet, `smolvm gpu list` prints the one-time setup
 your machine needs. See [Graphics cards](docs/guides/gpu.md) for the details.
 

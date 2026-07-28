@@ -63,6 +63,15 @@ nvidia-smi
 
 SmolVM does not ship the driver itself. Graphics drivers come with their own licences and are tied to specific card models, so which one you need is your choice.
 
+**Right now this needs your own sandbox image.** Installing a graphics driver means loading extra code into the sandbox's operating system, and the images SmolVM builds for you cannot do that yet — the piece that allows it is built but not yet published. Until it is, bring an image that already has its own driver support:
+
+```bash
+smolvm sandbox create --name train --os ubuntu \
+    --image /path/to/your-image.qcow2 --gpu 0000:01:00.0
+```
+
+Everything else on this page — lending the card, seeing it in the sandbox, the limits below — works with the built-in images today.
+
 ## Lend more than one card
 
 Repeat the option:

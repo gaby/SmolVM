@@ -591,12 +591,14 @@ def check_worker_node_security() -> list[DoctorCheck]:
 
 
 def _check_gpu_passthrough() -> DoctorCheck | None:
-    """Report whether a graphics card is free for sandboxes.
+    """Report that a graphics card is free for sandboxes, or say nothing.
 
-    Returns ``None`` — meaning "say nothing" — when the machine has no
-    graphics card SmolVM could ever hand over. Most machines are in that
-    state, and a warning there would be noise about a feature the user never
-    asked for.
+    Returns ``None`` unless at least one card is actually ready. Every
+    machine with a screen has a graphics chip, so reporting on cards the
+    user has not set up would nag about a feature they never asked for on
+    ordinary laptops and desktops — the exact noise this check exists to
+    avoid. ``smolvm gpu list`` is where "why isn't my card ready" is
+    answered, and it is the command every GPU message points at.
     """
     from smolvm.host.gpu import list_host_gpus
 
@@ -604,21 +606,14 @@ def _check_gpu_passthrough() -> DoctorCheck | None:
         devices = list_host_gpus()
     except Exception:  # pragma: no cover - defensive; sysfs reads are guarded
         return None
-    if not devices:
-        return None
 
     ready = [device for device in devices if device.ready]
-    if ready:
-        return DoctorCheck(
-            name="gpu-passthrough",
-            status="pass",
-            detail=f"{len(ready)} of {len(devices)} card(s) free for sandboxes",
-        )
+    if not ready:
+        return None
     return DoctorCheck(
         name="gpu-passthrough",
-        status="warn",
-        detail="no graphics card is free for sandboxes yet",
-        fix="Run 'smolvm gpu list' for the one-time setup steps",
+        status="pass",
+        detail=f"{len(ready)} of {len(devices)} card(s) free for sandboxes",
     )
 
 
