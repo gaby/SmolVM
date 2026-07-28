@@ -356,6 +356,39 @@ The destination must be an absolute path inside the sandbox (starting
 with `/`), and any existing file at that path is overwritten.
 
 
+## Use a graphics card
+
+On a Linux machine with a graphics card to spare, a sandbox can borrow the
+real hardware — useful for running or training a model, or converting video.
+
+Start by listing the cards in your machine:
+
+```bash
+smolvm gpu list
+```
+
+Each card is listed with an address like `0000:01:00.0`, and whether it is
+available. Use that address to lend the card to a sandbox:
+
+```bash
+smolvm sandbox create --name train --gpu 0000:01:00.0
+```
+
+The card belongs to that sandbox while it runs, and returns to your machine
+when it stops.
+
+Seeing the card is not the same as being able to use it. Install the
+manufacturer's driver inside the sandbox, the same way you would on any
+other computer:
+
+```bash
+smolvm sandbox exec train -- apt-get install -y nvidia-driver-550
+```
+
+If a card is not available yet, `smolvm gpu list` prints the one-time setup
+your machine needs. See [Graphics cards](docs/guides/gpu.md) for the details.
+
+
 ## Examples
 
 ### Getting started

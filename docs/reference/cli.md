@@ -9,6 +9,7 @@ The CLI creates and manages disposable sandboxes. Run `smolvm COMMAND --help` fo
 | `smolvm setup` | Install or check local runtime dependencies. Add `--macos` to prepare the macOS desktop runtime. |
 | `smolvm doctor` | Check whether this machine can run sandboxes. Use `--backend vz` to check macOS desktop support. |
 | `smolvm bridge check BRIDGE` | Check an existing Linux bridge before connecting a sandbox to it. |
+| `smolvm gpu list` | See which graphics cards a sandbox can borrow, and what is left to set up. Linux only. |
 | `smolvm update` | Upgrade to the latest stable release. |
 | `smolvm prune` | Remove stale cached images (alias for `smolvm image prune`). |
 
@@ -18,7 +19,7 @@ Run these in the order you need them:
 
 | Command | Use it to |
 | --- | --- |
-| `smolvm sandbox create` | Create a sandbox. Add `--network bridge --bridge BRIDGE` only when the sandbox should appear as a separate computer on that network. |
+| `smolvm sandbox create` | Create a sandbox. Add `--network bridge --bridge BRIDGE` only when the sandbox should appear as a separate computer on that network. Add `--gpu ADDRESS` to lend it a graphics card — see [Graphics cards](../guides/gpu.md). |
 | `smolvm sandbox list` / `info` | Find or inspect sandboxes. |
 | `smolvm sandbox shell` / `ssh` | Open a shell. `shell` uses SmolVM's fast control channel when available; `ssh` explicitly uses SSH. |
 | `smolvm sandbox desktop` | Open a running macOS sandbox in Screen Sharing. Add `--start` to start it first. |

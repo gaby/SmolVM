@@ -1441,11 +1441,13 @@ RUN npm init -y && \\
     chown node:node /var/log/openclaw.log && \\
     npm cache clean --force >/dev/null 2>&1 || true
 
-# Strip @node-llama-cpp GPU and non-host-arch backends. Inside Firecracker
-# there is no GPU passthrough, so the CUDA/Vulkan binaries are dead weight
-# (~600+ MiB on amd64). On arm64 only the matching arch package exists, so
-# the rm calls are no-ops there. The path reflects npm's `-g --prefix`
-# layout: /opt/openclaw/lib/node_modules/openclaw/node_modules/...
+# Strip @node-llama-cpp GPU and non-host-arch backends. This image runs on
+# Firecracker, which cannot attach a graphics card, so the CUDA/Vulkan
+# binaries are dead weight (~600+ MiB on amd64). Sandboxes that do borrow a
+# card use the QEMU backend and a different image — see docs/guides/gpu.md.
+# On arm64 only the matching arch package exists, so the rm calls are no-ops
+# there. The path reflects npm's `-g --prefix` layout:
+# /opt/openclaw/lib/node_modules/openclaw/node_modules/...
 RUN rm -rf \\
     /opt/openclaw/lib/node_modules/openclaw/node_modules/@node-llama-cpp/linux-x64-cuda \\
     /opt/openclaw/lib/node_modules/openclaw/node_modules/@node-llama-cpp/linux-x64-cuda-ext \\

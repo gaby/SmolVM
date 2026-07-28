@@ -14,6 +14,7 @@ SmolVM gives an AI agent a disposable computer for running code, using a browser
 - [Browser sandboxes](guides/browser.md) — run Chromium and connect with a browser or Playwright.
 - [Snapshots](guides/snapshots.md) — save and restore supported sandbox state.
 - [Networking](guides/networking.md) — share a local port, limit outbound domains, or connect a sandbox to an existing bridge.
+- [Graphics cards](guides/gpu.md) — lend a sandbox one of your computer's graphics cards.
 - [macOS desktops](guides/macos.md) — open a disposable Mac desktop on Apple Silicon.
 - [Windows guests](guides/windows.md) — build and use a Windows image.
 

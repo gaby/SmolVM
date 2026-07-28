@@ -27,7 +27,7 @@ This flow is implemented primarily by [`SmolVM`](../../src/smolvm/facade.py) and
 
 ## Backend and control-channel selection
 
-`auto` selects Apple Virtualization.framework (`vz`) for a macOS guest on Apple Silicon. Linux guests still prefer QEMU on macOS and Firecracker on Linux. Automatic control-channel selection uses supported vsock when available and SSH otherwise; Windows guests use SSH in automatic mode. An explicit vsock request for Windows or macOS is rejected instead of falling back to SSH. These are current implementation details, so update this document with [`runtime/backends.py`](../../src/smolvm/runtime/backends.py) and [`comm/select.py`](../../src/smolvm/comm/select.py) whenever selection rules change.
+`auto` selects Apple Virtualization.framework (`vz`) for a macOS guest on Apple Silicon. Linux guests still prefer QEMU on macOS and Firecracker on Linux. A sandbox that borrows a host graphics card selects QEMU, which is the only backend able to attach one. Automatic control-channel selection uses supported vsock when available and SSH otherwise; Windows guests use SSH in automatic mode. An explicit vsock request for Windows or macOS is rejected instead of falling back to SSH. These are current implementation details, so update this document with [`runtime/backends.py`](../../src/smolvm/runtime/backends.py) and [`comm/select.py`](../../src/smolvm/comm/select.py) whenever selection rules change.
 
 ## How to change behavior safely
 
