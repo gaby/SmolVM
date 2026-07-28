@@ -37,7 +37,7 @@ from typing import cast
 from smolvm.exceptions import SmolVMError
 from smolvm.runtime.guest_platforms import GuestPlatformSpec
 from smolvm.runtime.qemu import QEMU_ROOT_NODE_NAME
-from smolvm.types import GuestOS, QemuMachine, VMInfo
+from smolvm.types import GPU_REJECTS_MICROVM_MESSAGE, GuestOS, QemuMachine, VMInfo
 
 # DNS server announced to the guest by QEMU's SLIRP stack. The default would
 # also work; we set it explicitly so the guest sees the same address whether
@@ -127,11 +127,7 @@ def _use_qemu_microvm(
     """
     requested_machine = _requested_qemu_machine(vm_info)
     if vm_info.config.gpus and requested_machine == "microvm":
-        raise SmolVMError(
-            "'--qemu-machine microvm' can't use a graphics card; "
-            "drop it or pass '--qemu-machine q35'.",
-            {"vm_id": vm_info.vm_id},
-        )
+        raise SmolVMError(GPU_REJECTS_MICROVM_MESSAGE, {"vm_id": vm_info.vm_id})
     if requested_machine == "q35":
         return False
     return _supports_qemu_microvm(

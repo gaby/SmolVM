@@ -1010,7 +1010,7 @@ def _resolve_gpu_passthrough(gpu_selections: Sequence[str] | None) -> list[Any] 
     if not gpu_selections:
         return None
 
-    from smolvm.host.gpu import assignable_functions, resolve_gpu_selection
+    from smolvm.host.gpu import resolve_gpu_selection
     from smolvm.types import GpuPassthrough
 
     cards = []
@@ -1019,7 +1019,7 @@ def _resolve_gpu_passthrough(gpu_selections: Sequence[str] | None) -> list[Any] 
         cards.append(
             GpuPassthrough(
                 address=device.address,
-                functions=assignable_functions(device),
+                functions=device.group_members,
                 vendor_id=device.vendor_id,
                 device_id=device.device_id,
             )
@@ -1207,7 +1207,7 @@ def _run_create(args: SimpleNamespace) -> int:
         # Resolve the requested cards against real hardware now, before any
         # image download, so a wrong address fails in a second rather than
         # after a long wait. Downstream code reads the resolved cards.
-        args.gpus = _resolve_gpu_passthrough(getattr(args, "gpus", None))
+        args.gpu_cards = _resolve_gpu_passthrough(getattr(args, "gpus", None))
 
         # Windows guests only boot on QEMU (firmware boot + swtpm). Auto-pick
         # QEMU when the user did not pin a backend; reject explicit
@@ -1354,7 +1354,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
-                    gpus=getattr(args, "gpus", None),
+                    gpus=args.gpu_cards,
                 )
             else:
                 config, ssh_key_path = _build_local_image_config(
@@ -1371,7 +1371,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
-                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
+                config = _apply_gpu_passthrough(config, args.gpu_cards)
                 vm_kwargs: dict[str, Any] = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1409,7 +1409,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
-                    gpus=getattr(args, "gpus", None),
+                    gpus=args.gpu_cards,
                 )
             else:
                 config, ssh_key_path = _build_s3_image_config(
@@ -1425,7 +1425,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
-                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
+                config = _apply_gpu_passthrough(config, args.gpu_cards)
                 vm_kwargs = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1465,7 +1465,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
-                    gpus=getattr(args, "gpus", None),
+                    gpus=args.gpu_cards,
                 )
             else:
                 config, ssh_key_path = _build_auto_config(
@@ -1483,7 +1483,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
-                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
+                config = _apply_gpu_passthrough(config, args.gpu_cards)
                 vm_kwargs = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1729,6 +1729,11 @@ def _run_start_with_published_image(args: SimpleNamespace, preset: object) -> in
             backend=backend,
             qemu_machine=args.qemu_machine,
             ssh_public_key=public_key_value,
+            # Normally unreachable with a card attached — _run_start pins the
+            # backend to QEMU, which declines this path. Carried anyway so a
+            # future host whose published runtime is QEMU honours the request
+            # instead of silently starting without the card.
+            gpus=getattr(args, "gpu_cards", None) or [],
         )
 
         vm: SmolVM | None = None
@@ -1836,9 +1841,15 @@ def _run_start(args: SimpleNamespace) -> int:
     # path below, so a wrong address fails immediately rather than after a
     # download. See _resolve_gpu_passthrough.
     try:
-        args.gpus = _resolve_gpu_passthrough(getattr(args, "gpus", None))
+        args.gpu_cards = _resolve_gpu_passthrough(getattr(args, "gpus", None))
     except Exception as exc:
         return _emit_cli_error(command_name, 2, exc, json_output=args.json)
+
+    # Only QEMU can attach a graphics card, so pin the backend the same way
+    # _run_create does. The published-image fast path below then declines on
+    # its own, because it publishes for a different runtime on Linux.
+    if args.gpu_cards and args.backend in (None, "auto"):
+        args.backend = "qemu"
 
     # The user-facing default is ubuntu when --os is omitted.
     requested_os = GuestOS(args.os) if args.os is not None else GuestOS.UBUNTU
@@ -1856,13 +1867,8 @@ def _run_start(args: SimpleNamespace) -> int:
     else:
         requested_backend = args.backend or "auto"
         published_backend = _VMM_TO_BACKEND[vmm]
-        # A graphics card needs the QEMU backend, and this fast path prefers
-        # Firecracker on Linux. Fall through to the QEMU path below rather
-        # than picking a runtime that would have to reject the card.
-        if (
-            not args.gpus
-            and requested_backend in {"auto", published_backend}
-            and is_preset_published(preset.name, arch, vmm, requested_os.value)
+        if requested_backend in {"auto", published_backend} and is_preset_published(
+            preset.name, arch, vmm, requested_os.value
         ):
             return _run_start_with_published_image(args, preset)
 
@@ -1907,7 +1913,7 @@ def _run_start(args: SimpleNamespace) -> int:
                 writable_mounts=args.writable_mounts,
                 network_mode=getattr(args, "network_mode", None),
                 bridge_name=getattr(args, "bridge_name", None),
-                gpus=getattr(args, "gpus", None),
+                gpus=args.gpu_cards,
             )
             apply_summary = _apply_preset_with_progress(
                 console=console,
@@ -1931,7 +1937,7 @@ def _run_start(args: SimpleNamespace) -> int:
                 network_mode=getattr(args, "network_mode", None),
                 bridge_name=getattr(args, "bridge_name", None),
             )
-            config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
+            config = _apply_gpu_passthrough(config, args.gpu_cards)
             vm = _cli_vm(
                 config,
                 ssh_key_path=ssh_key_path,

@@ -83,6 +83,7 @@ from smolvm.storage import (
 )
 from smolvm.storage._base import VSOCK_CID_END, VSOCK_CID_START
 from smolvm.types import (
+    GPU_REQUIRES_QEMU_MESSAGE,
     GuestOS,
     NetworkConfig,
     RootfsFormat,
@@ -1240,50 +1241,54 @@ class SmolVMManager:
             },
         )
 
-    def _check_gpus(self, vm_info: VMInfo) -> None:
-        """Verify each graphics card is still free before starting.
+    def _check_gpus(self, config: VMConfig, vm_id: str) -> None:
+        """Verify each graphics card is still usable before starting.
 
         A sandbox records which card it wants at create time, but hardware
         moves: the machine may have reclaimed the card, the sandbox may be
         starting on a different machine, or a restart may follow a reboot
         that undid the setup. Checking here turns all of those into one clear
         message instead of an emulator error nobody can act on.
+
+        Takes the configuration rather than a :class:`VMInfo` so restore can
+        check a snapshot's saved settings without inventing a sandbox.
         """
-        if not vm_info.config.gpus:
+        if not config.gpus:
             return
 
-        from smolvm.host.gpu import find_gpu, memlock_headroom_ok
+        from smolvm.host.gpu import memlock_headroom_ok, resolve_gpu_selection
 
-        for card in vm_info.config.gpus:
+        for card in config.gpus:
             try:
-                device = find_gpu(card.address)
+                device = resolve_gpu_selection(card.address)
             except ValueError as exc:
-                raise SmolVMError(str(exc), {"vm_id": vm_info.vm_id}) from exc
-            if not device.ready:
+                raise SmolVMError(str(exc), {"vm_id": vm_id, "gpu": card.address}) from exc
+            # Addresses are positional: pull a card out and put a different
+            # one in the same slot and the sandbox would silently get
+            # hardware it was never set up for.
+            if (device.vendor_id, device.device_id) != (card.vendor_id, card.device_id):
                 raise SmolVMError(
-                    device.blocker
-                    or (
-                        f"The graphics card at '{card.address}' isn't free for sandboxes. "
-                        "Run 'smolvm gpu list' to see what to do."
-                    ),
-                    {"vm_id": vm_info.vm_id, "gpu": card.address},
+                    f"A different graphics card is now at '{card.address}' "
+                    f"({device.description}). Run 'smolvm gpu list', then create a "
+                    "sandbox for the card you want.",
+                    {"vm_id": vm_id, "gpu": card.address},
                 )
 
         # A sandbox holding a graphics card keeps all its memory reserved,
         # and the operating system caps how much one user may reserve. Below
         # that cap the emulator dies partway through startup.
-        if not memlock_headroom_ok(vm_info.config.memory):
+        if not memlock_headroom_ok(config.memory):
             raise SmolVMError(
                 "This machine limits how much memory a sandbox can reserve, which a "
                 "graphics card needs. Run 'ulimit -l unlimited', then start the "
-                f"sandbox with 'smolvm sandbox start {vm_info.vm_id}'.",
-                {"vm_id": vm_info.vm_id, "memory_mib": vm_info.config.memory},
+                f"sandbox with 'smolvm sandbox start {vm_id}'.",
+                {"vm_id": vm_id, "memory_mib": config.memory},
             )
 
     def _ensure_snapshot_supported(
         self,
         vm_info: VMInfo,
-        snapshot_type: SnapshotType | None = None,
+        snapshot_type: SnapshotType = SnapshotType.FULL,
     ) -> None:
         """Validate whether snapshot operations are supported for a VM.
 
@@ -1291,8 +1296,8 @@ class SmolVMManager:
             vm_info: The sandbox being snapshotted.
             snapshot_type: What the snapshot will store. Only the types that
                 save the guest's memory are ruled out for a sandbox holding a
-                graphics card; ``None`` skips that check for callers (such as
-                restore) that are not creating one.
+                graphics card, so this has to be known to answer fully; it
+                defaults to the strictest type rather than skipping the check.
         """
         if snapshot_type in (SnapshotType.FULL, SnapshotType.DIFF) and vm_info.config.gpus:
             # Saving memory means saving the state of every device, and a real
@@ -1304,6 +1309,7 @@ class SmolVMManager:
                 f"'smolvm sandbox snapshot create {vm_info.vm_id} --snapshot-type disk'.",
                 {"vm_id": vm_info.vm_id, "snapshot_type": snapshot_type.value},
             )
+
         if vm_info.config.guest_os is GuestOS.WINDOWS:
             # Snapshotting a Windows VM faithfully needs the qcow2, the OVMF
             # NVRAM, AND the swtpm state captured atomically; that's a
@@ -2013,7 +2019,7 @@ class SmolVMManager:
             )
         if effective_config.gpus and backend != BACKEND_QEMU:
             raise SmolVMError(
-                "Graphics cards are only available with the QEMU backend; "
+                f"{GPU_REQUIRES_QEMU_MESSAGE}; "
                 "re-run without '--backend' so SmolVM can select a compatible runtime.",
                 {"vm_id": effective_config.vm_id, "backend": backend},
             )
@@ -2285,7 +2291,7 @@ class SmolVMManager:
             )
 
         self._check_workspace_mounts(vm_info)
-        self._check_gpus(vm_info)
+        self._check_gpus(vm_info.config, vm_info.vm_id)
 
         backend = self._backend_for_vm(vm_info)
         if backend == BACKEND_VZ:
@@ -2851,13 +2857,7 @@ class SmolVMManager:
         # card may be gone, reclaimed, or on another machine entirely by the
         # time someone restores, so check before restoring rather than
         # failing at launch.
-        self._check_gpus(
-            VMInfo(
-                vm_id=restore_vm_id,
-                status=VMState.CREATED,
-                config=snapshot.vm_config,
-            )
-        )
+        self._check_gpus(snapshot.vm_config, restore_vm_id)
         required_artifacts: list[tuple[Path | None, str]] = [
             (snapshot.artifacts.disk_path, "disk_path"),
             (snapshot.artifacts.state_path, "snapshot_path"),
@@ -3893,7 +3893,7 @@ class SmolVMManager:
             )
         if effective_config.gpus and backend != BACKEND_QEMU:
             raise SmolVMError(
-                "Graphics cards are only available with the QEMU backend; "
+                f"{GPU_REQUIRES_QEMU_MESSAGE}; "
                 "re-run without '--backend' so SmolVM can select a compatible runtime.",
                 {"vm_id": effective_config.vm_id, "backend": backend},
             )
@@ -4132,7 +4132,7 @@ class SmolVMManager:
             raise SmolVMError("VM has no network configuration", {"vm_id": vm_id})
 
         self._check_workspace_mounts(vm_info)
-        self._check_gpus(vm_info)
+        self._check_gpus(vm_info.config, vm_info.vm_id)
 
         backend = self._backend_for_vm(vm_info)
         if backend == BACKEND_VZ:

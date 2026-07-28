@@ -13,3 +13,41 @@
 # limitations under the License.
 
 # Tests configuration
+
+from collections.abc import Callable
+
+import pytest
+
+from smolvm.host.gpu import GpuDevice
+
+
+@pytest.fixture
+def gpu_device() -> Callable[..., GpuDevice]:
+    """Return a factory for host graphics cards.
+
+    Shared because four test modules need one and they only ever vary
+    whether the card is free. Pass ``blocker=`` to get a card that is not:
+    ``ready`` is derived from it, and the driver follows unless overridden.
+    """
+
+    def _make(
+        address: str = "0000:01:00.0",
+        *,
+        blocker: str | None = None,
+        driver: str | None = None,
+        functions: tuple[str, ...] = ("0000:01:00.0", "0000:01:00.1"),
+        vendor_id: str = "10de",
+        device_id: str = "2684",
+    ) -> GpuDevice:
+        return GpuDevice(
+            address=address,
+            vendor_id=vendor_id,
+            device_id=device_id,
+            vendor_name="NVIDIA",
+            driver=driver if driver is not None else ("nvidia" if blocker else "vfio-pci"),
+            iommu_group=12,
+            group_members=functions,
+            blocker=blocker,
+        )
+
+    return _make

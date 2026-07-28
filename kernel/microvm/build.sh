@@ -135,18 +135,22 @@ case "$SMOLVM_KERNEL_VARIANT" in
     default)
         ;;
     gpu)
-        VARIANT_FRAGMENT="$SCRIPT_DIR/config.gpu.fragment"
-        ARTIFACT_SUFFIX="-gpu"
-        if [ ! -f "$VARIANT_FRAGMENT" ]; then
-            echo "internal error: missing $VARIANT_FRAGMENT" >&2
-            exit 2
-        fi
+        VARIANT_FRAGMENT="$SCRIPT_DIR/config.$SMOLVM_KERNEL_VARIANT.fragment"
         ;;
     *)
         echo "unsupported SMOLVM_KERNEL_VARIANT: $SMOLVM_KERNEL_VARIANT (want 'default' or 'gpu')" >&2
         exit 2
         ;;
 esac
+# Everything below is variant-agnostic: adding a variant means adding one
+# case arm above plus its fragment, not touching the build or packaging.
+if [ -n "$VARIANT_FRAGMENT" ]; then
+    ARTIFACT_SUFFIX="-$SMOLVM_KERNEL_VARIANT"
+    if [ ! -f "$VARIANT_FRAGMENT" ]; then
+        echo "internal error: missing $VARIANT_FRAGMENT" >&2
+        exit 2
+    fi
+fi
 
 OUT_DIR="${OUT_DIR:-$PWD}"
 WORK_DIR="${WORK_DIR:-$(mktemp -d)}"
@@ -258,19 +262,14 @@ verify_fragment() {
         line="${line#"${line%%[![:space:]]*}"}"
         case "$line" in
             "") continue ;;
-            "CONFIG_"*=y)
+            "CONFIG_"*=y|"CONFIG_"*=m)
                 local symbol="${line%%=*}"
+                local want="${line#*=}"
                 if [ "$allow_override_skip" = yes ] && is_overridden "$symbol"; then
                     continue
                 fi
-                grep -qE "^${symbol}=y$" .config && continue
-                echo "  MISSING: $symbol — wanted =y, .config has: $(grep -E "^# ?${symbol}[ =]" .config || echo '<absent>') (from $(basename "$fragment"))"
-                fail=1
-                ;;
-            "CONFIG_"*=m)
-                local symbol="${line%%=*}"
-                grep -qE "^${symbol}=m$" .config && continue
-                echo "  MISSING: $symbol — wanted =m, .config has: $(grep -E "^# ?${symbol}[ =]" .config || echo '<absent>') (from $(basename "$fragment"))"
+                grep -qE "^${symbol}=${want}$" .config && continue
+                echo "  MISSING: $symbol — wanted =$want, .config has: $(grep -E "^# ?${symbol}[ =]" .config || echo '<absent>') (from $(basename "$fragment"))"
                 fail=1
                 ;;
         esac
@@ -305,7 +304,7 @@ echo "==> Building kernel ($JOBS jobs)"
 # 5b. Build and package the module tree for variants that enable modules.
 # The default variant has none (CONFIG_MODULES is off), so this is skipped
 # and its artifact set is unchanged.
-if [ -n "$VARIANT_FRAGMENT" ] && grep -q '^CONFIG_MODULES=y$' .config; then
+if grep -q '^CONFIG_MODULES=y$' .config; then
     MOD_STAGE="$WORK_DIR/modules-install"
     rm -rf "$MOD_STAGE"
     mkdir -p "$MOD_STAGE"

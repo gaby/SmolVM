@@ -68,7 +68,7 @@ jobs:
     env:
       # Asset names carry the variant; "default" keeps the historical names
       # so the SHAs pinned in BASE_KERNELS keep resolving.
-      SUFFIX: ${{ matrix.variant == 'gpu' && '-gpu' || '' }}
+      SUFFIX: ${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}
 
     steps:
       - name: Check out repository
@@ -130,8 +130,8 @@ jobs:
           # The gpu variant exists to give a sandbox loadable modules. If the
           # tree is missing, the artifact set is silently useless for that —
           # so fail here rather than publish a kernel nothing can drive.
-          if [ "$VARIANT" = "gpu" ]; then
-            MODULES="kernel-out/modules-${ARCH}-gpu.tar.zst"
+          if [ "$VARIANT" != "default" ]; then
+            MODULES="kernel-out/modules-${ARCH}${SUFFIX}.tar.zst"
             test -f "$MODULES" || { echo "missing: $MODULES"; exit 1; }
             test "$(stat -c '%s' "$MODULES")" -gt 10000 || {
               echo "$MODULES is suspiciously small"; exit 1; }
@@ -278,8 +278,8 @@ jobs:
             "kernel-out/vmlinux-${ARCH}${SUFFIX}.elf" \
             "kernel-out/vmlinux-${ARCH}${SUFFIX}.image" \
             "kernel-out/vmlinux-${ARCH}${SUFFIX}.config"
-          if [ -f "kernel-out/modules-${ARCH}-gpu.tar.zst" ]; then
-            set -- "$@" "kernel-out/modules-${ARCH}-gpu.tar.zst"
+          if [ -f "kernel-out/modules-${ARCH}${SUFFIX}.tar.zst" ]; then
+            set -- "$@" "kernel-out/modules-${ARCH}${SUFFIX}.tar.zst"
           fi
           for f in "$@"; do
             name="$(basename "$f")"

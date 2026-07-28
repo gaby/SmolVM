@@ -32,7 +32,6 @@ from smolvm.cli.main import (
     build_cli,
     main,
 )
-from smolvm.host.gpu import GpuDevice
 from smolvm.types import (
     BrowserSessionState,
     GuestOS,
@@ -5556,28 +5555,6 @@ class TestCliCompletion:
         assert items == []
 
 
-def _gpu_device(
-    address: str = "0000:01:00.0",
-    *,
-    ready: bool = True,
-    blocker: str | None = None,
-    driver: str | None = "vfio-pci",
-    functions: tuple[str, ...] = ("0000:01:00.0", "0000:01:00.1"),
-) -> GpuDevice:
-    """Build a real GpuDevice for CLI rendering tests."""
-    return GpuDevice(
-        address=address,
-        vendor_id="10de",
-        device_id="2684",
-        vendor_name="NVIDIA",
-        driver=driver,
-        iommu_group=12,
-        group_members=functions,
-        ready=ready,
-        blocker=blocker,
-    )
-
-
 class TestGpuList:
     """`smolvm gpu list` reports host graphics cards."""
 
@@ -5589,8 +5566,10 @@ class TestGpuList:
         assert ret == 0
         assert "didn't find a graphics card" in capsys.readouterr().out
 
-    def test_ready_card_shows_the_create_command(self, capsys: pytest.CaptureFixture) -> None:
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+    def test_ready_card_shows_the_create_command(
+        self, capsys: pytest.CaptureFixture, gpu_device
+    ) -> None:
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             ret = main(["gpu", "list"])
 
         assert ret == 0
@@ -5600,11 +5579,9 @@ class TestGpuList:
         assert "smolvm sandbox create --gpu 0000:01:00.0" in output
 
     def test_blocked_card_shows_the_reason_and_setup_steps(
-        self, capsys: pytest.CaptureFixture
+        self, capsys: pytest.CaptureFixture, gpu_device
     ) -> None:
-        blocked = _gpu_device(
-            ready=False,
-            driver="nvidia",
+        blocked = gpu_device(
             blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
         )
         with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
@@ -5618,16 +5595,18 @@ class TestGpuList:
         assert "One-time setup on this machine" in output
 
     def test_setup_steps_are_hidden_when_everything_is_ready(
-        self, capsys: pytest.CaptureFixture
+        self, capsys: pytest.CaptureFixture, gpu_device
     ) -> None:
         """Don't lecture a user whose machine is already configured."""
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             main(["gpu", "list"])
 
         assert "One-time setup" not in capsys.readouterr().out
 
-    def test_json_envelope_carries_every_field(self, capsys: pytest.CaptureFixture) -> None:
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+    def test_json_envelope_carries_every_field(
+        self, capsys: pytest.CaptureFixture, gpu_device
+    ) -> None:
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             ret = main(["gpu", "list", "--json"])
 
         assert ret == 0
@@ -5641,8 +5620,8 @@ class TestGpuList:
         assert card["functions"] == ["0000:01:00.0", "0000:01:00.1"]
         assert payload["data"]["setup_steps"], "JSON callers need the steps too"
 
-    def test_json_reports_the_blocker(self, capsys: pytest.CaptureFixture) -> None:
-        blocked = _gpu_device(ready=False, driver="nvidia", blocker="still in use")
+    def test_json_reports_the_blocker(self, capsys: pytest.CaptureFixture, gpu_device) -> None:
+        blocked = gpu_device(blocker="still in use")
         with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
             main(["gpu", "list", "--json"])
 
@@ -5676,13 +5655,14 @@ class TestCreateWithGpu:
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
+        gpu_device,
     ) -> None:
         monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="gputest")
         mock_build_auto_config.return_value = (config, "/tmp/key")
         mock_vm_cls.return_value = self._started_vm()
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+        with patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()):
             ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:01:00.0"])
 
         assert ret == 0
@@ -5699,13 +5679,14 @@ class TestCreateWithGpu:
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
+        gpu_device,
     ) -> None:
         monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
         config = MagicMock(vm_id="gputest")
         mock_build_auto_config.return_value = (config, "/tmp/key")
         mock_vm_cls.return_value = self._started_vm()
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "auto"])
 
         assert ret == 0
@@ -5719,6 +5700,7 @@ class TestCreateWithGpu:
         mock_vm_cls: MagicMock,
         mock_build_auto_config: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
+        gpu_device,
     ) -> None:
         """Only QEMU can attach a card, so don't fail on a backend nobody chose."""
         monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
@@ -5726,7 +5708,7 @@ class TestCreateWithGpu:
         mock_build_auto_config.return_value = (config, "/tmp/key")
         mock_vm_cls.return_value = self._started_vm()
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             main(["sandbox", "create", "--name", "gputest", "--gpu", "auto"])
 
         assert mock_build_auto_config.call_args.kwargs["backend"] == "qemu"
@@ -5736,7 +5718,11 @@ class TestCreateWithGpu:
         self, mock_build_auto_config: MagicMock, capsys: pytest.CaptureFixture
     ) -> None:
         """Building a sandbox downloads an image; a bad address must fail first."""
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+        missing = ValueError(
+            "No graphics card found at '0000:09:00.0' on this machine. "
+            "Run 'smolvm gpu list' to see the cards SmolVM can use."
+        )
+        with patch("smolvm.host.gpu.find_gpu", side_effect=missing):
             ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:09:00.0"])
 
         assert ret != 0
@@ -5744,13 +5730,13 @@ class TestCreateWithGpu:
         combined = " ".join((capsys.readouterr().err + capsys.readouterr().out).split())
         assert "No graphics card found at '0000:09:00.0'" in combined
 
-    def test_card_still_in_use_reports_the_blocker(self, capsys: pytest.CaptureFixture) -> None:
-        blocked = _gpu_device(
-            ready=False,
-            driver="nvidia",
+    def test_card_still_in_use_reports_the_blocker(
+        self, capsys: pytest.CaptureFixture, gpu_device
+    ) -> None:
+        blocked = gpu_device(
             blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
         )
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
+        with patch("smolvm.host.gpu.find_gpu", return_value=blocked):
             ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:01:00.0"])
 
         assert ret != 0

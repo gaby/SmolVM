@@ -753,16 +753,22 @@ class TestGpuPassthroughArgs:
         assert "vfio-pci,host=0000:01:00.1,id=smolvm-gpu0-1,addr=0x10.1" in cmd
 
     def test_guest_function_numbers_mirror_the_host(self, tmp_path: Path) -> None:
-        """Guest drivers look for the audio part at function 1 of the same slot."""
-        cmd = _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))
+        """Guest drivers look for a card's audio part at the host's function number.
 
-        graphics = cmd[
-            cmd.index("vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0,multifunction=on")
-        ]
-        audio = cmd[cmd.index("vfio-pci,host=0000:01:00.1,id=smolvm-gpu0-1,addr=0x10.1")]
+        Host function 3 is deliberately unusual: renumbering the parts onto
+        consecutive guest functions would still satisfy a test that only ever
+        used .0 and .1.
+        """
+        card = _gpu_card(functions=("0000:01:00.0", "0000:01:00.3"))
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
 
-        assert "addr=0x10.0" in graphics
-        assert "addr=0x10.1" in audio
+        slots = {
+            arg.split("host=")[1].split(",")[0]: arg.split("addr=")[1].split(",")[0]
+            for arg in cmd
+            if arg.startswith("vfio-pci,")
+        }
+
+        assert slots == {"0000:01:00.0": "0x10.0", "0000:01:00.3": "0x10.3"}
 
     def test_single_function_card_is_not_marked_multifunction(self, tmp_path: Path) -> None:
         card = _gpu_card(functions=("0000:01:00.0",))

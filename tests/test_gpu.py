@@ -217,13 +217,13 @@ class TestIommuEnabled:
         assert gpu.iommu_enabled(tmp_path / "nonexistent") is False
 
 
-class TestAssignableFunctions:
+class TestHandOverSet:
     def test_includes_the_audio_sibling(self, sysfs: Path, vfio_accessible: None) -> None:
         _nvidia_pair(sysfs, driver="vfio-pci")
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert gpu.assignable_functions(card) == ("0000:01:00.0", "0000:01:00.1")
+        assert card.group_members == ("0000:01:00.0", "0000:01:00.1")
 
     def test_graphics_function_leads(self, sysfs: Path, vfio_accessible: None) -> None:
         """QEMU puts the first entry at function 0, so ordering is load-bearing."""
@@ -238,7 +238,7 @@ class TestAssignableFunctions:
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert gpu.assignable_functions(card)[0] == "0000:01:00.0"
+        assert card.group_members[0] == "0000:01:00.0"
 
     def test_bridges_are_excluded(self, sysfs: Path, vfio_accessible: None) -> None:
         """A root port shares the group but is never handed to the guest."""
@@ -249,15 +249,16 @@ class TestAssignableFunctions:
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert "0000:00:01.0" not in gpu.assignable_functions(card)
+        assert "0000:00:01.0" not in card.group_members
         assert card.ready is True, "a bridge in the group must not block the card"
 
-    def test_falls_back_to_the_card_alone(self, sysfs: Path) -> None:
+    def test_card_with_no_group_still_reports_itself(self, sysfs: Path) -> None:
+        """Never empty — callers would otherwise have to special-case it."""
         _write_device(sysfs, "0000:01:00.0", class_id=CLASS_VGA, driver="vfio-pci")
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert gpu.assignable_functions(card) == ("0000:01:00.0",)
+        assert card.group_members == ("0000:01:00.0",)
 
 
 class TestFindGpu:
@@ -394,48 +395,44 @@ class TestSandboxGuards:
             patch("smolvm.host.gpu.list_host_gpus", return_value=[]),
             pytest.raises(SmolVMError, match="No graphics card found at '0000:01:00.0'"),
         ):
-            self._manager()._check_gpus(self._vm_info(tmp_path))
+            self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
-    def test_start_is_blocked_when_the_card_was_reclaimed(self, tmp_path: Path) -> None:
+    def test_start_is_blocked_when_the_card_was_reclaimed(self, tmp_path: Path, gpu_device) -> None:
         from smolvm.exceptions import SmolVMError
 
-        reclaimed = gpu.GpuDevice(
-            address="0000:01:00.0",
-            vendor_id="10de",
-            device_id="2684",
-            vendor_name="NVIDIA",
-            driver="nvidia",
-            iommu_group=12,
-            group_members=("0000:01:00.0",),
-            ready=False,
-            blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
+        reclaimed = gpu_device(
+            blocker="The graphics card at '0000:01:00.0' is still in use by this machine."
         )
         with (
-            patch("smolvm.host.gpu.list_host_gpus", return_value=[reclaimed]),
+            patch("smolvm.host.gpu.find_gpu", return_value=reclaimed),
             pytest.raises(SmolVMError, match="still in use by this machine"),
         ):
-            self._manager()._check_gpus(self._vm_info(tmp_path))
+            self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
-    def test_start_is_blocked_by_a_low_memory_reservation_cap(self, tmp_path: Path) -> None:
+    def test_start_is_blocked_when_a_different_card_took_the_slot(
+        self, tmp_path: Path, gpu_device
+    ) -> None:
+        """Addresses are positional; a swapped card must not be used silently."""
         from smolvm.exceptions import SmolVMError
 
-        ready = gpu.GpuDevice(
-            address="0000:01:00.0",
-            vendor_id="10de",
-            device_id="2684",
-            vendor_name="NVIDIA",
-            driver="vfio-pci",
-            iommu_group=12,
-            group_members=("0000:01:00.0", "0000:01:00.1"),
-            ready=True,
-            blocker=None,
-        )
+        other = gpu_device(device_id="1234")
         with (
-            patch("smolvm.host.gpu.list_host_gpus", return_value=[ready]),
+            patch("smolvm.host.gpu.find_gpu", return_value=other),
+            pytest.raises(SmolVMError, match="A different graphics card is now at"),
+        ):
+            self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
+
+    def test_start_is_blocked_by_a_low_memory_reservation_cap(
+        self, tmp_path: Path, gpu_device
+    ) -> None:
+        from smolvm.exceptions import SmolVMError
+
+        with (
+            patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()),
             patch("smolvm.host.gpu.memlock_headroom_ok", return_value=False),
             pytest.raises(SmolVMError, match="ulimit -l unlimited"),
         ):
-            self._manager()._check_gpus(self._vm_info(tmp_path))
+            self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
     def test_a_sandbox_without_a_card_skips_every_check(self, tmp_path: Path) -> None:
         """The check must not touch the host for the overwhelmingly common case."""
@@ -451,8 +448,8 @@ class TestSandboxGuards:
             config=VMConfig(vm_id="plain", kernel_path=kernel, rootfs_path=rootfs),
         )
 
-        with patch("smolvm.host.gpu.list_host_gpus", side_effect=AssertionError("probed host")):
-            self._manager()._check_gpus(plain)
+        with patch("smolvm.host.gpu.find_gpu", side_effect=AssertionError("probed host")):
+            self._manager()._check_gpus(plain.config, "plain")
 
     def test_memory_saving_snapshots_are_rejected(self, tmp_path: Path) -> None:
         from smolvm.exceptions import SmolVMError

@@ -364,21 +364,6 @@ class TestDoctorQemu:
 class TestGpuPassthroughCheck:
     """Tests for the user-facing graphics-card doctor row."""
 
-    def _device(self, *, ready: bool):
-        from smolvm.host.gpu import GpuDevice
-
-        return GpuDevice(
-            address="0000:01:00.0",
-            vendor_id="10de",
-            device_id="2684",
-            vendor_name="NVIDIA",
-            driver="vfio-pci" if ready else "nvidia",
-            iommu_group=12,
-            group_members=("0000:01:00.0",),
-            ready=ready,
-            blocker=None if ready else "still in use",
-        )
-
     def test_machine_without_a_card_says_nothing(self) -> None:
         """Most machines have no card; a warning there would be pure noise."""
         from smolvm.host.doctor import _check_gpu_passthrough
@@ -386,19 +371,21 @@ class TestGpuPassthroughCheck:
         with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
             assert _check_gpu_passthrough() is None
 
-    def test_ready_card_passes(self) -> None:
+    def test_ready_card_passes(self, gpu_device) -> None:
         from smolvm.host.doctor import _check_gpu_passthrough
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=True)]):
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             check = _check_gpu_passthrough()
 
         assert check is not None
         assert check.status == "pass"
 
-    def test_blocked_card_warns_and_points_at_gpu_list(self) -> None:
+    def test_blocked_card_warns_and_points_at_gpu_list(self, gpu_device) -> None:
         from smolvm.host.doctor import _check_gpu_passthrough
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=False)]):
+        with patch(
+            "smolvm.host.gpu.list_host_gpus", return_value=[gpu_device(blocker="still in use")]
+        ):
             check = _check_gpu_passthrough()
 
         assert check is not None
@@ -440,11 +427,12 @@ class TestGpuPassthroughCheck:
         mock_which: MagicMock,
         mock_run: MagicMock,
         _mock_system: MagicMock,
+        gpu_device,
     ) -> None:
         mock_which.side_effect = lambda binary: Path(f"/usr/bin/{binary}")
         mock_run.return_value = MagicMock(stdout="QEMU emulator version 8.2.0", stderr="")
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[self._device(ready=True)]):
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
             report = generate_doctor_report(backend="qemu")
 
         assert "gpu-passthrough" in {check.name for check in report.checks}

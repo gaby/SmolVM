@@ -38,13 +38,10 @@ Two details drive the shape of the API:
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
 
 # A PCI address ("bus/device/function"), e.g. "0000:01:00.0". Lowercase hex;
 # callers are normalized through _normalize_address before matching.
@@ -102,11 +99,11 @@ class GpuDevice:
             nothing has claimed it. ``vfio-pci`` means it is free for sandboxes.
         iommu_group: The hardware isolation group this card belongs to, or
             ``None`` when the machine has hardware isolation switched off.
-        group_members: Every address in that group that must be handed over
-            together, main function first. Bridges are excluded.
-        ready: Whether a sandbox can use this card right now.
-        blocker: When *ready* is False, a plain-English reason. ``None``
-            otherwise.
+        group_members: Every address handed to a sandbox together with this
+            card, main function first. Bridges are excluded. Always contains
+            at least the card itself.
+        blocker: Why a sandbox cannot use this card right now, in plain
+            English. ``None`` when it can.
     """
 
     address: str
@@ -116,8 +113,17 @@ class GpuDevice:
     driver: str | None
     iommu_group: int | None
     group_members: tuple[str, ...]
-    ready: bool
     blocker: str | None
+
+    @property
+    def ready(self) -> bool:
+        """Return whether a sandbox can use this card right now.
+
+        Derived rather than stored: a card is ready exactly when nothing is
+        blocking it, and keeping the two as separate fields would let them
+        disagree.
+        """
+        return self.blocker is None
 
     @property
     def description(self) -> str:
@@ -173,9 +179,12 @@ def _read_class(device_dir: Path) -> int | None:
         return None
 
 
-def _read_driver(device_dir: Path) -> str | None:
-    """Return the name of the driver bound to a device, or ``None``."""
-    link = device_dir / "driver"
+def _read_link_name(link: Path) -> str | None:
+    """Return the final path component a sysfs symlink points at.
+
+    sysfs answers "which driver owns this?" and "which group is it in?" with
+    symlinks whose target's last component is the answer.
+    """
     try:
         if not link.is_symlink() and not link.exists():
             return None
@@ -184,14 +193,15 @@ def _read_driver(device_dir: Path) -> str | None:
         return None
 
 
+def _read_driver(device_dir: Path) -> str | None:
+    """Return the name of the driver bound to a device, or ``None``."""
+    return _read_link_name(device_dir / "driver")
+
+
 def _read_iommu_group(device_dir: Path) -> int | None:
     """Return the hardware isolation group number for a device."""
-    link = device_dir / "iommu_group"
-    try:
-        if not link.is_symlink() and not link.exists():
-            return None
-        name = os.path.basename(os.path.realpath(link))
-    except OSError:
+    name = _read_link_name(device_dir / "iommu_group")
+    if name is None:
         return None
     try:
         return int(name)
@@ -233,64 +243,61 @@ def _vfio_group_accessible(group: int) -> bool:
     return node.exists() and os.access(node, os.R_OK | os.W_OK)
 
 
-def _classify(
+def _blocker(
     *,
     sysfs_root: Path,
     address: str,
-    driver: str | None,
+    iommu_on: bool,
     iommu_group: int | None,
     members: tuple[str, ...],
-) -> tuple[bool, str | None]:
-    """Return ``(ready, blocker)`` for one card.
+) -> str | None:
+    """Return why a sandbox cannot use this card, or ``None`` if it can.
 
-    The blocker text is user-facing. It names the single most useful next
-    step rather than every possible one — the full setup lives in
-    ``smolvm gpu list`` output and the GPU guide.
+    The text is user-facing. It names the single most useful next step rather
+    than every possible one — the full setup lives in ``smolvm gpu list``
+    output and the GPU guide.
     """
-    if not iommu_enabled(sysfs_root):
-        return False, (
+    if not iommu_on:
+        return (
             "This machine isn't set up to share graphics cards with sandboxes. "
             "Run 'smolvm gpu list' for the one-time setup steps."
         )
     if iommu_group is None:
-        return False, (
+        return (
             f"The graphics card at '{address}' isn't isolated from the rest of this "
             "machine, so a sandbox can't use it safely."
         )
 
+    in_use = (
+        f"The graphics card at '{address}' is still in use by this machine. "
+        "Run 'smolvm gpu list' for the one-time steps to free it."
+    )
+
     # Every member of the group has to be free, not just the card itself.
-    # This is the failure people hit most often and the one a generic message
-    # is least helpful for, so name the exact device that is still in use.
-    for member in members:
-        member_driver = _read_driver(sysfs_root / "bus" / "pci" / "devices" / member)
-        if member_driver == VFIO_DRIVER:
+    # A group whose listing was unreadable falls back to the card alone, so
+    # this loop always checks at least the card.
+    for member in members or (address,):
+        if _read_driver(sysfs_root / "bus" / "pci" / "devices" / member) == VFIO_DRIVER:
             continue
         if member == address:
-            return False, (
-                f"The graphics card at '{address}' is still in use by this machine. "
-                "Run 'smolvm gpu list' for the one-time steps to free it."
-            )
-        return False, (
+            return in_use
+        # Naming the exact device that is holding the group back is the
+        # difference between a five-minute fix and a lost afternoon.
+        return (
             f"The graphics card at '{address}' is grouped with '{member}', which is "
             "still in use by this machine. Run 'smolvm gpu list' to see what to free."
         )
 
-    if driver != VFIO_DRIVER:
-        return False, (
-            f"The graphics card at '{address}' is still in use by this machine. "
-            "Run 'smolvm gpu list' for the one-time steps to free it."
-        )
-
     if not _vfio_group_accessible(iommu_group):
-        return False, (
+        return (
             f"You don't have permission to use the graphics card at '{address}'. "
             "Add yourself to the 'vfio' group, then start a new login session."
         )
 
-    return True, None
+    return None
 
 
-def _build_device(sysfs_root: Path, address: str) -> GpuDevice | None:
+def _build_device(sysfs_root: Path, address: str, *, iommu_on: bool) -> GpuDevice | None:
     """Return a :class:`GpuDevice` for *address*, or ``None`` if not a GPU."""
     device_dir = sysfs_root / "bus" / "pci" / "devices" / address
     class_id = _read_class(device_dir)
@@ -299,53 +306,47 @@ def _build_device(sysfs_root: Path, address: str) -> GpuDevice | None:
 
     vendor_id = _read_hex_id(device_dir / "vendor") or "0000"
     device_id = _read_hex_id(device_dir / "device") or "0000"
-    driver = _read_driver(device_dir)
     iommu_group = _read_iommu_group(device_dir)
-
-    members: tuple[str, ...] = ()
-    if iommu_group is not None:
-        members = _assignable_members(sysfs_root, address, iommu_group)
-
-    ready, blocker = _classify(
-        sysfs_root=sysfs_root,
-        address=address,
-        driver=driver,
-        iommu_group=iommu_group,
-        members=members,
-    )
+    members = _assignable_members(sysfs_root, address, iommu_group)
 
     return GpuDevice(
         address=address,
         vendor_id=vendor_id,
         device_id=device_id,
         vendor_name=_VENDOR_NAMES.get(vendor_id, vendor_id),
-        driver=driver,
+        driver=_read_driver(device_dir),
         iommu_group=iommu_group,
         group_members=members,
-        ready=ready,
-        blocker=blocker,
+        blocker=_blocker(
+            sysfs_root=sysfs_root,
+            address=address,
+            iommu_on=iommu_on,
+            iommu_group=iommu_group,
+            members=members,
+        ),
     )
 
 
-def _assignable_members(sysfs_root: Path, address: str, group: int) -> tuple[str, ...]:
-    """Return the group's hand-over set, main function first.
+def _assignable_members(sysfs_root: Path, address: str, group: int | None) -> tuple[str, ...]:
+    """Return the hand-over set for a card, the card itself first.
 
     Bridges are dropped: they appear in the group listing but are never
-    handed to a guest, and VFIO does not require them to be freed.
+    handed to a guest, and VFIO does not require them to be freed. A card
+    with no readable group still reports itself, so callers never have to
+    special-case an empty result.
     """
-    assignable: list[str] = []
-    for member in _iommu_group_members(sysfs_root, group):
-        class_id = _read_class(sysfs_root / "bus" / "pci" / "devices" / member)
-        if class_id is not None and class_id in _BRIDGE_CLASSES:
-            continue
-        assignable.append(member)
+    listed = _iommu_group_members(sysfs_root, group) if group is not None else ()
+    assignable = [
+        member
+        for member in listed
+        if (_read_class(sysfs_root / "bus" / "pci" / "devices" / member)) not in _BRIDGE_CLASSES
+    ]
 
     # The card the user named must lead, because QEMU puts the first function
     # at slot function 0 and guests expect the display/compute function there.
     if address in assignable:
         assignable.remove(address)
-        assignable.insert(0, address)
-    return tuple(assignable)
+    return (address, *assignable)
 
 
 def list_host_gpus(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> list[GpuDevice]:
@@ -361,11 +362,15 @@ def list_host_gpus(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> list[GpuDevice]:
     except OSError:
         return []
 
+    # Whether the machine isolates hardware at all is the same answer for
+    # every card, so read it once rather than per device.
+    iommu_on = iommu_enabled(sysfs_root)
+
     found: list[GpuDevice] = []
     for name in entries:
         if not PCI_ADDRESS_PATTERN.match(name):
             continue
-        device = _build_device(sysfs_root, name)
+        device = _build_device(sysfs_root, name, iommu_on=iommu_on)
         if device is not None:
             found.append(device)
     return found
@@ -374,18 +379,25 @@ def list_host_gpus(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> list[GpuDevice]:
 def find_gpu(address: str, sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> GpuDevice:
     """Return the graphics card at *address*.
 
+    Goes straight to the device's own directory rather than scanning the
+    whole bus — the address already names the path.
+
     Raises:
         ValueError: When no graphics card sits at that address. The message
             is user-facing and points at ``smolvm gpu list``.
     """
     wanted = _normalize_address(address)
-    for device in list_host_gpus(sysfs_root):
-        if device.address == wanted:
-            return device
-    raise ValueError(
-        f"No graphics card found at '{address}' on this machine. "
-        "Run 'smolvm gpu list' to see the cards SmolVM can use."
+    device = (
+        _build_device(sysfs_root, wanted, iommu_on=iommu_enabled(sysfs_root))
+        if PCI_ADDRESS_PATTERN.match(wanted)
+        else None
     )
+    if device is None:
+        raise ValueError(
+            f"No graphics card found at '{address}' on this machine. "
+            "Run 'smolvm gpu list' to see the cards SmolVM can use."
+        )
+    return device
 
 
 def resolve_gpu_selection(
@@ -423,17 +435,6 @@ def resolve_gpu_selection(
     return device
 
 
-def assignable_functions(device: GpuDevice) -> tuple[str, ...]:
-    """Return every PCI address handed to the guest for *device*.
-
-    A discrete graphics card is nearly always paired with its own audio
-    function on the same chip, and the hardware isolates the pair together,
-    so both go to the sandbox. Falls back to the card alone when the machine
-    reports no grouping.
-    """
-    return device.group_members or (device.address,)
-
-
 def memlock_headroom_ok(memory_mib: int) -> bool:
     """Return whether this user may reserve enough memory for *memory_mib*.
 
@@ -458,13 +459,8 @@ def memlock_headroom_ok(memory_mib: int) -> bool:
 
 
 __all__ = [
-    "DEFAULT_SYSFS_ROOT",
-    "PCI_ADDRESS_PATTERN",
-    "VFIO_DRIVER",
     "GpuDevice",
-    "assignable_functions",
     "find_gpu",
-    "iommu_enabled",
     "list_host_gpus",
     "memlock_headroom_ok",
     "resolve_gpu_selection",

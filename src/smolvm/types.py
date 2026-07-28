@@ -129,6 +129,15 @@ _IDENTIFIER_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$"
 # sandbox was asked for and must stay loadable without touching the host.
 _PCI_ADDRESS_PATTERN = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
+# Two conditions get caught at more than one layer — the config validator
+# sees the declared request, the runtime sees the resolved machine — and the
+# user should get the same sentence either way. Kept here because this is the
+# lowest layer of the three and both others already import it.
+GPU_REQUIRES_QEMU_MESSAGE = "Graphics cards are only available with the QEMU backend"
+GPU_REJECTS_MICROVM_MESSAGE = (
+    "'--qemu-machine microvm' can't use a graphics card; drop it or pass '--qemu-machine q35'."
+)
+
 
 def _should_validate_paths(info: ValidationInfo) -> bool:
     """Return whether path-existence checks should run for this validation.
@@ -762,7 +771,7 @@ class VMConfig(BaseModel):
 
         if self.backend != "qemu":
             raise ValueError(
-                "Graphics cards are only available with the QEMU backend; "
+                f"{GPU_REQUIRES_QEMU_MESSAGE}; "
                 f"create the sandbox with '--name {self.vm_id} --backend qemu'."
             )
         if self.guest_os is GuestOS.MACOS:
@@ -773,10 +782,7 @@ class VMConfig(BaseModel):
                 "create the sandbox without '--gpu'."
             )
         if self.qemu_machine == "microvm":
-            raise ValueError(
-                "'--qemu-machine microvm' can't use a graphics card; "
-                "drop it or pass '--qemu-machine q35'."
-            )
+            raise ValueError(GPU_REJECTS_MICROVM_MESSAGE)
 
         # One address can only be in one sandbox's hand-over set. Catching it
         # here means a bad --gpu pair fails before anything is created.
