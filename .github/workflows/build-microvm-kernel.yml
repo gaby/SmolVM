@@ -12,6 +12,15 @@
 #   vmlinux-<arch>.image    — boot wrapper (bzImage / Image), for QEMU
 #   vmlinux-<arch>.config   — resolved .config (debugging aid)
 #
+# The "gpu" variant adds a `-gpu` suffix to each of those plus:
+#   modules-<arch>-gpu.tar.zst — loadable module tree for the same build
+#
+# Two variants are built per arch. "default" is the small, module-free
+# kernel every sandbox boots. "gpu" turns loadable modules back on so a
+# sandbox given a real graphics card can install that card's vendor driver;
+# see kernel/microvm/config.gpu.fragment for why it is a separate artifact
+# rather than a change to the default.
+#
 # These artifacts are preset-independent (one kernel boots all presets).
 
 name: Build microvm Kernel
@@ -53,8 +62,13 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
+        variant: [default, gpu]
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 60
+    env:
+      # Asset names carry the variant; "default" keeps the historical names
+      # so the SHAs pinned in BASE_KERNELS keep resolving.
+      SUFFIX: ${{ matrix.variant == 'gpu' && '-gpu' || '' }}
 
     steps:
       - name: Check out repository
@@ -67,9 +81,14 @@ jobs:
           # bc, flex, bison, libelf-dev, libssl-dev are required by the
           # Linux kernel build. ubuntu-latest already has most of them but
           # libelf-dev + a couple others aren't preinstalled.
+          #
+          # zstd packs the gpu variant's module tree. kmod provides depmod,
+          # which `make modules_install` needs to write modules.dep — without
+          # it that step only warns and ships a tree modprobe cannot use, so
+          # build.sh refuses to continue.
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-              bc bison flex libelf-dev libssl-dev xz-utils
+              bc bison flex libelf-dev libssl-dev xz-utils zstd kmod
 
       - name: Cache built kernel by input hash
         id: cache
@@ -80,21 +99,25 @@ jobs:
           # produces the same kernel byte-for-byte (modulo nondeterminism
           # we'd want to track separately if it bites).
           path: kernel-out
-          key: linux-kernel-${{ matrix.arch }}-${{ hashFiles('kernel/microvm/linux.version', 'kernel/microvm/linux.sha256', 'kernel/microvm/config.fragment', 'kernel/microvm/config.amd64.fragment', 'kernel/microvm/config.arm64.fragment', 'kernel/microvm/build.sh') }}
+          key: linux-kernel-${{ matrix.arch }}-${{ matrix.variant }}-${{ hashFiles('kernel/microvm/linux.version', 'kernel/microvm/linux.sha256', 'kernel/microvm/config.fragment', 'kernel/microvm/config.amd64.fragment', 'kernel/microvm/config.arm64.fragment', 'kernel/microvm/config.gpu.fragment', 'kernel/microvm/build.sh') }}
 
       - name: Build kernel
         if: steps.cache.outputs.cache-hit != 'true'
         env:
           OUT_DIR: ${{ github.workspace }}/kernel-out
           SMOLVM_ARCH_OVERRIDE: ${{ matrix.arch }}
+          SMOLVM_KERNEL_VARIANT: ${{ matrix.variant }}
         run: |
           mkdir -p "$OUT_DIR"
           bash kernel/microvm/build.sh
 
       - name: Sanity-check artifacts
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          ELF="kernel-out/vmlinux-${{ matrix.arch }}.elf"
-          IMAGE="kernel-out/vmlinux-${{ matrix.arch }}.image"
+          ELF="kernel-out/vmlinux-${ARCH}${SUFFIX}.elf"
+          IMAGE="kernel-out/vmlinux-${ARCH}${SUFFIX}.image"
           for f in "$ELF" "$IMAGE"; do
             test -f "$f" || { echo "missing: $f"; exit 1; }
             # Kernel images are MBs, not bytes. Catches the silent
@@ -103,6 +126,16 @@ jobs:
             test "$size" -gt 1000000 || { echo "$f is suspiciously small ($size bytes)"; exit 1; }
           done
           file "$ELF" "$IMAGE"
+
+          # The gpu variant exists to give a sandbox loadable modules. If the
+          # tree is missing, the artifact set is silently useless for that —
+          # so fail here rather than publish a kernel nothing can drive.
+          if [ "$VARIANT" = "gpu" ]; then
+            MODULES="kernel-out/modules-${ARCH}-gpu.tar.zst"
+            test -f "$MODULES" || { echo "missing: $MODULES"; exit 1; }
+            test "$(stat -c '%s' "$MODULES")" -gt 10000 || {
+              echo "$MODULES is suspiciously small"; exit 1; }
+          fi
           ls -lh kernel-out/
 
       - name: Resolve release tag
@@ -132,10 +165,10 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
-          elf_sha=$(sha256sum "kernel-out/vmlinux-${ARCH}.elf" | cut -d' ' -f1)
-          elf_size=$(stat -c '%s' "kernel-out/vmlinux-${ARCH}.elf")
-          image_sha=$(sha256sum "kernel-out/vmlinux-${ARCH}.image" | cut -d' ' -f1)
-          image_size=$(stat -c '%s' "kernel-out/vmlinux-${ARCH}.image")
+          elf_sha=$(sha256sum "kernel-out/vmlinux-${ARCH}${SUFFIX}.elf" | cut -d' ' -f1)
+          elf_size=$(stat -c '%s' "kernel-out/vmlinux-${ARCH}${SUFFIX}.elf")
+          image_sha=$(sha256sum "kernel-out/vmlinux-${ARCH}${SUFFIX}.image" | cut -d' ' -f1)
+          image_size=$(stat -c '%s' "kernel-out/vmlinux-${ARCH}${SUFFIX}.image")
           {
             echo "elf_sha=${elf_sha}"
             echo "elf_size=${elf_size}"
@@ -145,6 +178,9 @@ jobs:
 
       - name: Read pinned BASE_KERNELS SHAs
         id: pinned
+        # Only the default variant is pinned in BASE_KERNELS today, so the
+        # drift canary below has nothing to compare for the gpu variant.
+        if: matrix.variant == 'default'
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -235,10 +271,17 @@ jobs:
           # skipped silently.
           existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)"
           drift_detected=0
-          for f in \
-            "kernel-out/vmlinux-${ARCH}.elf" \
-            "kernel-out/vmlinux-${ARCH}.image" \
-            "kernel-out/vmlinux-${ARCH}.config"; do
+          # Positional params rather than a piped list: the loop below sets
+          # drift_detected, and a pipeline would run it in a subshell where
+          # that assignment is lost.
+          set -- \
+            "kernel-out/vmlinux-${ARCH}${SUFFIX}.elf" \
+            "kernel-out/vmlinux-${ARCH}${SUFFIX}.image" \
+            "kernel-out/vmlinux-${ARCH}${SUFFIX}.config"
+          if [ -f "kernel-out/modules-${ARCH}-gpu.tar.zst" ]; then
+            set -- "$@" "kernel-out/modules-${ARCH}-gpu.tar.zst"
+          fi
+          for f in "$@"; do
             name="$(basename "$f")"
             if [ "${FORCE_OVERWRITE:-false}" = "true" ]; then
               gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$f"
@@ -265,6 +308,7 @@ jobs:
       - name: Step summary
         env:
           ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
           TAG: ${{ steps.release.outputs.tag }}
           ELF_SHA: ${{ steps.sha.outputs.elf_sha }}
           ELF_SIZE: ${{ steps.sha.outputs.elf_size }}
@@ -281,14 +325,14 @@ jobs:
           fi
           published_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/src/smolvm/images/published.py"
           {
-            echo "## microvm kernel build: \`${ARCH}\`"
+            echo "## microvm kernel build: \`${ARCH}\` (\`${VARIANT}\`)"
             echo ""
             echo "Target release: [\`${TAG}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}). ${existing_assets_note}"
             echo ""
             echo "| Artifact | Size | SHA-256 |"
             echo "| --- | --- | --- |"
-            echo "| \`vmlinux-${ARCH}.elf\` (Firecracker) | $(numfmt --to=iec-i --suffix=B ${ELF_SIZE}) | \`${ELF_SHA}\` |"
-            echo "| \`vmlinux-${ARCH}.image\` (QEMU) | $(numfmt --to=iec-i --suffix=B ${IMAGE_SIZE}) | \`${IMAGE_SHA}\` |"
+            echo "| \`vmlinux-${ARCH}${SUFFIX}.elf\` (Firecracker) | $(numfmt --to=iec-i --suffix=B ${ELF_SIZE}) | \`${ELF_SHA}\` |"
+            echo "| \`vmlinux-${ARCH}${SUFFIX}.image\` (QEMU) | $(numfmt --to=iec-i --suffix=B ${IMAGE_SIZE}) | \`${IMAGE_SHA}\` |"
             echo ""
             echo "Linux version: \`$(cat kernel/microvm/linux.version)\` · Cache hit: \`${CACHE_HIT}\`"
             if [ "${DRIFT_DETECTED:-0}" = "1" ]; then

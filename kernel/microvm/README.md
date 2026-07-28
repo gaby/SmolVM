@@ -11,6 +11,40 @@ Both formats come from the same source build with the same Kconfig and
 boot identically; the difference is just the container the runtime
 expects.
 
+## Two variants
+
+Each arch is built twice, from the same source and the same common
+fragment:
+
+| Variant | Artifacts | Who boots it |
+|---|---|---|
+| `default` | `vmlinux-<arch>.{elf,image,config}` | Every ordinary sandbox. No loadable modules — see "No modules, ever" below. |
+| `gpu` | `vmlinux-<arch>-gpu.{elf,image,config}` plus `modules-<arch>-gpu.tar.zst` | Sandboxes given a real graphics card (`smolvm sandbox create --gpu`). |
+
+Build a variant with `SMOLVM_KERNEL_VARIANT=gpu bash build.sh`; the
+default needs no flag.
+
+**Why the GPU kernel is separate rather than a change to the common
+fragment.** A sandbox handed a real graphics card needs that card's
+driver, and NVIDIA's driver is built outside the kernel tree — it can
+only ever be a loadable module. But turning `CONFIG_MODULES` on in
+`config.fragment` would also un-drop every `=m` symbol inherited from the
+upstream defconfig (the `CONFIG_NETFILTER_XTABLES` note in that file
+records the same effect in reverse). That would hand a few hundred extra
+drivers to every sandbox, undoing the trimming this directory exists to
+do. So the cost lands only on the sandboxes that asked for it.
+
+`config.gpu.fragment` also switches off the largest driver groups a
+sandbox can never use (sound, wireless, InfiniBand, Bluetooth, media),
+which keeps the module tree small — around two dozen modules rather than
+several hundred. Boot-critical drivers stay `=y` in the common fragment,
+so the no-initrd contract in "No modules, ever" still holds for both
+variants.
+
+**Not in the GPU variant: `CONFIG_VFIO` and friends.** Those belong to
+the machine handing the card over, not to the sandbox receiving it. The
+sandbox just sees an ordinary graphics card on its own PCI bus.
+
 ## Why this exists
 
 Before 0.0.14a0 SmolVM fetched kernels from two external CDNs:
@@ -100,6 +134,7 @@ That's what the fragments in this directory encode.
 | `config.fragment` | Common deltas vs `x86_64_defconfig` (x86) / `defconfig` (arm64) — symbols that exist on both archs. Every line carries an inline `# why:` comment — that's the source of truth for "why is this in our kernel." |
 | `config.amd64.fragment` | x86-only deltas (8250 console). Merged on top of `config.fragment` for amd64 builds. |
 | `config.arm64.fragment` | arm64-only deltas (PCI host-generic, PL011 console). Merged on top of `config.fragment` for arm64 builds. |
+| `config.gpu.fragment` | `gpu`-variant-only deltas (loadable modules, DRM core, driver-group trims). Merged last so it can override the common fragment's `# CONFIG_MODULES is not set`. |
 | `build.sh` | The exact recipe CI runs. Also runnable locally — see below. |
 
 ## Building locally
@@ -221,11 +256,14 @@ task.
 
 ## Constraints and tradeoffs
 
-- **No modules built.** `# CONFIG_MODULES is not set` ensures every driver
-  needed at boot is `=y` (in-kernel). Without modules we don't need an
-  initrd, which keeps the image set simple. Cost: any future preset that
-  needs a kernel module (zfs, btrfs, NFS, etc.) requires adding the symbol
-  to `config.fragment` (or the per-arch fragment) as `=y`.
+- **No modules built (default variant).** `# CONFIG_MODULES is not set`
+  ensures every driver needed at boot is `=y` (in-kernel). Without modules
+  we don't need an initrd, which keeps the image set simple. Cost: any
+  future preset that needs a kernel module (zfs, btrfs, NFS, etc.) requires
+  adding the symbol to `config.fragment` (or the per-arch fragment) as `=y`.
+  The `gpu` variant is the one documented exception — see "Two variants"
+  above — and it still keeps every boot-path driver `=y`, so neither
+  variant needs an initrd.
 - **FUSE is built in.** Guest filesystems such as JuiceFS still need userspace
   packages in the rootfs, but the kernel must provide `/dev/fuse` because
   there is no initrd or module tree to load it later.

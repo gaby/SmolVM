@@ -203,6 +203,44 @@ if [ ! -x "$GUEST_AGENT_BINARY" ]; then
 fi
 install -D -m 0755 "$GUEST_AGENT_BINARY" "$MNT/usr/local/bin/smolvm-guest-agent"
 
+# Bake the loadable-module tree for images meant to run with a graphics
+# card. SMOLVM_MODULES_ARCHIVE points at the `modules-<arch>-gpu.tar.zst`
+# produced by kernel/microvm/build.sh with SMOLVM_KERNEL_VARIANT=gpu.
+#
+# Without this the guest has no /lib/modules at all, so `modprobe` fails
+# even for drivers that exist — which is exactly why the default images
+# cannot load a vendor GPU driver. Left unset for ordinary images, so
+# their contents are unchanged.
+if [ -n "${SMOLVM_MODULES_ARCHIVE:-}" ]; then
+  if [ ! -f "$SMOLVM_MODULES_ARCHIVE" ]; then
+    echo "Module archive not found: $SMOLVM_MODULES_ARCHIVE" >&2
+    exit 1
+  fi
+  echo "==> Installing kernel modules from $SMOLVM_MODULES_ARCHIVE"
+  mkdir -p "$MNT/lib/modules"
+  tar -C "$MNT" --zstd -xf "$SMOLVM_MODULES_ARCHIVE"
+
+  # depmod runs here, not in the guest: it needs the module tree only, and
+  # doing it now means the sandbox can modprobe on first boot.
+  KVER="$(ls "$MNT/lib/modules" | head -n1)"
+  if [ -z "$KVER" ]; then
+    echo "Module archive contained no kernel version directory" >&2
+    exit 1
+  fi
+  chroot "$MNT" depmod -a "$KVER"
+
+  # nouveau is the in-tree NVIDIA driver. It claims the card first and the
+  # proprietary driver then refuses to bind, which is the single most
+  # common reason an otherwise-correct setup ends with no working GPU.
+  mkdir -p "$MNT/etc/modprobe.d"
+  cat > "$MNT/etc/modprobe.d/smolvm-gpu.conf" <<'MODPROBE_EOF'
+# Keep the in-tree NVIDIA driver out of the way so the vendor driver can
+# bind to the card. Installed by scripts/ci/build-preset.sh.
+blacklist nouveau
+options nouveau modeset=0
+MODPROBE_EOF
+fi
+
 # Restore (or remove) /etc/resolv.conf so the runner's DNS doesn't leak
 # into the published rootfs. The init script writes 8.8.8.8 / 8.8.4.4 at
 # boot, so removing it on the empty case is safe.

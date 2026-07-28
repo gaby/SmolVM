@@ -1,0 +1,62 @@
+# SmolVM GPU kernel config fragment — the "gpu" variant only.
+#
+# Merged on top of `config.fragment` and `config.<arch>.fragment` when
+# build.sh runs with SMOLVM_KERNEL_VARIANT=gpu. The default kernel does NOT
+# get these, and that is the whole point of the split.
+#
+# Why a separate variant instead of changing the common fragment:
+# `config.fragment` ends with `# CONFIG_MODULES is not set`, which also
+# silences every `=m` symbol inherited from the upstream defconfig (see the
+# CONFIG_NETFILTER_XTABLES note there). Turning modules on in the common
+# fragment would hand a few hundred extra drivers to every sandbox — the
+# opposite of the trimmed attack surface the README argues for. So sandboxes
+# that want a graphics card opt into a bigger kernel, and everybody else
+# keeps the small one.
+#
+# What this variant is for: a sandbox given a real graphics card needs the
+# card's own driver, and for NVIDIA that driver is built outside the kernel
+# tree and can only be loaded as a module. Without CONFIG_MODULES there is
+# no way to install it at all.
+#
+# NOT here: CONFIG_VFIO and friends. Those belong to the machine handing the
+# card over, not to the sandbox receiving it. The sandbox sees an ordinary
+# graphics card on its own PCI bus.
+#
+# Formatting note: `# CONFIG_X is not set` lines must stand alone. Both
+# merge_config.sh and build.sh's verify_fragment match that exact shape, and
+# a trailing `# why:` comment turns the directive into an ordinary comment
+# that is silently ignored. So those get their reason on the line above.
+
+# ── Loadable modules ─────────────────────────────────────────────────
+CONFIG_MODULES=y                        # why: vendor GPU drivers ship as out-of-tree modules
+CONFIG_MODULE_UNLOAD=y                  # why: a failed driver install can be undone without a reboot
+
+# why: a vendor driver built inside the sandbox is unsigned, so refusing
+# unsigned modules would make this variant pointless.
+# CONFIG_MODULE_SIG_FORCE is not set
+
+# ── Direct rendering core ────────────────────────────────────────────
+# Both the NVIDIA and AMD drivers register with this layer, so it has to
+# exist before either can attach. Modular so the variant stays close to the
+# default kernel at boot: nothing here is needed to mount the root disk.
+CONFIG_DRM=m                            # why: nvidia-drm and amdgpu both bind to it
+
+# ── Trim the defconfig module explosion ──────────────────────────────
+# Switching CONFIG_MODULES on revives every `=m` symbol the upstream
+# defconfig carries. A sandbox has no speakers, no radios, and no fabric
+# adapters, so drop the largest groups rather than build and ship them.
+
+# why: sandboxes have no audio output
+# CONFIG_SOUND is not set
+
+# why: sandbox networking is virtio-net only
+# CONFIG_WLAN is not set
+
+# why: no RDMA fabric in a sandbox
+# CONFIG_INFINIBAND is not set
+
+# why: no capture or tuner hardware
+# CONFIG_MEDIA_SUPPORT is not set
+
+# why: no Bluetooth radio
+# CONFIG_BT is not set

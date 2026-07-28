@@ -12,6 +12,13 @@
 #   ~30 MB plus its dep tree, and uv brings its own venv implementation.
 # - gnupg: only needed by the NodeSource bootstrap (apt-key); we drop it
 #   in the same RUN that uses it so it doesn't persist into the image.
+# - build-essential / dkms: needed only to build a graphics driver inside a
+#   sandbox, which is rare and reachable with apt at that point. Baking them
+#   in would cost every image several hundred MB. See docs/guides/gpu.md.
+#
+# kmod IS here (~150 KB): it provides modprobe/depmod. The default kernel
+# has no loadable modules, but the gpu kernel variant does, and without kmod
+# a sandbox cannot load a driver it just installed.
 
 FROM ubuntu:24.04
 
@@ -29,6 +36,7 @@ RUN apt-get update -qq \
         gnupg \
         git \
         bash \
+        kmod \
         python3 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y -qq --no-install-recommends nodejs \
