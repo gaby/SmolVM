@@ -27,6 +27,7 @@ from smolvm.types import (
     BrowserSessionState,
     BrowserViewport,
     CommandResult,
+    GpuPassthrough,
     GuestOS,
     NetworkConfig,
     SnapshotArtifacts,
@@ -644,3 +645,143 @@ def test_guest_os_public_export() -> None:
     assert PublicGuestOS is GuestOS
     assert GuestOS.ALPINE.value == "alpine"
     assert GuestOS.UBUNTU.value == "ubuntu"
+
+
+class TestGpuPassthrough:
+    """Tests for the graphics-card model."""
+
+    def _card(self, **overrides: object) -> GpuPassthrough:
+        values: dict[str, object] = {
+            "address": "0000:01:00.0",
+            "functions": ("0000:01:00.0", "0000:01:00.1"),
+            "vendor_id": "10de",
+            "device_id": "2684",
+        }
+        values.update(overrides)
+        return GpuPassthrough(**values)  # type: ignore[arg-type]
+
+    def test_identifiers_are_lowercased(self) -> None:
+        card = self._card(address="0000:0A:00.0", functions=("0000:0A:00.0",), vendor_id="10DE")
+
+        assert card.address == "0000:0a:00.0"
+        assert card.functions == ("0000:0a:00.0",)
+        assert card.vendor_id == "10de"
+
+    def test_survives_a_json_round_trip(self) -> None:
+        """Sandboxes are stored as JSON, so this is the persistence path."""
+        card = self._card()
+
+        assert GpuPassthrough.model_validate_json(card.model_dump_json()) == card
+
+    def test_is_hashable(self) -> None:
+        """A frozen model with a list field would raise here; functions is a tuple."""
+        assert hash(self._card()) == hash(self._card())
+
+    def test_rejects_a_malformed_address(self) -> None:
+        with pytest.raises(ValidationError, match="is not a hardware address"):
+            self._card(address="01:00", functions=("01:00",))
+
+    def test_rejects_an_empty_hand_over_set(self) -> None:
+        with pytest.raises(ValidationError, match="at least one hardware address"):
+            self._card(functions=())
+
+    def test_rejects_a_repeated_address(self) -> None:
+        with pytest.raises(ValidationError, match="listed twice"):
+            self._card(functions=("0000:01:00.0", "0000:01:00.0"))
+
+    def test_requires_the_named_card_to_lead(self) -> None:
+        """The emulator puts the first entry where guest drivers expect it."""
+        with pytest.raises(ValidationError, match="must be the first address"):
+            self._card(functions=("0000:01:00.1", "0000:01:00.0"))
+
+
+class TestVMConfigGpus:
+    """Tests for the sandbox settings that can and cannot use a graphics card."""
+
+    def _config(self, tmp_path: Path, **overrides: object) -> VMConfig:
+        kernel = tmp_path / "vmlinux"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        card = GpuPassthrough(
+            address="0000:01:00.0",
+            functions=("0000:01:00.0", "0000:01:00.1"),
+            vendor_id="10de",
+            device_id="2684",
+        )
+        values: dict[str, object] = {
+            "vm_id": "gputest",
+            "kernel_path": kernel,
+            "rootfs_path": rootfs,
+            "backend": "qemu",
+            "gpus": [card],
+        }
+        values.update(overrides)
+        return VMConfig(**values)  # type: ignore[arg-type]
+
+    def test_qemu_linux_sandbox_is_allowed(self, tmp_path: Path) -> None:
+        config = self._config(tmp_path)
+
+        assert config.gpus[0].address == "0000:01:00.0"
+
+    def test_no_gpus_skips_every_rule(self, tmp_path: Path) -> None:
+        """The checks must not fire for the overwhelmingly common case."""
+        config = self._config(tmp_path, gpus=[], backend="firecracker")
+
+        assert config.gpus == []
+
+    def test_rejects_a_non_qemu_backend(self, tmp_path: Path) -> None:
+        with pytest.raises(ValidationError, match="only available with the QEMU backend"):
+            self._config(tmp_path, backend="firecracker")
+
+    def test_rejects_windows_guests(self, tmp_path: Path) -> None:
+        # Windows boots through firmware with no separate kernel, so build a
+        # config that is otherwise valid — else the boot-mode rule fires first
+        # and this test would pass without exercising the graphics-card rule.
+        with pytest.raises(ValidationError, match="Windows sandboxes cannot use a graphics card"):
+            self._config(
+                tmp_path,
+                guest_os=GuestOS.WINDOWS,
+                boot_mode="firmware",
+                kernel_path=None,
+            )
+
+    def test_rejects_the_microvm_machine(self, tmp_path: Path) -> None:
+        """The microvm machine has no PCI bus, so a card cannot attach."""
+        with pytest.raises(ValidationError, match="microvm"):
+            self._config(tmp_path, qemu_machine="microvm")
+
+    def test_rejects_the_same_card_named_twice(self, tmp_path: Path) -> None:
+        card = GpuPassthrough(
+            address="0000:01:00.0",
+            functions=("0000:01:00.0",),
+            vendor_id="10de",
+            device_id="2684",
+        )
+        with pytest.raises(ValidationError, match="listed twice"):
+            self._config(tmp_path, gpus=[card, card])
+
+    def test_rejects_a_shared_function_between_two_cards(self, tmp_path: Path) -> None:
+        """Two cards must not claim the same piece of hardware."""
+        first = GpuPassthrough(
+            address="0000:01:00.0",
+            functions=("0000:01:00.0", "0000:01:00.1"),
+            vendor_id="10de",
+            device_id="2684",
+        )
+        second = GpuPassthrough(
+            address="0000:01:00.1",
+            functions=("0000:01:00.1",),
+            vendor_id="10de",
+            device_id="22ba",
+        )
+        with pytest.raises(ValidationError, match="listed twice"):
+            self._config(tmp_path, gpus=[first, second])
+
+    def test_reloads_from_storage_without_touching_the_host(self, tmp_path: Path) -> None:
+        """A saved sandbox must load on a machine whose hardware has changed."""
+        raw = self._config(tmp_path).model_dump_json()
+
+        restored = VMConfig.model_validate_json(raw, context={"validate_paths": False})
+
+        assert restored.gpus[0].functions == ("0000:01:00.0", "0000:01:00.1")

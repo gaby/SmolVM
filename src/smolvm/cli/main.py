@@ -873,6 +873,7 @@ def _build_and_boot_with_progress(
     writable_mounts: bool = False,
     network_mode: str | None = None,
     bridge_name: str | None = None,
+    gpus: Sequence[str] | None = None,
 ) -> object:
     """Build a VM config and boot it, showing a Rich progress bar.
 
@@ -909,6 +910,7 @@ def _build_and_boot_with_progress(
         config = _apply_network_attachment(
             config, network_mode=network_mode, bridge_name=bridge_name
         )
+        config = _apply_gpu_passthrough(config, gpus)
         progress.remove_task(prepare_task)
 
         # One task that re-labels as the boot pipeline progresses
@@ -992,6 +994,44 @@ def _apply_network_attachment(
             }
         )
     return config
+
+
+def _resolve_gpu_passthrough(gpu_selections: Sequence[str] | None) -> list[Any] | None:
+    """Turn ``--gpu`` values into graphics cards, or raise saying why not.
+
+    Call this *before* any slow work. Building a sandbox downloads an image,
+    so a card that is missing or still in use has to fail first — otherwise
+    the user waits for a few hundred megabytes to learn they typed the wrong
+    address. Same reasoning as the ``ensure_backend_available`` gate.
+
+    Each selection is expanded to every piece of hardware the machine
+    isolates alongside the card, since they can only be handed over together.
+    """
+    if not gpu_selections:
+        return None
+
+    from smolvm.host.gpu import assignable_functions, resolve_gpu_selection
+    from smolvm.types import GpuPassthrough
+
+    cards = []
+    for selection in gpu_selections:
+        device = resolve_gpu_selection(selection)
+        cards.append(
+            GpuPassthrough(
+                address=device.address,
+                functions=assignable_functions(device),
+                vendor_id=device.vendor_id,
+                device_id=device.device_id,
+            )
+        )
+    return cards
+
+
+def _apply_gpu_passthrough(config: Any, cards: Sequence[Any] | None) -> Any:
+    """Record already-resolved graphics cards on a VMConfig."""
+    if not cards:
+        return config
+    return config.model_copy(update={"gpus": list(cards)})
 
 
 def _run_bridge_check(args: SimpleNamespace) -> int:
@@ -1158,6 +1198,17 @@ def _run_create(args: SimpleNamespace) -> int:
         if args.mounts and args.backend in (None, "auto") and args.os != "macos":
             args.backend = "qemu"
 
+        # Same for graphics cards: only the QEMU backend can attach one, so
+        # auto-pick it rather than failing on a backend the user never chose.
+        # An explicit --backend is left alone for the config check to catch.
+        if getattr(args, "gpus", None) and args.backend in (None, "auto"):
+            args.backend = "qemu"
+
+        # Resolve the requested cards against real hardware now, before any
+        # image download, so a wrong address fails in a second rather than
+        # after a long wait. Downstream code reads the resolved cards.
+        args.gpus = _resolve_gpu_passthrough(getattr(args, "gpus", None))
+
         # Windows guests only boot on QEMU (firmware boot + swtpm). Auto-pick
         # QEMU when the user did not pin a backend; reject explicit
         # non-QEMU choices upfront with a one-sentence error.
@@ -1303,6 +1354,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
+                    gpus=getattr(args, "gpus", None),
                 )
             else:
                 config, ssh_key_path = _build_local_image_config(
@@ -1319,6 +1371,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
+                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
                 vm_kwargs: dict[str, Any] = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1356,6 +1409,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
+                    gpus=getattr(args, "gpus", None),
                 )
             else:
                 config, ssh_key_path = _build_s3_image_config(
@@ -1371,6 +1425,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
+                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
                 vm_kwargs = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1410,6 +1465,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     writable_mounts=args.writable_mounts,
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
+                    gpus=getattr(args, "gpus", None),
                 )
             else:
                 config, ssh_key_path = _build_auto_config(
@@ -1427,6 +1483,7 @@ def _run_create(args: SimpleNamespace) -> int:
                     network_mode=getattr(args, "network_mode", None),
                     bridge_name=getattr(args, "bridge_name", None),
                 )
+                config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
                 vm_kwargs = {
                     "ssh_key_path": ssh_key_path,
                     "mounts": args.mounts,
@@ -1775,6 +1832,14 @@ def _run_start(args: SimpleNamespace) -> int:
     preset = get_preset(args.preset_name)
     command_name = getattr(args, "command_name", f"{preset.name}.start")
 
+    # Resolve any requested graphics card before the published-image fast
+    # path below, so a wrong address fails immediately rather than after a
+    # download. See _resolve_gpu_passthrough.
+    try:
+        args.gpus = _resolve_gpu_passthrough(getattr(args, "gpus", None))
+    except Exception as exc:
+        return _emit_cli_error(command_name, 2, exc, json_output=args.json)
+
     # The user-facing default is ubuntu when --os is omitted.
     requested_os = GuestOS(args.os) if args.os is not None else GuestOS.UBUNTU
 
@@ -1791,8 +1856,13 @@ def _run_start(args: SimpleNamespace) -> int:
     else:
         requested_backend = args.backend or "auto"
         published_backend = _VMM_TO_BACKEND[vmm]
-        if requested_backend in {"auto", published_backend} and is_preset_published(
-            preset.name, arch, vmm, requested_os.value
+        # A graphics card needs the QEMU backend, and this fast path prefers
+        # Firecracker on Linux. Fall through to the QEMU path below rather
+        # than picking a runtime that would have to reject the card.
+        if (
+            not args.gpus
+            and requested_backend in {"auto", published_backend}
+            and is_preset_published(preset.name, arch, vmm, requested_os.value)
         ):
             return _run_start_with_published_image(args, preset)
 
@@ -1837,6 +1907,7 @@ def _run_start(args: SimpleNamespace) -> int:
                 writable_mounts=args.writable_mounts,
                 network_mode=getattr(args, "network_mode", None),
                 bridge_name=getattr(args, "bridge_name", None),
+                gpus=getattr(args, "gpus", None),
             )
             apply_summary = _apply_preset_with_progress(
                 console=console,
@@ -1860,6 +1931,7 @@ def _run_start(args: SimpleNamespace) -> int:
                 network_mode=getattr(args, "network_mode", None),
                 bridge_name=getattr(args, "bridge_name", None),
             )
+            config = _apply_gpu_passthrough(config, getattr(args, "gpus", None))
             vm = _cli_vm(
                 config,
                 ssh_key_path=ssh_key_path,

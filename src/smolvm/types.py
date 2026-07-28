@@ -124,6 +124,11 @@ def _generate_snapshot_id() -> str:
 
 _IDENTIFIER_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$"
 
+# Where a piece of hardware sits on the host machine, e.g. "0000:01:00.0".
+# Duplicated from smolvm.host.gpu on purpose: this module describes what a
+# sandbox was asked for and must stay loadable without touching the host.
+_PCI_ADDRESS_PATTERN = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+
 
 def _should_validate_paths(info: ValidationInfo) -> bool:
     """Return whether path-existence checks should run for this validation.
@@ -231,6 +236,73 @@ class WorkspaceMount(BaseModel):
     def resolved_tag(self, index: int) -> str:
         """Return the mount tag, falling back to ``workspace{index}``."""
         return self.mount_tag or f"workspace{index}"
+
+    model_config = {"frozen": True}
+
+
+class GpuPassthrough(BaseModel):
+    """One graphics card from the host machine, given to this sandbox.
+
+    The sandbox gets the real hardware, so the card is unavailable to the
+    host machine and to every other sandbox while this one runs.
+
+    A graphics card is usually more than one piece of hardware — the graphics
+    part and its audio output sit on the same chip, and the machine isolates
+    them together — so ``functions`` lists every piece handed over, not just
+    the address the user typed. ``address`` is always the first entry.
+
+    Attributes:
+        address: Where the card sits on the host machine, e.g.
+            ``0000:01:00.0``.
+        functions: Every hardware address handed to the sandbox, starting
+            with *address*.
+        vendor_id: Four hex digits identifying the maker, e.g. ``10de``.
+        device_id: Four hex digits identifying the model, e.g. ``2684``.
+    """
+
+    address: str
+    functions: tuple[str, ...]
+    vendor_id: str
+    device_id: str
+
+    @field_validator("address", "vendor_id", "device_id")
+    @classmethod
+    def normalize_lowercase(cls, value: str) -> str:
+        """Lowercase hex identifiers so comparisons are stable."""
+        return value.strip().lower()
+
+    @field_validator("functions")
+    @classmethod
+    def normalize_functions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Lowercase and validate every hardware address."""
+        normalized = tuple(item.strip().lower() for item in value)
+        if not normalized:
+            raise ValueError("a graphics card must list at least one hardware address")
+        for item in normalized:
+            if not _PCI_ADDRESS_PATTERN.fullmatch(item):
+                raise ValueError(
+                    f"'{item}' is not a hardware address; it should look like '0000:01:00.0'"
+                )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("the same hardware address is listed twice")
+        return normalized
+
+    @model_validator(mode="after")
+    def _check_address_leads(self) -> "GpuPassthrough":
+        """Ensure the named card is the first address handed over.
+
+        Order is load-bearing: the emulator places the first entry at the
+        slot a guest driver expects the graphics part to occupy.
+        """
+        if not _PCI_ADDRESS_PATTERN.fullmatch(self.address):
+            raise ValueError(
+                f"'{self.address}' is not a hardware address; it should look like '0000:01:00.0'"
+            )
+        if self.functions[0] != self.address:
+            raise ValueError(
+                f"the graphics card '{self.address}' must be the first address handed over"
+            )
+        return self
 
     model_config = {"frozen": True}
 
@@ -493,6 +565,8 @@ class VMConfig(BaseModel):
             ``smolvm.network=guest`` and can configure its own interface.
             Required for bridge mode so older cached or custom images cannot
             silently boot without usable networking.
+        gpus: Graphics cards from the host machine given to this sandbox.
+            Only the QEMU backend can do this, and only for Linux guests.
     """
 
     vm_id: Annotated[
@@ -528,6 +602,7 @@ class VMConfig(BaseModel):
     comm_channel: Literal["ssh", "vsock"] | None = None
     internet_settings: InternetSettings | None = None
     workspace_mounts: list[WorkspaceMount] = []
+    gpus: list[GpuPassthrough] = []
     ssh_public_key: str | None = None
     guest_managed_networking: bool = False
     network_attachment: NetworkAttachmentConfig = Field(default_factory=NetworkAttachmentConfig)
@@ -672,6 +747,47 @@ class VMConfig(BaseModel):
                 "Domain allow-lists are not enforced in bridge mode; "
                 "remove internet_settings or use NAT mode."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_gpu_constraints(self) -> "VMConfig":
+        """Reject sandbox settings that cannot use a graphics card.
+
+        These are properties of the request, not of the machine SmolVM is
+        running on, so they hold when a saved sandbox is loaded back on a
+        different host. Whether the card is actually free is checked at start.
+        """
+        if not self.gpus:
+            return self
+
+        if self.backend != "qemu":
+            raise ValueError(
+                "Graphics cards are only available with the QEMU backend; "
+                f"create the sandbox with '--name {self.vm_id} --backend qemu'."
+            )
+        if self.guest_os is GuestOS.MACOS:
+            raise ValueError("macOS sandboxes cannot use a graphics card from this machine.")
+        if self.guest_os is GuestOS.WINDOWS:
+            raise ValueError(
+                "Windows sandboxes cannot use a graphics card in this release; "
+                "create the sandbox without '--gpu'."
+            )
+        if self.qemu_machine == "microvm":
+            raise ValueError(
+                "'--qemu-machine microvm' can't use a graphics card; "
+                "drop it or pass '--qemu-machine q35'."
+            )
+
+        # One address can only be in one sandbox's hand-over set. Catching it
+        # here means a bad --gpu pair fails before anything is created.
+        seen: set[str] = set()
+        for card in self.gpus:
+            for function in card.functions:
+                if function in seen:
+                    raise ValueError(
+                        f"The graphics card at '{function}' is listed twice; name it once."
+                    )
+                seen.add(function)
         return self
 
     @field_validator("extra_drives")

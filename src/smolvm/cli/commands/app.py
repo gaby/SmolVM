@@ -16,6 +16,7 @@ from smolvm.cli.commands.options import (
     comm_channel_option,
     complete_browser_session_names,
     complete_sandbox_names,
+    gpu_option,
     image_dir_option,
     json_option,
     positive_float_type,
@@ -87,6 +88,7 @@ def sandbox() -> None:
 @comm_channel_option
 @click.option("--mount", "mounts", multiple=True, metavar="HOST_PATH[:GUEST_PATH]")
 @click.option("--writable-mounts", is_flag=True, help="Allow writes to mounted host folders.")
+@gpu_option
 @click.option(
     "--clipboard/--no-clipboard",
     default=True,
@@ -123,6 +125,7 @@ def sandbox_create(
     comm_channel: str | None,
     mounts: tuple[str, ...],
     writable_mounts: bool,
+    gpus: tuple[str, ...],
     clipboard: bool,
     yes: bool,
     network_mode: str,
@@ -145,6 +148,7 @@ def sandbox_create(
             comm_channel=comm_channel,
             mounts=_mounts(mounts),
             writable_mounts=writable_mounts,
+            gpus=list(gpus),
             clipboard=clipboard,
             yes=yes,
             network_mode=network_mode,
@@ -1448,6 +1452,7 @@ def _register_preset_commands() -> None:
             )
             @click.option("--mount", "mounts", multiple=True, metavar="HOST_PATH[:GUEST_PATH]")
             @click.option("--writable-mounts", is_flag=True)
+            @gpu_option
             @click.option("--install-timeout", type=positive_float_type(), default=600.0)
             @click.option("--attach/--no-attach", default=None)
             @comm_channel_option
@@ -1462,6 +1467,7 @@ def _register_preset_commands() -> None:
                 os_name: str | None,
                 mounts: tuple[str, ...],
                 writable_mounts: bool,
+                gpus: tuple[str, ...],
                 install_timeout: float,
                 attach: bool | None,
                 comm_channel: str | None,
@@ -1481,6 +1487,7 @@ def _register_preset_commands() -> None:
                         os=os_name,
                         mounts=_mounts(mounts),
                         writable_mounts=writable_mounts,
+                        gpus=list(gpus),
                         install_timeout=install_timeout,
                         attach=attach,
                         comm_channel=comm_channel,

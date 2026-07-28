@@ -18,7 +18,17 @@ COMM_CHANNELS = ["ssh", "vsock"]
 
 
 class LinuxOnlyOption(click.Option):
-    """Hide and reject Linux-only options on non-Linux hosts."""
+    """Hide and reject Linux-only options on non-Linux hosts.
+
+    The rejection message names what to do instead. It defaults to the
+    ``smolvm setup`` wording the first callers needed; pass ``recovery=`` when
+    the flag belongs to a different command, so the suggestion is one the user
+    can actually run.
+    """
+
+    def __init__(self, *args: Any, recovery: str | None = None, **kwargs: Any) -> None:
+        self.recovery = recovery or "Run 'smolvm setup' without this flag."
+        super().__init__(*args, **kwargs)
 
     def get_help_record(self, ctx: click.Context) -> tuple[str, str] | None:
         if platform.system() != "Linux":
@@ -33,9 +43,7 @@ class LinuxOnlyOption(click.Option):
     ) -> tuple[Any, list[str]]:
         if self.name in opts and platform.system() != "Linux":
             option = next(iter(self.opts), f"--{self.name}")
-            raise click.UsageError(
-                f"{option} is only supported on Linux. Run 'smolvm setup' without this flag."
-            )
+            raise click.UsageError(f"{option} is only supported on Linux. {self.recovery}")
         return super().handle_parse_result(ctx, opts, args)
 
 
@@ -78,6 +86,23 @@ def qemu_machine_option(fn: F) -> F:
         default="auto",
         show_default=True,
         help="QEMU machine model.",
+    )(fn)
+
+
+def gpu_option(fn: F) -> F:
+    """Attach ``--gpu`` for giving a sandbox a graphics card from this machine."""
+    return click.option(
+        "--gpu",
+        "gpus",
+        multiple=True,
+        metavar="ADDRESS",
+        cls=LinuxOnlyOption,
+        recovery="Create the sandbox without it.",
+        help=(
+            "Give the sandbox a graphics card from this machine, by address "
+            "(for example 0000:01:00.0) or 'auto' for the only free one. "
+            "Run 'smolvm gpu list' to see what's available."
+        ),
     )(fn)
 
 

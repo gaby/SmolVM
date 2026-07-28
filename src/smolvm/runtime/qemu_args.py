@@ -49,6 +49,11 @@ QEMU_SLIRP_DNS = "10.0.2.3"
 # to virtio-blk-pci so the QEMU command line stays valid.
 _Q35_AHCI_PORTS = 6
 
+# First guest PCI slot used for a passed-through graphics card. Low slots on
+# q35 are taken by the chipset and SmolVM's own virtio devices, so start well
+# clear of them; each card takes one slot from here upward.
+_GPU_FIRST_GUEST_SLOT = 0x10
+
 _QEMU_MACHINE_ENV = "SMOLVM_QEMU_MACHINE"
 _QEMU_MICROVM_MACHINE = "microvm,accel=kvm,acpi=on,pcie=off,pic=off,pit=off,rtc=on"
 _QEMU_MACHINE_VALUES: set[QemuMachine] = {"auto", "q35", "microvm"}
@@ -98,6 +103,10 @@ def _supports_qemu_microvm(
         and qemu_name == "qemu-system-x86_64"
         and vm_info.config.boot_mode == "direct_kernel"
         and platform_spec.guest_os in {GuestOS.ALPINE, GuestOS.UBUNTU}
+        # The microvm machine is built without a PCI bus (pcie=off), and a
+        # graphics card is a PCI device, so a sandbox using one has to fall
+        # back to the compatibility machine.
+        and not vm_info.config.gpus
     )
 
 
@@ -108,8 +117,21 @@ def _use_qemu_microvm(
     system: str,
     platform_spec: GuestPlatformSpec,
 ) -> bool:
-    """Return whether to use the x86_64 QEMU microvm machine."""
+    """Return whether to use the x86_64 QEMU microvm machine.
+
+    Raises:
+        SmolVMError: When microvm is explicitly requested for a sandbox that
+            uses a graphics card. Silently ignoring the request would boot a
+            machine the user did not ask for, and the env override below can
+            outrank the sandbox's own setting, so say so instead.
+    """
     requested_machine = _requested_qemu_machine(vm_info)
+    if vm_info.config.gpus and requested_machine == "microvm":
+        raise SmolVMError(
+            "'--qemu-machine microvm' can't use a graphics card; "
+            "drop it or pass '--qemu-machine q35'.",
+            {"vm_id": vm_info.vm_id},
+        )
     if requested_machine == "q35":
         return False
     return _supports_qemu_microvm(
@@ -118,6 +140,41 @@ def _use_qemu_microvm(
         system=system,
         platform_spec=platform_spec,
     )
+
+
+def _gpu_device_args(vm_info: VMInfo) -> list[str]:
+    """Return the ``-device`` argv pairs attaching each graphics card.
+
+    Empty for the overwhelmingly common case of a sandbox without a card, so
+    the rest of the command line is untouched.
+
+    Each card lands on its own guest slot, and the function numbers within
+    that slot mirror the host's. That matters: a graphics card's audio part
+    sits at function 1 on the real hardware, and guest drivers look for it in
+    the same place. When a card has more than one part, the first is marked
+    ``multifunction`` so the guest enumerates the rest.
+
+    ``x-vga`` is deliberately absent — it is for handing a card the guest's
+    own screen, and SmolVM sandboxes are headless.
+    """
+    args: list[str] = []
+    for index, card in enumerate(vm_info.config.gpus):
+        slot = _GPU_FIRST_GUEST_SLOT + index
+        multifunction = len(card.functions) > 1
+        for function in card.functions:
+            # "0000:01:00.1" -> 1. Validated by GpuPassthrough, so the split
+            # and int() cannot fail here.
+            function_number = int(function.rsplit(".", 1)[1])
+            options = [
+                "vfio-pci",
+                f"host={function}",
+                f"id=smolvm-gpu{index}-{function_number}",
+                f"addr=0x{slot:x}.{function_number}",
+            ]
+            if multifunction and function == card.address:
+                options.append("multifunction=on")
+            args.extend(["-device", ",".join(options)])
+    return args
 
 
 def build_qemu_argv(
@@ -498,6 +555,13 @@ def build_qemu_argv(
         # controllers always come before consumers.
         for device_arg in platform_spec.extra_devices:
             cmd.extend(["-device", device_arg])
+
+    # Passed-through graphics cards. Emitted outside the machine branches
+    # above so both the aarch64 `virt` and x86 `q35` machines get them —
+    # both expose a PCI bus, and dropping the card on one of them would be a
+    # silent no-op. The microvm machine has no PCI bus, but a sandbox with a
+    # card never reaches it: _supports_qemu_microvm rules it out.
+    cmd.extend(_gpu_device_args(vm_info))
 
     # vsock control-plane device. The guest agent listens on this CID and the
     # host RustHttpVsockChannel connects to it. Native vhost-vsock needs the host's

@@ -28,6 +28,7 @@ from smolvm.runtime.guest_platforms import (
 )
 from smolvm.runtime.qemu_args import build_qemu_argv
 from smolvm.types import (
+    GpuPassthrough,
     GuestOS,
     NetworkConfig,
     QemuMachine,
@@ -697,3 +698,137 @@ def test_build_qemu_argv_slirp_allows_no_ssh_host_port(tmp_path: Path) -> None:
     joined = " ".join(cmd)
     assert "user,id=net0,dns=10.0.2.3" in joined
     assert "-:22" not in joined
+
+
+def _gpu_card(
+    address: str = "0000:01:00.0",
+    functions: tuple[str, ...] = ("0000:01:00.0", "0000:01:00.1"),
+    device_id: str = "2684",
+) -> GpuPassthrough:
+    return GpuPassthrough(
+        address=address,
+        functions=functions,
+        vendor_id="10de",
+        device_id=device_id,
+    )
+
+
+def _gpu_vm_info(
+    tmp_path: Path,
+    *,
+    cards: list[GpuPassthrough] | None = None,
+    qemu_machine: QemuMachine = "auto",
+    vm_id: str = "vm-gpu",
+) -> VMInfo:
+    """A Linux VMInfo whose sandbox borrows a graphics card."""
+    base = _qemu_vm_info(tmp_path, vm_id=vm_id, qemu_machine=qemu_machine)
+    config = base.config.model_copy(update={"gpus": cards if cards is not None else [_gpu_card()]})
+    return base.model_copy(update={"config": config})
+
+
+def _build(vm_info: VMInfo, *, qemu_bin: str = "/usr/bin/qemu-system-x86_64") -> list[str]:
+    return build_qemu_argv(
+        vm_info,
+        qemu_bin=Path(qemu_bin),
+        boot_args=vm_info.config.boot_args,
+        platform_spec=_LINUX_SPEC,
+        host_system="Linux",
+    )
+
+
+class TestGpuPassthroughArgs:
+    """Graphics cards become vfio-pci devices on the QEMU command line."""
+
+    def test_no_card_adds_nothing(self, tmp_path: Path) -> None:
+        """The common case must leave the command line completely untouched."""
+        plain = _build(_qemu_vm_info(tmp_path, qemu_machine="q35"))
+        with_field = _build(_gpu_vm_info(tmp_path, cards=[], qemu_machine="q35"))
+
+        assert plain == with_field
+
+    def test_both_functions_are_attached(self, tmp_path: Path) -> None:
+        cmd = _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))
+
+        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0,multifunction=on" in cmd
+        assert "vfio-pci,host=0000:01:00.1,id=smolvm-gpu0-1,addr=0x10.1" in cmd
+
+    def test_guest_function_numbers_mirror_the_host(self, tmp_path: Path) -> None:
+        """Guest drivers look for the audio part at function 1 of the same slot."""
+        cmd = _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))
+
+        graphics = cmd[
+            cmd.index("vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0,multifunction=on")
+        ]
+        audio = cmd[cmd.index("vfio-pci,host=0000:01:00.1,id=smolvm-gpu0-1,addr=0x10.1")]
+
+        assert "addr=0x10.0" in graphics
+        assert "addr=0x10.1" in audio
+
+    def test_single_function_card_is_not_marked_multifunction(self, tmp_path: Path) -> None:
+        card = _gpu_card(functions=("0000:01:00.0",))
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
+
+        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0" in cmd
+        assert not any("multifunction" in arg for arg in cmd)
+
+    def test_two_cards_land_on_separate_slots(self, tmp_path: Path) -> None:
+        cards = [
+            _gpu_card(),
+            _gpu_card(
+                address="0000:02:00.0",
+                functions=("0000:02:00.0",),
+                device_id="2685",
+            ),
+        ]
+        cmd = _build(_gpu_vm_info(tmp_path, cards=cards, qemu_machine="q35"))
+
+        assert any("host=0000:01:00.0" in arg and "addr=0x10.0" in arg for arg in cmd)
+        assert any("host=0000:02:00.0" in arg and "addr=0x11.0" in arg for arg in cmd)
+
+    def test_x_vga_is_never_set(self, tmp_path: Path) -> None:
+        """Sandboxes are headless; x-vga is for giving the guest the screen."""
+        cmd = _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))
+
+        assert not any("x-vga" in arg for arg in cmd)
+
+    def test_aarch64_also_attaches_the_card(self, tmp_path: Path) -> None:
+        """The virt machine has a PCI bus too; dropping the card would be silent."""
+        cmd = _build(
+            _gpu_vm_info(tmp_path, qemu_machine="q35"),
+            qemu_bin="/usr/bin/qemu-system-aarch64",
+        )
+
+        assert any("vfio-pci,host=0000:01:00.0" in arg for arg in cmd)
+
+
+class TestGpuMachineSelection:
+    """A graphics card needs a PCI bus, which the microvm machine lacks."""
+
+    def test_auto_falls_back_to_q35(self, tmp_path: Path) -> None:
+        """Without a card this sandbox would get microvm; with one it must not."""
+        without = _build(_qemu_vm_info(tmp_path))
+        assert any("microvm" in arg for arg in without), "guard premise: auto picks microvm here"
+
+        cmd = _build(_gpu_vm_info(tmp_path))
+
+        assert not any("microvm" in arg for arg in cmd)
+        assert "q35,accel=kvm" in cmd
+
+    def test_explicit_microvm_is_rejected(self, tmp_path: Path) -> None:
+        vm_info = _gpu_vm_info(tmp_path, qemu_machine="q35")
+        # Bypass the VMConfig rule to prove the builder refuses too, rather
+        # than emitting a machine with no bus for the card.
+        config = vm_info.config.model_copy(update={"qemu_machine": "microvm"})
+        vm_info = vm_info.model_copy(update={"config": config})
+
+        with pytest.raises(SmolVMError, match="can't use a graphics card"):
+            _build(vm_info)
+
+    def test_env_override_cannot_silently_win(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SMOLVM_QEMU_MACHINE outranks the sandbox setting, so it must error too."""
+        monkeypatch.setenv("SMOLVM_QEMU_MACHINE", "microvm")
+
+        with pytest.raises(SmolVMError, match="can't use a graphics card"):
+            _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))

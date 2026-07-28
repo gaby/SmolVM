@@ -5655,3 +5655,152 @@ class TestGpuList:
 
         assert ret == 0
         assert "List the graphics cards on this machine." in capsys.readouterr().out
+
+
+class TestCreateWithGpu:
+    """`smolvm sandbox create --gpu` hands a host graphics card to a sandbox."""
+
+    def _started_vm(self) -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "gputest"
+        vm.info.config.backend = "qemu"
+        vm.info.network = MagicMock(spec=NetworkConfig)
+        vm.info.network.guest_ip = "172.16.0.2"
+        vm.info.network.ssh_host_port = 2200
+        return vm
+
+    @patch("smolvm.facade._build_auto_config")
+    @patch("smolvm.facade.SmolVM")
+    def test_card_lands_on_the_sandbox_config(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+        config = MagicMock(vm_id="gputest")
+        mock_build_auto_config.return_value = (config, "/tmp/key")
+        mock_vm_cls.return_value = self._started_vm()
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:01:00.0"])
+
+        assert ret == 0
+        update = config.model_copy.call_args.kwargs["update"]
+        card = update["gpus"][0]
+        assert card.address == "0000:01:00.0"
+        assert card.functions == ("0000:01:00.0", "0000:01:00.1")
+        assert card.vendor_id == "10de"
+
+    @patch("smolvm.facade._build_auto_config")
+    @patch("smolvm.facade.SmolVM")
+    def test_auto_picks_the_only_free_card(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+        config = MagicMock(vm_id="gputest")
+        mock_build_auto_config.return_value = (config, "/tmp/key")
+        mock_vm_cls.return_value = self._started_vm()
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "auto"])
+
+        assert ret == 0
+        update = config.model_copy.call_args.kwargs["update"]
+        assert update["gpus"][0].address == "0000:01:00.0"
+
+    @patch("smolvm.facade._build_auto_config")
+    @patch("smolvm.facade.SmolVM")
+    def test_selects_qemu_when_no_backend_was_pinned(
+        self,
+        mock_vm_cls: MagicMock,
+        mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only QEMU can attach a card, so don't fail on a backend nobody chose."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+        config = MagicMock(vm_id="gputest")
+        mock_build_auto_config.return_value = (config, "/tmp/key")
+        mock_vm_cls.return_value = self._started_vm()
+
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[_gpu_device()]):
+            main(["sandbox", "create", "--name", "gputest", "--gpu", "auto"])
+
+        assert mock_build_auto_config.call_args.kwargs["backend"] == "qemu"
+
+    @patch("smolvm.facade._build_auto_config")
+    def test_unknown_address_fails_before_anything_is_created(
+        self, mock_build_auto_config: MagicMock, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Building a sandbox downloads an image; a bad address must fail first."""
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+            ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:09:00.0"])
+
+        assert ret != 0
+        mock_build_auto_config.assert_not_called()
+        combined = " ".join((capsys.readouterr().err + capsys.readouterr().out).split())
+        assert "No graphics card found at '0000:09:00.0'" in combined
+
+    def test_card_still_in_use_reports_the_blocker(self, capsys: pytest.CaptureFixture) -> None:
+        blocked = _gpu_device(
+            ready=False,
+            driver="nvidia",
+            blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
+        )
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[blocked]):
+            ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "0000:01:00.0"])
+
+        assert ret != 0
+        combined = " ".join((capsys.readouterr().err + capsys.readouterr().out).split())
+        assert "still in use by this machine" in combined
+
+    def test_json_mode_reports_the_failure_in_the_envelope(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+            ret = main(["sandbox", "create", "--name", "gputest", "--gpu", "auto", "--json"])
+
+        assert ret != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert "No graphics card on this machine is free" in payload["error"]["message"]
+
+    def test_rejected_on_a_non_linux_host(self) -> None:
+        """The flag is hidden and refused where passthrough cannot work."""
+        from click.testing import CliRunner
+
+        with patch("smolvm.cli.commands.options.platform.system", return_value="Darwin"):
+            result = CliRunner().invoke(build_cli(), ["sandbox", "create", "--gpu", "0000:01:00.0"])
+
+        assert result.exit_code != 0
+        assert "--gpu is only supported on Linux" in result.output
+        assert "Create the sandbox without it." in result.output
+
+    def test_hidden_from_help_on_a_non_linux_host(self) -> None:
+        from click.testing import CliRunner
+
+        with patch("smolvm.cli.commands.options.platform.system", return_value="Darwin"):
+            result = CliRunner().invoke(build_cli(), ["sandbox", "create", "--help"])
+
+        assert "--gpu" not in result.output
+
+    def test_documented_in_help_on_linux(self) -> None:
+        from click.testing import CliRunner
+
+        with patch("smolvm.cli.commands.options.platform.system", return_value="Linux"):
+            result = CliRunner().invoke(build_cli(), ["sandbox", "create", "--help"])
+
+        assert "--gpu" in result.output
+        assert "smolvm gpu list" in " ".join(result.output.split())
+
+    def test_preset_start_accepts_the_flag_too(self) -> None:
+        """Preset commands duplicate the create-time flags, so they need it as well."""
+        from click.testing import CliRunner
+
+        with patch("smolvm.cli.commands.options.platform.system", return_value="Linux"):
+            result = CliRunner().invoke(build_cli(), ["codex", "start", "--help"])
+
+        assert "--gpu" in result.output

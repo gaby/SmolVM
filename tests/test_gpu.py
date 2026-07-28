@@ -20,6 +20,7 @@ card and on a workstation with two.
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -349,3 +350,139 @@ class TestMemlockHeadroom:
         monkeypatch.setattr(resource, "getrlimit", lambda _which: (limit, limit))
 
         assert gpu.memlock_headroom_ok(4096) is True
+
+
+class TestSandboxGuards:
+    """Guards that stop a graphics-card sandbox from reaching a broken state."""
+
+    def _vm_info(self, tmp_path: Path, *, memory: int = 512):
+        from smolvm.types import GpuPassthrough, VMConfig, VMInfo, VMState
+
+        kernel = tmp_path / "vmlinux"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        card = GpuPassthrough(
+            address="0000:01:00.0",
+            functions=("0000:01:00.0", "0000:01:00.1"),
+            vendor_id="10de",
+            device_id="2684",
+        )
+        return VMInfo(
+            vm_id="gputest",
+            status=VMState.CREATED,
+            config=VMConfig(
+                vm_id="gputest",
+                kernel_path=kernel,
+                rootfs_path=rootfs,
+                backend="qemu",
+                memory=memory,
+                gpus=[card],
+            ),
+        )
+
+    def _manager(self):
+        from smolvm.vm import SmolVMManager
+
+        return SmolVMManager.__new__(SmolVMManager)
+
+    def test_start_is_blocked_when_the_card_is_gone(self, tmp_path: Path) -> None:
+        """Hardware moves; a saved sandbox may start on a machine without it."""
+        from smolvm.exceptions import SmolVMError
+
+        with (
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[]),
+            pytest.raises(SmolVMError, match="No graphics card found at '0000:01:00.0'"),
+        ):
+            self._manager()._check_gpus(self._vm_info(tmp_path))
+
+    def test_start_is_blocked_when_the_card_was_reclaimed(self, tmp_path: Path) -> None:
+        from smolvm.exceptions import SmolVMError
+
+        reclaimed = gpu.GpuDevice(
+            address="0000:01:00.0",
+            vendor_id="10de",
+            device_id="2684",
+            vendor_name="NVIDIA",
+            driver="nvidia",
+            iommu_group=12,
+            group_members=("0000:01:00.0",),
+            ready=False,
+            blocker="The graphics card at '0000:01:00.0' is still in use by this machine.",
+        )
+        with (
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[reclaimed]),
+            pytest.raises(SmolVMError, match="still in use by this machine"),
+        ):
+            self._manager()._check_gpus(self._vm_info(tmp_path))
+
+    def test_start_is_blocked_by_a_low_memory_reservation_cap(self, tmp_path: Path) -> None:
+        from smolvm.exceptions import SmolVMError
+
+        ready = gpu.GpuDevice(
+            address="0000:01:00.0",
+            vendor_id="10de",
+            device_id="2684",
+            vendor_name="NVIDIA",
+            driver="vfio-pci",
+            iommu_group=12,
+            group_members=("0000:01:00.0", "0000:01:00.1"),
+            ready=True,
+            blocker=None,
+        )
+        with (
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[ready]),
+            patch("smolvm.host.gpu.memlock_headroom_ok", return_value=False),
+            pytest.raises(SmolVMError, match="ulimit -l unlimited"),
+        ):
+            self._manager()._check_gpus(self._vm_info(tmp_path))
+
+    def test_a_sandbox_without_a_card_skips_every_check(self, tmp_path: Path) -> None:
+        """The check must not touch the host for the overwhelmingly common case."""
+        from smolvm.types import VMConfig, VMInfo, VMState
+
+        kernel = tmp_path / "vmlinux"
+        rootfs = tmp_path / "rootfs.ext4"
+        kernel.touch()
+        rootfs.touch()
+        plain = VMInfo(
+            vm_id="plain",
+            status=VMState.CREATED,
+            config=VMConfig(vm_id="plain", kernel_path=kernel, rootfs_path=rootfs),
+        )
+
+        with patch("smolvm.host.gpu.list_host_gpus", side_effect=AssertionError("probed host")):
+            self._manager()._check_gpus(plain)
+
+    def test_memory_saving_snapshots_are_rejected(self, tmp_path: Path) -> None:
+        from smolvm.exceptions import SmolVMError
+        from smolvm.types import SnapshotType
+
+        manager = self._manager()
+        vm_info = self._vm_info(tmp_path)
+
+        for snapshot_type in (SnapshotType.FULL, SnapshotType.DIFF):
+            with pytest.raises(SmolVMError, match="can only save its disk"):
+                manager._ensure_snapshot_supported(vm_info, snapshot_type)
+
+    def test_disk_snapshots_are_allowed(self, tmp_path: Path) -> None:
+        """Disk-only snapshots never touch device state, so a card is fine."""
+        from smolvm.exceptions import SmolVMError
+        from smolvm.types import SnapshotType
+
+        manager = self._manager()
+        vm_info = self._vm_info(tmp_path)
+
+        try:
+            manager._ensure_snapshot_supported(vm_info, SnapshotType.DISK)
+        except SmolVMError as exc:
+            assert "graphics card" not in str(exc), "a disk snapshot must not be blocked by the GPU"
+
+    def test_the_rejection_names_the_command_that_works(self, tmp_path: Path) -> None:
+        from smolvm.exceptions import SmolVMError
+        from smolvm.types import SnapshotType
+
+        with pytest.raises(SmolVMError) as excinfo:
+            self._manager()._ensure_snapshot_supported(self._vm_info(tmp_path), SnapshotType.FULL)
+
+        assert "smolvm sandbox snapshot create gputest --snapshot-type disk" in str(excinfo.value)
