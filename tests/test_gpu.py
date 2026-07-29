@@ -83,7 +83,7 @@ def vfio_accessible(monkeypatch: pytest.MonkeyPatch) -> None:
     the probe out. ``TestVfioDeviceAccess`` covers the real thing against a
     fake ``/dev/vfio``.
     """
-    monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group, root=None: True)
+    monkeypatch.setattr(gpu, "_vfio_group_state", lambda group, root=None: "ready")
 
 
 def _nvidia_pair(sysfs: Path, *, driver: str | None, group: int = 12) -> None:
@@ -197,7 +197,7 @@ class TestReadiness:
         self, sysfs: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _nvidia_pair(sysfs, driver="vfio-pci")
-        monkeypatch.setattr(gpu, "_vfio_group_accessible", lambda group, root=None: False)
+        monkeypatch.setattr(gpu, "_vfio_group_state", lambda group, root=None: "denied")
 
         card = gpu.list_host_gpus(sysfs)[0]
 
@@ -326,6 +326,11 @@ class TestResolveGpuSelection:
 
 
 class TestMemlockHeadroom:
+    @pytest.fixture(autouse=True)
+    def _ordinary_account(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Run these as a normal login; the cap does not apply to root."""
+        monkeypatch.setattr(gpu, "_exempt_from_memlock_cap", lambda: False)
+
     def test_unlimited_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import resource
 
@@ -350,6 +355,18 @@ class TestMemlockHeadroom:
 
         limit = 32 * 1024 * 1024 * 1024
         monkeypatch.setattr(resource, "getrlimit", lambda _which: (limit, limit))
+
+        assert gpu.memlock_headroom_ok(4096) is True
+
+    def test_an_administrator_is_not_blocked_by_a_small_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The kernel skips the cap for a privileged process, so we do too."""
+        import resource
+
+        eight_mib = 8 * 1024 * 1024
+        monkeypatch.setattr(resource, "getrlimit", lambda _which: (eight_mib, eight_mib))
+        monkeypatch.setattr(gpu, "_exempt_from_memlock_cap", lambda: True)
 
         assert gpu.memlock_headroom_ok(4096) is True
 
@@ -425,6 +442,21 @@ class TestSandboxGuards:
         with (
             patch("smolvm.host.gpu.find_gpu", return_value=other),
             pytest.raises(SmolVMError, match="A different graphics card is now at"),
+        ):
+            self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
+
+    def test_start_is_blocked_when_the_card_was_regrouped(self, tmp_path: Path, gpu_device) -> None:
+        """The saved parts are what the emulator opens, so they must still hold.
+
+        A firmware change can split a card away from the part it shipped with;
+        the address check cannot see that, because the card itself is fine.
+        """
+        from smolvm.exceptions import SmolVMError
+
+        regrouped = gpu_device(functions=("0000:01:00.0",))
+        with (
+            patch("smolvm.host.gpu.find_gpu", return_value=regrouped),
+            pytest.raises(SmolVMError, match="no longer grouped with the same hardware"),
         ):
             self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
@@ -563,10 +595,30 @@ class TestVfioDeviceAccess:
         assert card.ready is True
 
     def test_blocked_when_the_group_node_is_absent(self, sysfs: Path, tmp_path: Path) -> None:
-        """Everything else is set up, but this user cannot open the group."""
+        """A device that was never exposed is not a permissions problem.
+
+        Joining a group cannot conjure a missing device node, so telling the
+        reader to do that would send them in a circle.
+        """
         _nvidia_pair(sysfs, driver="vfio-pci")
         vfio_dev = tmp_path / "dev-vfio"
         vfio_dev.mkdir()
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs, vfio_dev)
+
+        assert card.ready is False
+        assert "permission" not in card.blocker
+        assert "Restart it" in card.blocker
+
+    def test_blocked_when_the_group_node_cannot_be_opened(
+        self, sysfs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The node is there, but this user cannot open it."""
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        vfio_dev = tmp_path / "dev-vfio"
+        vfio_dev.mkdir()
+        (vfio_dev / "12").write_text("")
+        monkeypatch.setattr(gpu.os, "access", lambda *_args, **_kwargs: False)
 
         card = gpu.find_gpu("0000:01:00.0", sysfs, vfio_dev)
 

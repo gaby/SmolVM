@@ -749,8 +749,8 @@ class TestGpuPassthroughArgs:
     def test_both_functions_are_attached(self, tmp_path: Path) -> None:
         cmd = _build(_gpu_vm_info(tmp_path, qemu_machine="q35"))
 
-        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0,multifunction=on" in cmd
-        assert "vfio-pci,host=0000:01:00.1,id=smolvm-gpu0-1,addr=0x10.1" in cmd
+        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0,addr=0x10.0,multifunction=on" in cmd
+        assert "vfio-pci,host=0000:01:00.1,id=smolvm-gpu1,addr=0x10.1" in cmd
 
     def test_guest_function_numbers_mirror_the_host(self, tmp_path: Path) -> None:
         """Guest drivers look for a card's audio part at the host's function number.
@@ -774,7 +774,7 @@ class TestGpuPassthroughArgs:
         card = _gpu_card(functions=("0000:01:00.0",))
         cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
 
-        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0-0,addr=0x10.0" in cmd
+        assert "vfio-pci,host=0000:01:00.0,id=smolvm-gpu0,addr=0x10.0" in cmd
         assert not any("multifunction" in arg for arg in cmd)
 
     def test_unrelated_group_member_gets_its_own_slot(self, tmp_path: Path) -> None:
@@ -815,6 +815,58 @@ class TestGpuPassthroughArgs:
 
         assert any("host=0000:01:00.0" in arg and "addr=0x10.0" in arg for arg in cmd)
         assert any("host=0000:02:00.0" in arg and "addr=0x11.0" in arg for arg in cmd)
+
+    def test_a_slot_always_has_a_function_zero(self, tmp_path: Path) -> None:
+        """PCI probing reads function 0 first and skips a slot that lacks one.
+
+        A group member that only exposes a non-zero host function — an
+        unrelated onboard device at ``.3``, common on consumer boards — used
+        to be copied verbatim into its own slot, leaving that slot with no
+        function 0 and the device invisible inside the sandbox.
+        """
+        card = _gpu_card(functions=("0000:01:00.0", "0000:01:00.1", "0000:00:1f.3"))
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
+
+        devices = [arg for arg in cmd if arg.startswith("vfio-pci,")]
+        slots: dict[str, set[str]] = {}
+        for device in devices:
+            slot, _, function = device.split("addr=")[1].split(",")[0].partition(".")
+            slots.setdefault(slot, set()).add(function)
+
+        assert all("0" in functions for functions in slots.values()), slots
+        assert any("host=0000:00:1f.3" in arg and "addr=0x11.0" in arg for arg in devices)
+
+    def test_a_lone_non_zero_function_is_renumbered(self, tmp_path: Path) -> None:
+        """An SR-IOV virtual function reports a GPU class at, say, ``.4``."""
+        card = _gpu_card(address="0000:41:00.4", functions=("0000:41:00.4",))
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
+
+        assert any("host=0000:41:00.4" in arg and "addr=0x10.0" in arg for arg in cmd)
+
+    def test_multifunction_is_anchored_on_guest_function_zero(self, tmp_path: Path) -> None:
+        """The named card leads the hand-over set but need not be function 0.
+
+        The multifunction bit is only read from function 0, so anchoring it on
+        whichever address the user typed left the rest of the slot unscanned.
+        """
+        card = _gpu_card(address="0000:01:00.1", functions=("0000:01:00.1", "0000:01:00.0"))
+        cmd = _build(_gpu_vm_info(tmp_path, cards=[card], qemu_machine="q35"))
+
+        devices = [arg for arg in cmd if arg.startswith("vfio-pci,")]
+        anchored = [arg for arg in devices if "multifunction=on" in arg]
+        assert len(anchored) == 1, devices
+        assert "addr=0x10.0" in anchored[0]
+        assert "host=0000:01:00.0" in anchored[0]
+
+    def test_too_many_cards_is_a_sandbox_error(self, tmp_path: Path) -> None:
+        """A PCI slot number is five bits; running past it is not a QEMU crash."""
+        cards = [
+            _gpu_card(address=f"0000:{index:02x}:00.0", functions=(f"0000:{index:02x}:00.0",))
+            for index in range(1, 22)
+        ]
+
+        with pytest.raises(SmolVMError, match="more graphics hardware"):
+            _build(_gpu_vm_info(tmp_path, cards=cards, qemu_machine="q35"))
 
     def test_x_vga_is_never_set(self, tmp_path: Path) -> None:
         """Sandboxes are headless; x-vga is for giving the guest the screen."""

@@ -600,9 +600,14 @@ def _check_gpu_passthrough() -> DoctorCheck | None:
     avoid. ``smolvm gpu list`` is where "why isn't my card ready" is
     answered, and it is the command every GPU message points at.
     """
-    from smolvm.host.gpu import list_host_gpus
+    from smolvm.host.gpu import iommu_enabled, list_host_gpus
 
     try:
+        # A machine that never turned hardware isolation on cannot have a free
+        # card, and this answer costs one directory read against the hundreds
+        # the full scan makes on a server. Every `smolvm doctor` run pays it.
+        if not iommu_enabled():
+            return None
         devices = list_host_gpus()
     except Exception:  # pragma: no cover - defensive; sysfs reads are guarded
         return None
@@ -743,10 +748,6 @@ def generate_doctor_report(backend: str | None = None) -> DoctorReport:
 
         checks.append(_check_command("qemu-img", "qemu"))
         checks.append(_check_command("ssh", "openssh-client"))
-
-        gpu_check = _check_gpu_passthrough()
-        if gpu_check is not None:
-            checks.append(gpu_check)
     elif resolved == BACKEND_VZ:
         from smolvm.host.lume import (
             LUME_VERSION,
@@ -855,6 +856,15 @@ def generate_doctor_report(backend: str | None = None) -> DoctorReport:
                 detail=f"unsupported backend: {resolved}",
             )
         )
+
+    # Reported outside the branches above because lending a card does not
+    # depend on the runtime `doctor` picked: a sandbox that borrows one always
+    # runs on QEMU, whatever this machine would otherwise choose. Gated on
+    # Linux because that is the only place the feature exists.
+    if platform.system() == "Linux":
+        gpu_check = _check_gpu_passthrough()
+        if gpu_check is not None:
+            checks.append(gpu_check)
 
     return DoctorReport(
         backend_requested=requested,

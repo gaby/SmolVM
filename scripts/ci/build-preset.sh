@@ -218,13 +218,31 @@ if [ -n "${SMOLVM_MODULES_ARCHIVE:-}" ]; then
   fi
   echo "==> Installing kernel modules from $SMOLVM_MODULES_ARCHIVE"
   mkdir -p "$MNT/lib/modules"
+
+  # Read the version out of the archive rather than off the mount. Listing
+  # the directory after extraction would also see any lib/modules the base
+  # image already carries, and picking the wrong one indexes a tree the
+  # sandbox never boots — modprobe then fails with a missing modules.dep.
+  KVER="$(tar --zstd -tf "$SMOLVM_MODULES_ARCHIVE" \
+    | sed -n 's#^lib/modules/\([^/][^/]*\)/.*#\1#p' | sort -u)"
+  if [ -z "$KVER" ]; then
+    echo "Module archive contained no kernel version directory" >&2
+    exit 1
+  fi
+  if [ "$(printf '%s\n' "$KVER" | wc -l)" -ne 1 ]; then
+    echo "Module archive holds more than one kernel version: $KVER" >&2
+    exit 1
+  fi
+
   tar -C "$MNT" --zstd -xf "$SMOLVM_MODULES_ARCHIVE"
 
   # depmod runs here, not in the guest: it needs the module tree only, and
-  # doing it now means the sandbox can modprobe on first boot.
-  KVER="$(ls "$MNT/lib/modules" | head -n1)"
-  if [ -z "$KVER" ]; then
-    echo "Module archive contained no kernel version directory" >&2
+  # doing it now means the sandbox can modprobe on first boot. It comes from
+  # the 'kmod' package, which the base image installs — say so plainly if a
+  # base without it ever reaches this branch.
+  if [ ! -x "$MNT/sbin/depmod" ] && [ ! -x "$MNT/usr/sbin/depmod" ] \
+     && [ ! -x "$MNT/bin/depmod" ] && [ ! -x "$MNT/usr/bin/depmod" ]; then
+    echo "This image has no depmod; add the 'kmod' package to its base rootfs." >&2
     exit 1
   fi
   chroot "$MNT" depmod -a "$KVER"

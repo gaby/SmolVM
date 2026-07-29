@@ -54,6 +54,10 @@ _Q35_AHCI_PORTS = 6
 # clear of them; each card takes one slot from here upward.
 _GPU_FIRST_GUEST_SLOT = 0x10
 
+# Last slot a card may use. A PCI slot number is five bits (0x00-0x1f), and
+# q35 keeps 0x1f for its own chipset, so 0x1e is the highest one left.
+_GPU_LAST_GUEST_SLOT = 0x1E
+
 _QEMU_MACHINE_ENV = "SMOLVM_QEMU_MACHINE"
 _QEMU_MICROVM_MACHINE = "microvm,accel=kvm,acpi=on,pcie=off,pic=off,pit=off,rtc=on"
 _QEMU_MACHINE_VALUES: set[QemuMachine] = {"auto", "q35", "microvm"}
@@ -145,10 +149,17 @@ def _gpu_device_args(vm_info: VMInfo) -> list[str]:
     the rest of the command line is untouched.
 
     Parts of the *same* piece of host hardware share one guest slot, and their
-    function numbers within it mirror the host's. That matters: a graphics
-    card's audio part sits at function 1 on the real hardware, and guest
-    drivers look for it in the same place. The lowest function of a shared
-    slot is marked ``multifunction`` so the guest enumerates the rest.
+    function numbers within it mirror the host's *when the host numbers them
+    from zero*. That matters: a graphics card's audio part sits at function 1
+    on the real hardware, and guest drivers look for it in the same place.
+
+    A guest slot is only usable if something sits at its function 0 carrying
+    the ``multifunction`` bit — PCI enumeration reads function 0 first and
+    only scans 1-7 when that bit is set, and QEMU refuses to realize a plain
+    device at a non-zero function of an otherwise empty slot. So a hand-over
+    set that does not include the host's function 0 (an SR-IOV virtual
+    function, or an unrelated group member that only exposes function 3) is
+    renumbered from zero rather than copied verbatim.
 
     A card's hand-over set is not always one piece of hardware, though. The
     machine can isolate an unrelated device in the same group — common on
@@ -158,10 +169,16 @@ def _gpu_device_args(vm_info: VMInfo) -> list[str]:
 
     ``x-vga`` is deliberately absent — it is for handing a card the guest's
     own screen, and SmolVM sandboxes are headless.
+
+    Raises:
+        SmolVMError: When the cards need more guest slots than a PCI bus has.
     """
     args: list[str] = []
     slot = _GPU_FIRST_GUEST_SLOT
-    for index, card in enumerate(vm_info.config.gpus):
+    # Ids only have to be unique; counting the parts handed over is enough,
+    # and two parts of different host hardware can both be function 0.
+    part_number = 0
+    for card in vm_info.config.gpus:
         # Group by everything left of the function digit: "0000:01:00.1" and
         # "0000:01:00.0" are the same piece of hardware, "0000:02:00.0" is
         # not. dict preserves insertion order, so the card itself — always
@@ -170,23 +187,30 @@ def _gpu_device_args(vm_info: VMInfo) -> list[str]:
         for function in card.functions:
             by_hardware.setdefault(function.rsplit(".", 1)[0], []).append(function)
 
-        # Ids count the parts handed over, not their host function numbers:
-        # two parts of different host hardware can both be function 0, and a
-        # repeated id makes QEMU refuse to start.
-        part_number = 0
         for functions in by_hardware.values():
-            multifunction = len(functions) > 1
-            for function in functions:
-                # "0000:01:00.1" -> 1. Validated by GpuPassthrough, so the
-                # split and int() cannot fail here.
-                function_number = int(function.rsplit(".", 1)[1])
+            if slot > _GPU_LAST_GUEST_SLOT:
+                raise SmolVMError(
+                    f"Sandbox '{vm_info.vm_id}' asks for more graphics hardware than one "
+                    "sandbox can hold. Create it with fewer '--gpu' cards.",
+                    {"vm_id": vm_info.vm_id},
+                )
+
+            # "0000:01:00.1" -> 1. Validated by GpuPassthrough, so the split
+            # and int() cannot fail here. Sorted so the slot's function 0 —
+            # the one the guest probes first — is emitted first.
+            numbered = sorted((int(f.rsplit(".", 1)[1]), f) for f in functions)
+            # Keep the host's numbering only when it already starts at 0;
+            # otherwise pack the slot from 0 so function 0 exists at all.
+            mirror_host = numbered[0][0] == 0
+            for position, (host_function, function) in enumerate(numbered):
+                guest_function = host_function if mirror_host else position
                 options = [
                     "vfio-pci",
                     f"host={function}",
-                    f"id=smolvm-gpu{index}-{part_number}",
-                    f"addr=0x{slot:x}.{function_number}",
+                    f"id=smolvm-gpu{part_number}",
+                    f"addr=0x{slot:x}.{guest_function}",
                 ]
-                if multifunction and function == functions[0]:
+                if len(numbered) > 1 and guest_function == 0:
                     options.append("multifunction=on")
                 args.extend(["-device", ",".join(options)])
                 part_number += 1

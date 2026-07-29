@@ -353,10 +353,14 @@ if grep -q '^CONFIG_MODULES=y$' .config; then
     # preserved — kbuild resolves relative include paths and a flat copy
     # would break them. tar (not cpio) because the build already requires
     # it and cpio is not in CI's package list.
+    #
+    # Errors are NOT swallowed: a silent failure here ships a module tree
+    # whose build/ directory has no Makefiles, and the first sign of it is a
+    # vendor driver failing to compile inside somebody's sandbox.
     find . -path ./.git -prune -o \
         \( -name 'Makefile*' -o -name 'Kconfig*' -o -name 'Kbuild*' \) -print \
-        | tar -cf - --files-from=- 2>/dev/null \
-        | tar -C "$BUILD_DIR" -xf - 2>/dev/null || true
+        | tar -cf - --files-from=- \
+        | tar -C "$BUILD_DIR" -xf -
 
     # Note KSRCARCH, not KARCH: the kernel's ARCH= value for 64-bit x86 is
     # "x86_64" but its source tree is arch/x86. Using KARCH here silently
@@ -380,6 +384,13 @@ if grep -q '^CONFIG_MODULES=y$' .config; then
     # without it looks fine on disk and fails in the sandbox.
     if [ ! -f "$MOD_STAGE/lib/modules/$KVER/modules.dep" ]; then
         echo "==> ERROR: module tree has no modules.dep; modprobe would fail in the guest" >&2
+        exit 1
+    fi
+
+    # modules.dep comes from modules_install, so it says nothing about the
+    # header staging above. Check that separately, or an empty build/ ships.
+    if [ ! -f "$BUILD_DIR/Makefile" ] || [ ! -f "$BUILD_DIR/scripts/Makefile" ]; then
+        echo "==> ERROR: staged headers are incomplete; an out-of-tree driver could not build" >&2
         exit 1
     fi
 

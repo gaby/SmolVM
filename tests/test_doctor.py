@@ -374,11 +374,32 @@ class TestGpuPassthroughCheck:
     def test_ready_card_passes(self, gpu_device) -> None:
         from smolvm.host.doctor import _check_gpu_passthrough
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
+        with (
+            patch("smolvm.host.gpu.iommu_enabled", return_value=True),
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]),
+        ):
             check = _check_gpu_passthrough()
 
         assert check is not None
         assert check.status == "pass"
+
+    def test_a_machine_without_hardware_isolation_says_nothing(self, gpu_device) -> None:
+        """No card can be free there, so the whole PCI scan is skipped."""
+        from smolvm.host.doctor import _check_gpu_passthrough
+
+        scanned = []
+
+        def _record() -> list:
+            scanned.append(True)
+            return [gpu_device()]
+
+        with (
+            patch("smolvm.host.gpu.iommu_enabled", return_value=False),
+            patch("smolvm.host.gpu.list_host_gpus", side_effect=_record),
+        ):
+            assert _check_gpu_passthrough() is None
+
+        assert scanned == []
 
     def test_card_that_is_not_set_up_says_nothing(self, gpu_device) -> None:
         """Every machine with a screen has a graphics chip, so a card the user
@@ -407,7 +428,10 @@ class TestGpuPassthroughCheck:
         mock_which.side_effect = lambda binary: Path(f"/usr/bin/{binary}")
         mock_run.return_value = MagicMock(stdout="QEMU emulator version 8.2.0", stderr="")
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[]):
+        with (
+            patch("smolvm.host.gpu.iommu_enabled", return_value=True),
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[]),
+        ):
             report = generate_doctor_report(backend="qemu")
 
         assert "gpu-passthrough" not in {check.name for check in report.checks}
@@ -430,7 +454,10 @@ class TestGpuPassthroughCheck:
         mock_which.side_effect = lambda binary: Path(f"/usr/bin/{binary}")
         mock_run.return_value = MagicMock(stdout="QEMU emulator version 8.2.0", stderr="")
 
-        with patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]):
+        with (
+            patch("smolvm.host.gpu.iommu_enabled", return_value=True),
+            patch("smolvm.host.gpu.list_host_gpus", return_value=[gpu_device()]),
+        ):
             report = generate_doctor_report(backend="qemu")
 
         assert "gpu-passthrough" in {check.name for check in report.checks}

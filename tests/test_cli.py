@@ -5714,6 +5714,24 @@ class TestCreateWithGpu:
         assert mock_build_auto_config.call_args.kwargs["backend"] == "qemu"
 
     @patch("smolvm.facade._build_auto_config")
+    def test_a_mac_sandbox_says_so_instead_of_naming_a_backend(
+        self,
+        mock_build_auto_config: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Pinning QEMU here would report a clash over a flag nobody passed."""
+        monkeypatch.delenv("SMOLVM_BACKEND", raising=False)
+
+        ret = main(["sandbox", "create", "--name", "mac", "--os", "macos", "--gpu", "auto"])
+
+        assert ret != 0
+        message = capsys.readouterr().err
+        assert "macOS sandboxes cannot use a graphics card" in message
+        assert "--backend" not in message
+        mock_build_auto_config.assert_not_called()
+
+    @patch("smolvm.facade._build_auto_config")
     def test_unknown_address_fails_before_anything_is_created(
         self, mock_build_auto_config: MagicMock, capsys: pytest.CaptureFixture
     ) -> None:
@@ -5807,6 +5825,35 @@ class TestCreateWithGpu:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is False
         assert "No graphics card on this machine is free" in payload["error"]["message"]
+
+    def test_a_preset_with_a_pinned_backend_gets_a_one_sentence_error(
+        self, capsys: pytest.CaptureFixture, gpu_device
+    ) -> None:
+        """The published-image path builds a config that would raise raw pydantic.
+
+        That report is multi-line, carries a docs URL, and names a sandbox the
+        command never created, so the clash is caught before it.
+        """
+        with patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()):
+            ret = main(
+                [
+                    "codex",
+                    "start",
+                    "--backend",
+                    "firecracker",
+                    "--gpu",
+                    "0000:01:00.0",
+                    "--json",
+                ]
+            )
+
+        assert ret != 0
+        payload = json.loads(capsys.readouterr().out)
+        message = payload["error"]["message"]
+        assert "only available with the QEMU backend" in message
+        assert "smolvm codex start" in message
+        assert "validation error" not in message
+        assert "errors.pydantic.dev" not in message
 
     def test_rejected_on_a_non_linux_host(self) -> None:
         """The flag is hidden and refused where passthrough cannot work."""

@@ -238,14 +238,23 @@ def iommu_enabled(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> bool:
         return False
 
 
-def _vfio_group_accessible(group: int, vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT) -> bool:
-    """Return whether this user can drive the VFIO device for *group*.
+def _vfio_group_state(group: int, vfio_dev_root: Path = DEFAULT_VFIO_DEV_ROOT) -> str:
+    """Return how usable the VFIO device for *group* is.
+
+    Three answers, not two: ``"ready"``, ``"missing"`` when the operating
+    system never exposed a device for the group, and ``"denied"`` when it did
+    but this user cannot open it. They need different recoveries — joining a
+    group cannot conjure a device node that isn't there.
 
     Mirrors the ``/dev/kvm`` probe in :mod:`smolvm.runtime.backends`: the
     file existing is not enough, the current user has to be able to open it.
     """
     node = vfio_dev_root / str(group)
-    return node.exists() and os.access(node, os.R_OK | os.W_OK)
+    if not node.exists():
+        return "missing"
+    if not os.access(node, os.R_OK | os.W_OK):
+        return "denied"
+    return "ready"
 
 
 def _blocker(
@@ -271,7 +280,8 @@ def _blocker(
     if iommu_group is None:
         return (
             f"The graphics card at '{address}' isn't isolated from the rest of this "
-            "machine, so a sandbox can't use it safely."
+            "machine, so a sandbox can't use it safely. Run 'smolvm gpu list' for the "
+            "one-time setup steps."
         )
 
     # Every member of the group has to be free, not just the card itself.
@@ -306,7 +316,13 @@ def _blocker(
             "still in use by this machine. Run 'smolvm gpu list' to see what to free."
         )
 
-    if not _vfio_group_accessible(iommu_group, vfio_dev_root):
+    state = _vfio_group_state(iommu_group, vfio_dev_root)
+    if state == "missing":
+        return (
+            f"This machine hasn't finished handing the graphics card at '{address}' over. "
+            "Restart it, then run 'smolvm gpu list' again."
+        )
+    if state == "denied":
         return (
             f"You don't have permission to use the graphics card at '{address}'. "
             "Add yourself to the 'vfio' group, then start a new login session."
@@ -469,6 +485,17 @@ def resolve_gpu_selection(
     return device
 
 
+def _exempt_from_memlock_cap() -> bool:
+    """Return whether this process may keep memory resident without a cap.
+
+    An administrator account is exempt: the kernel skips the accounting
+    entirely for it, so the cap below says nothing about whether a sandbox
+    will start.
+    """
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and geteuid() == 0
+
+
 def memlock_headroom_ok(memory_mib: int) -> bool:
     """Return whether this user may reserve enough memory for *memory_mib*.
 
@@ -476,10 +503,16 @@ def memlock_headroom_ok(memory_mib: int) -> bool:
     and the operating system caps how much any one user can pin. When the cap
     is below the sandbox size the launch fails late and with an unhelpful
     message, so callers check this first.
+
+    An administrator account is exempt from the cap — the kernel skips the
+    accounting entirely for a privileged process — so answer yes for one
+    rather than sending it off to raise a limit that does not apply.
     """
     try:
         import resource
     except ImportError:  # pragma: no cover - not available on Windows hosts
+        return True
+    if _exempt_from_memlock_cap():
         return True
     try:
         soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)

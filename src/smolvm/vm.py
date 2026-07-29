@@ -1273,6 +1273,18 @@ class SmolVMManager:
                     "sandbox for the card you want.",
                     {"vm_id": vm_id, "gpu": card.address},
                 )
+            # The saved settings list every part handed over with the card,
+            # and those are what the emulator is told to open. A firmware
+            # change, a kernel upgrade, or a different machine can regroup
+            # them, leaving a saved part that no longer belongs — which the
+            # address check above cannot see because it only looks at the card.
+            if set(card.functions) != set(device.group_members):
+                raise SmolVMError(
+                    f"The graphics card at '{card.address}' is no longer grouped with the "
+                    f"same hardware as when sandbox '{vm_id}' was created. Run "
+                    "'smolvm gpu list', then create a sandbox for the card again.",
+                    {"vm_id": vm_id, "gpu": card.address},
+                )
 
         # A card belongs to one sandbox at a time. Nothing in the hardware
         # state says who has it — a card lent to a running sandbox still looks

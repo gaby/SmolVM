@@ -56,7 +56,13 @@ from smolvm.cli.output import (
     render_error,
     status_style,
 )
-from smolvm.types import BrowserSessionState, DesktopEndpoint, GuestOS, VMState
+from smolvm.types import (
+    GPU_REQUIRES_QEMU_MESSAGE,
+    BrowserSessionState,
+    DesktopEndpoint,
+    GuestOS,
+    VMState,
+)
 
 if TYPE_CHECKING:
     from smolvm.cli.service import CLIService
@@ -1044,9 +1050,14 @@ def _apply_gpu_passthrough(config: Any, cards: Sequence[Any] | None) -> Any:
 
     updated = config.model_copy(update={"gpus": list(cards)})
     try:
+        # dict(model) hands pydantic the field values rather than the model
+        # itself. Validating a model instance runs only the whole-model rules
+        # and takes every field as already-correct, so a field validator —
+        # the address checks on GpuPassthrough among them — would be skipped.
+        #
         # Paths on an existing config were already checked when it was built;
         # re-checking would reject a rootfs the builder is still writing.
-        return config.model_validate(updated, context={"validate_paths": False})
+        return config.model_validate(dict(updated), context={"validate_paths": False})
     except _PydanticValidationError as exc:
         raise ValueError(_first_validation_message(exc)) from exc
 
@@ -1126,6 +1137,13 @@ def _gpu_row(device: GpuDevice) -> dict[str, Any]:
     }
 
 
+def _without_gpu_list_pointer(blocker: str | None) -> str:
+    """Return *blocker* with its trailing "run smolvm gpu list" sentence cut."""
+    text = blocker or "This card isn't available for sandboxes."
+    head, sep, _tail = text.partition("Run 'smolvm gpu list'")
+    return head.strip() if sep else text
+
+
 def _render_gpu_list(devices: list[GpuDevice]) -> None:
     """Render the human-facing graphics-card list."""
     console = console_stdout()
@@ -1160,7 +1178,11 @@ def _render_gpu_list(devices: list[GpuDevice]) -> None:
     console.print()
     console.print(Text("Not available yet:", style="bold yellow"))
     for device in blocked:
-        console.print(f"  • {device.address} — {device.blocker}")
+        # Blockers end by pointing at this command, which is the right
+        # recovery when one surfaces from `sandbox create` or `sandbox start`.
+        # Here it would tell the reader to run what they just ran, and the
+        # steps it points at are printed a few lines below anyway.
+        console.print(f"  • {device.address} — {_without_gpu_list_pointer(device.blocker)}")
 
     console.print()
     console.print(Text("One-time setup on this machine:", style="bold"))
@@ -1233,7 +1255,17 @@ def _run_create(args: SimpleNamespace) -> int:
         # Same for graphics cards: only the QEMU backend can attach one, so
         # auto-pick it rather than failing on a backend the user never chose.
         # An explicit --backend is left alone for the config check to catch.
+        # macOS is excluded like the mounts pin above: a Mac sandbox can never
+        # take a card, and pinning QEMU here would report a backend clash the
+        # user never asked for instead of saying so.
         if getattr(args, "gpus", None) and args.backend in (None, "auto"):
+            if args.os == "macos":
+                return _emit_cli_error(
+                    command_name,
+                    2,
+                    ValueError("macOS sandboxes cannot use a graphics card from this machine."),
+                    json_output=args.json,
+                )
             args.backend = "qemu"
 
         # Resolve the requested cards against real hardware now, before any
@@ -1880,8 +1912,23 @@ def _run_start(args: SimpleNamespace) -> int:
     # Only QEMU can attach a graphics card, so pin the backend the same way
     # _run_create does. The published-image fast path below then declines on
     # its own, because it publishes for a different runtime on Linux.
-    if args.gpu_cards and args.backend in (None, "auto"):
-        args.backend = "qemu"
+    if args.gpu_cards:
+        if args.backend in (None, "auto"):
+            args.backend = "qemu"
+        elif args.backend != "qemu":
+            # Caught here rather than at the VMConfig below: that one raises a
+            # multi-line validation report naming a sandbox this command has
+            # not created yet, and a 'sandbox create' recovery for a command
+            # the user never ran.
+            return _emit_cli_error(
+                command_name,
+                2,
+                ValueError(
+                    f"{GPU_REQUIRES_QEMU_MESSAGE}; re-run "
+                    f"'smolvm {preset.name} start' without '--backend {args.backend}'."
+                ),
+                json_output=args.json,
+            )
 
     # The user-facing default is ubuntu when --os is omitted.
     requested_os = GuestOS(args.os) if args.os is not None else GuestOS.UBUNTU
