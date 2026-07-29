@@ -129,6 +129,9 @@ _IDENTIFIER_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$"
 # sandbox was asked for and must stay loadable without touching the host.
 _PCI_ADDRESS_PATTERN = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
+# Maker and model ids are 16-bit, so exactly four hex digits.
+_PCI_HEX_ID_PATTERN = re.compile(r"^[0-9a-f]{4}$")
+
 # Two conditions get caught at more than one layer — the config validator
 # sees the declared request, the runtime sees the resolved machine — and the
 # user should get the same sentence either way. Kept here because this is the
@@ -279,6 +282,19 @@ class GpuPassthrough(BaseModel):
     def normalize_lowercase(cls, value: str) -> str:
         """Lowercase hex identifiers so comparisons are stable."""
         return value.strip().lower()
+
+    @field_validator("vendor_id", "device_id")
+    @classmethod
+    def check_hex_id(cls, value: str) -> str:
+        """Reject ids that are not four hex digits.
+
+        A card read while powered down reports all-ones, and storing that
+        would make the sandbox refuse to start later against its own real
+        hardware.
+        """
+        if not _PCI_HEX_ID_PATTERN.fullmatch(value):
+            raise ValueError(f"'{value}' is not a four-digit hardware id")
+        return value
 
     @field_validator("functions")
     @classmethod
@@ -775,7 +791,10 @@ class VMConfig(BaseModel):
                 f"create the sandbox with '--name {self.vm_id} --backend qemu'."
             )
         if self.guest_os is GuestOS.MACOS:
-            raise ValueError("macOS sandboxes cannot use a graphics card from this machine.")
+            raise ValueError(
+                "macOS sandboxes cannot use a graphics card from this machine; "
+                "create the sandbox without '--gpu'."
+            )
         if self.guest_os is GuestOS.WINDOWS:
             raise ValueError(
                 "Windows sandboxes cannot use a graphics card in this release; "

@@ -82,7 +82,9 @@ smolvm sandbox create --name train --gpu 0000:01:00.0 --gpu 0000:02:00.0
 
 ## Things to know
 
-**A card usually comes with a sound part.** Graphics cards have a sound output built into the same chip, and your computer treats the two as one unit that can only be lent together. SmolVM works this out for you — you name the card, and it hands over everything that belongs with it. This is also why `smolvm gpu list` sometimes says a card is held back by a different address than the one you asked about.
+**A card usually comes with a sound part.** Graphics cards have a sound output built into the same chip. SmolVM works this out for you — you name the card, and both parts go to the sandbox together.
+
+**Your computer may group a card with unrelated hardware.** Some computers cannot separate a graphics card from, say, a disk controller. When that happens the other hardware has to be free before the card can be lent, which is why `smolvm gpu list` sometimes names an address you did not ask about. That hardware is *not* given to the sandbox — only the card and its own sound part are.
 
 **Saving a sandbox's memory does not work with a card.** Saving memory means recording the state of every piece of hardware, and a real graphics card cannot be recorded that way. Saving just the disk works normally:
 
@@ -90,7 +92,7 @@ smolvm sandbox create --name train --gpu 0000:01:00.0 --gpu 0000:02:00.0
 smolvm sandbox snapshot create train --snapshot-type disk
 ```
 
-**Your computer may limit reserved memory.** A sandbox using a graphics card has to keep all its memory reserved. If your computer's limit is lower than the sandbox size, SmolVM says so before starting. `ulimit -l unlimited` lifts it for the current terminal when your account is allowed to go that high; if it answers "Operation not permitted", add `* - memlock unlimited` to `/etc/security/limits.conf` and log in again.
+**Your computer may limit reserved memory.** A sandbox using a graphics card has to keep all its memory reserved, and most Linux accounts are allowed only a few megabytes. If the limit is lower than the sandbox size, SmolVM says so before starting; add `* - memlock unlimited` to `/etc/security/limits.conf` and log in again to raise it. Running SmolVM with administrator rights sidesteps the limit entirely, so this rarely comes up when you use `sudo`.
 
 **Sandboxes with a card start a little slower.** They use a more compatible virtual machine layout, because the faster one SmolVM normally picks has nowhere to plug a card in.
 

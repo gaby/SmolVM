@@ -224,7 +224,7 @@ class TestHandOverSet:
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert card.group_members == ("0000:01:00.0", "0000:01:00.1")
+        assert card.functions == ("0000:01:00.0", "0000:01:00.1")
 
     def test_graphics_function_leads(self, sysfs: Path, vfio_accessible: None) -> None:
         """QEMU puts the first entry at function 0, so ordering is load-bearing."""
@@ -250,6 +250,7 @@ class TestHandOverSet:
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
+        assert "0000:00:01.0" not in card.functions
         assert "0000:00:01.0" not in card.group_members
         assert card.ready is True, "a bridge in the group must not block the card"
 
@@ -259,7 +260,7 @@ class TestHandOverSet:
 
         card = gpu.find_gpu("0000:01:00.0", sysfs)
 
-        assert card.group_members == ("0000:01:00.0",)
+        assert card.functions == ("0000:01:00.0",)
 
 
 class TestFindGpu:
@@ -468,7 +469,7 @@ class TestSandboxGuards:
         with (
             patch("smolvm.host.gpu.find_gpu", return_value=gpu_device()),
             patch("smolvm.host.gpu.memlock_headroom_ok", return_value=False),
-            pytest.raises(SmolVMError, match="ulimit -l unlimited"),
+            pytest.raises(SmolVMError, match="more than this machine allows"),
         ):
             self._manager()._check_gpus(self._vm_info(tmp_path).config, "gputest")
 
@@ -659,3 +660,61 @@ class TestUnboundCardMessage:
 
         assert "0000:01:00.1" in card.blocker
         assert "isn't set up for sandboxes yet" in card.blocker
+
+
+class TestUnrelatedGroupMembers:
+    """A card's group can hold hardware that is nothing to do with the card."""
+
+    def _card_with_unrelated_neighbour(self, sysfs: Path, *, neighbour_driver: str) -> None:
+        """GPU + its audio part, isolated together with an NVMe controller."""
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        _write_device(
+            sysfs,
+            "0000:02:00.0",
+            class_id=CLASS_NVME,
+            vendor="0x144d",
+            driver=neighbour_driver,
+            iommu_group=12,
+        )
+
+    def test_unrelated_hardware_is_never_handed_to_the_sandbox(
+        self, sysfs: Path, vfio_accessible: None
+    ) -> None:
+        """Handing over a disk controller would give the sandbox the host's storage."""
+        self._card_with_unrelated_neighbour(sysfs, neighbour_driver="vfio-pci")
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert card.functions == ("0000:01:00.0", "0000:01:00.1")
+        assert "0000:02:00.0" not in card.functions
+
+    def test_unrelated_hardware_still_has_to_be_free(self, sysfs: Path) -> None:
+        """It is not handed over, but the card cannot be lent until it is free."""
+        self._card_with_unrelated_neighbour(sysfs, neighbour_driver="nvme")
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert card.ready is False
+        assert "0000:02:00.0" in card.blocker
+        assert "0000:02:00.0" in card.group_members
+
+    def test_a_card_alone_in_its_group_reports_both_sets_the_same(
+        self, sysfs: Path, vfio_accessible: None
+    ) -> None:
+        _nvidia_pair(sysfs, driver="vfio-pci")
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert card.functions == card.group_members
+
+    def test_non_pci_group_entries_are_ignored(self, sysfs: Path, vfio_accessible: None) -> None:
+        """arm64 hosts list platform devices in isolation groups."""
+        _nvidia_pair(sysfs, driver="vfio-pci")
+        group_devices = sysfs / "kernel" / "iommu_groups" / "12" / "devices"
+        (group_devices / "soc:pcie@1000").symlink_to(sysfs, target_is_directory=True)
+
+        card = gpu.find_gpu("0000:01:00.0", sysfs)
+
+        assert card.ready is True
+        assert not any("soc:" in member for member in card.group_members)
+        assert not any("soc:" in function for function in card.functions)

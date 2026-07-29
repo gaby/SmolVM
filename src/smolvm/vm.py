@@ -1278,7 +1278,7 @@ class SmolVMManager:
             # change, a kernel upgrade, or a different machine can regroup
             # them, leaving a saved part that no longer belongs — which the
             # address check above cannot see because it only looks at the card.
-            if set(card.functions) != set(device.group_members):
+            if set(card.functions) != set(device.functions):
                 raise SmolVMError(
                     f"The graphics card at '{card.address}' is no longer grouped with the "
                     f"same hardware as when sandbox '{vm_id}' was created. Run "
@@ -1303,11 +1303,9 @@ class SmolVMManager:
         # command that answers "Operation not permitted".
         if not memlock_headroom_ok(config.memory):
             raise SmolVMError(
-                f"This machine won't let sandbox '{vm_id}' reserve the {config.memory} MiB "
-                "of memory a graphics card needs. Raise the limit with "
-                "'ulimit -l unlimited', or add '* - memlock unlimited' to "
-                f"/etc/security/limits.conf and log in again, then run "
-                f"'smolvm sandbox start {vm_id}'.",
+                f"Sandbox '{vm_id}' needs to reserve {config.memory} MiB of memory for a "
+                "graphics card, which is more than this machine allows. Raise the limit in "
+                "/etc/security/limits.conf, then log in again.",
                 {"vm_id": vm_id, "memory_mib": config.memory},
             )
 

@@ -5864,7 +5864,7 @@ class TestCreateWithGpu:
 
         assert result.exit_code != 0
         assert "--gpu is only supported on Linux" in result.output
-        assert "Create the sandbox without it." in result.output
+        assert "Run the same command without it." in result.output
 
     def test_hidden_from_help_on_a_non_linux_host(self) -> None:
         from click.testing import CliRunner

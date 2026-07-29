@@ -97,7 +97,7 @@ def gpu_option(fn: F) -> F:
         multiple=True,
         metavar="ADDRESS",
         cls=LinuxOnlyOption,
-        recovery="Create the sandbox without it.",
+        recovery="Run the same command without it.",
         help=(
             "Give the sandbox a graphics card from this machine, by address "
             "(for example 0000:01:00.0) or 'auto' for the only free one. "

@@ -36,6 +36,7 @@ def gpu_device() -> Callable[..., GpuDevice]:
         blocker: str | None = None,
         driver: str | None = None,
         functions: tuple[str, ...] = ("0000:01:00.0", "0000:01:00.1"),
+        group_members: tuple[str, ...] | None = None,
         vendor_id: str = "10de",
         device_id: str = "2684",
     ) -> GpuDevice:
@@ -46,7 +47,10 @@ def gpu_device() -> Callable[..., GpuDevice]:
             vendor_name="NVIDIA",
             driver=driver if driver is not None else ("nvidia" if blocker else "vfio-pci"),
             iommu_group=12,
-            group_members=functions,
+            functions=functions,
+            # Defaults to the card's own parts; pass this to model a machine
+            # that isolates something unrelated alongside the card.
+            group_members=group_members if group_members is not None else functions,
             blocker=blocker,
         )
 

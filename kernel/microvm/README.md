@@ -19,7 +19,7 @@ fragment:
 | Variant | Artifacts | Who boots it |
 |---|---|---|
 | `default` | `vmlinux-<arch>.{elf,image,config}` | Every ordinary sandbox. No loadable modules — see "No modules, ever" below. |
-| `gpu` | `vmlinux-<arch>-gpu.{elf,image,config}` plus `modules-<arch>-gpu.tar.zst` | Sandboxes given a real graphics card (`smolvm sandbox create --gpu`). |
+| `gpu` | `vmlinux-<arch>-gpu.{elf,image,config}` plus `modules-<arch>-gpu.tar.zst` | Intended for sandboxes given a real graphics card. **Built but not yet selected at runtime** — nothing in `src/smolvm/images/` resolves to it, so `--gpu` sandboxes still boot the default kernel. Wiring it up needs a published-image manifest entry. |
 
 Build a variant with `SMOLVM_KERNEL_VARIANT=gpu bash build.sh`; the
 default needs no flag.

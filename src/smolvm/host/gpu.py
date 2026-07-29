@@ -30,7 +30,9 @@ Two details drive the shape of the API:
   and VFIO hands over a whole group at a time. A discrete graphics card is
   almost always grouped with its own HDMI audio function, so asking for
   ``0000:01:00.0`` really means asking for ``0000:01:00.1`` too — that set is
-  :attr:`GpuDevice.group_members`.
+  :attr:`GpuDevice.functions`. Anything *else* the machine isolates with the
+  card merely has to be free (:attr:`GpuDevice.group_members`); handing it to
+  the sandbox would give away hardware the user never asked about.
 - **Everything is testable.** Each entry point takes ``sysfs_root`` and
   ``vfio_dev_root`` so tests can build a fake ``/sys`` tree and a fake
   ``/dev/vfio`` in a temporary directory, instead of depending on whatever
@@ -104,9 +106,13 @@ class GpuDevice:
             nothing has claimed it. ``vfio-pci`` means it is free for sandboxes.
         iommu_group: The hardware isolation group this card belongs to, or
             ``None`` when the machine has hardware isolation switched off.
-        group_members: Every address handed to a sandbox together with this
-            card, main function first. Bridges are excluded. Always contains
-            at least the card itself.
+        functions: Every address handed to a sandbox for this card, the card
+            itself first. These are the card's own parts — its graphics chip
+            and the sound output built into the same hardware. Always
+            contains at least the card itself.
+        group_members: Every address the machine isolates alongside this card.
+            A superset of *functions*: the extra entries have to be free
+            before the card can be lent, but they are not handed over.
         blocker: Why a sandbox cannot use this card right now, in plain
             English. ``None`` when it can.
     """
@@ -117,6 +123,7 @@ class GpuDevice:
     vendor_name: str
     driver: str | None
     iommu_group: int | None
+    functions: tuple[str, ...]
     group_members: tuple[str, ...]
     blocker: str | None
 
@@ -161,14 +168,24 @@ def _read_text(path: Path) -> str | None:
 
 
 def _read_hex_id(path: Path) -> str | None:
-    """Return a sysfs ``0x1234`` id attribute as four lowercase hex digits."""
+    """Return a sysfs ``0x1234`` id attribute as four lowercase hex digits.
+
+    Maker and model ids are 16-bit. A card in a low-power state or removed
+    mid-scan reads back as ``0xffffffff``, and formatting that verbatim would
+    store an eight-digit id in the sandbox's settings — after which the
+    start-time identity check compares it against the real id and refuses to
+    start a sandbox whose hardware never changed.
+    """
     raw = _read_text(path)
     if raw is None:
         return None
     try:
-        return f"{int(raw, 16):04x}"
+        value = int(raw, 16)
     except ValueError:
         return None
+    if not 0 <= value <= 0xFFFF:
+        return None
+    return f"{value:04x}"
 
 
 def _read_class(device_dir: Path) -> int | None:
@@ -214,13 +231,31 @@ def _read_iommu_group(device_dir: Path) -> int | None:
         return None
 
 
-def _iommu_group_members(sysfs_root: Path, group: int) -> tuple[str, ...]:
-    """Return every PCI address in *group*, sorted."""
+def _iommu_group_members(sysfs_root: Path, group: int | None) -> tuple[str, ...]:
+    """Return the PCI addresses in *group* that matter, sorted.
+
+    Two kinds of entry are dropped, because neither has to be freed and
+    neither can be handed to a sandbox:
+
+    - **Non-PCI devices.** Linux lists platform devices in isolation groups
+      on some machines (``soc:pcie@1000`` on arm64); they are not addressable
+      as ``domain:bus:device.function``.
+    - **Bridges.** The port a card hangs off shares its group by definition,
+      and the hardware does not count it against the group being free.
+    """
+    if group is None:
+        return ()
     group_dir = sysfs_root / "kernel" / "iommu_groups" / str(group) / "devices"
     try:
-        return tuple(sorted(entry.name for entry in group_dir.iterdir()))
+        names = sorted(entry.name for entry in group_dir.iterdir())
     except OSError:
         return ()
+    return tuple(
+        name
+        for name in names
+        if PCI_ADDRESS_PATTERN.match(name)
+        and _read_class(sysfs_root / "bus" / "pci" / "devices" / name) not in _BRIDGE_CLASSES
+    )
 
 
 def iommu_enabled(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> bool:
@@ -343,7 +378,8 @@ def _build_device(
     vendor_id = _read_hex_id(device_dir / "vendor") or "0000"
     device_id = _read_hex_id(device_dir / "device") or "0000"
     iommu_group = _read_iommu_group(device_dir)
-    members = _assignable_members(sysfs_root, address, iommu_group)
+    members = _iommu_group_members(sysfs_root, iommu_group)
+    functions = _card_functions(sysfs_root, address, iommu_group)
 
     return GpuDevice(
         address=address,
@@ -352,7 +388,8 @@ def _build_device(
         vendor_name=_VENDOR_NAMES.get(vendor_id, vendor_id),
         driver=_read_driver(device_dir),
         iommu_group=iommu_group,
-        group_members=members,
+        functions=functions,
+        group_members=members or functions,
         blocker=_blocker(
             sysfs_root=sysfs_root,
             vfio_dev_root=vfio_dev_root,
@@ -364,26 +401,48 @@ def _build_device(
     )
 
 
-def _assignable_members(sysfs_root: Path, address: str, group: int | None) -> tuple[str, ...]:
-    """Return the hand-over set for a card, the card itself first.
+def _same_hardware(address: str) -> str:
+    """Return the part of a PCI address shared by one chip's functions.
 
-    Bridges are dropped: they appear in the group listing but are never
-    handed to a guest, and VFIO does not require them to be freed. A card
-    with no readable group still reports itself, so callers never have to
-    special-case an empty result.
+    ``0000:01:00.0`` and ``0000:01:00.1`` are two functions of the same
+    physical chip; ``0000:02:00.0`` is a different one.
     """
-    listed = _iommu_group_members(sysfs_root, group) if group is not None else ()
-    assignable = [
-        member
-        for member in listed
-        if (_read_class(sysfs_root / "bus" / "pci" / "devices" / member)) not in _BRIDGE_CLASSES
-    ]
+    return address.rsplit(".", 1)[0]
 
-    # The card the user named must lead, because QEMU puts the first function
-    # at slot function 0 and guests expect the display/compute function there.
-    if address in assignable:
-        assignable.remove(address)
-    return (address, *assignable)
+
+def _card_functions(sysfs_root: Path, address: str, group: int | None) -> tuple[str, ...]:
+    """Return the addresses handed to a sandbox for this card, card first.
+
+    Only the card's *own* functions — a graphics chip and the sound output
+    built into it. Other devices the machine happens to isolate alongside it
+    are deliberately excluded: a sandbox given one of those would get direct
+    memory access to hardware the user never mentioned, and on a consumer
+    board that can be a disk controller. The hardware only requires that such
+    devices be *free*, not that they be handed over, which is what
+    :func:`_blocker` checks.
+    """
+    prefix = _same_hardware(address)
+    listed = _iommu_group_members(sysfs_root, group)
+    if not listed:
+        # No readable group: fall back to the sibling functions the bus lists.
+        try:
+            listed = tuple(
+                sorted(
+                    entry.name
+                    for entry in (sysfs_root / "bus" / "pci" / "devices").iterdir()
+                    if PCI_ADDRESS_PATTERN.match(entry.name)
+                    and _read_class(entry) not in _BRIDGE_CLASSES
+                )
+            )
+        except OSError:
+            listed = ()
+
+    functions = [
+        member for member in listed if _same_hardware(member) == prefix and member != address
+    ]
+    # The card the user named leads: the emulator puts the first entry at the
+    # guest function a driver expects the graphics part to occupy.
+    return (address, *functions)
 
 
 def list_host_gpus(

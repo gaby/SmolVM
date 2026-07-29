@@ -1025,7 +1025,7 @@ def _resolve_gpu_passthrough(gpu_selections: Sequence[str] | None) -> list[Any] 
         cards.append(
             GpuPassthrough(
                 address=device.address,
-                functions=device.group_members,
+                functions=device.functions,
                 vendor_id=device.vendor_id,
                 device_id=device.device_id,
             )
@@ -1131,7 +1131,8 @@ def _gpu_row(device: GpuDevice) -> dict[str, Any]:
         "description": device.description,
         "driver": device.driver,
         "iommu_group": device.iommu_group,
-        "functions": list(device.group_members),
+        "functions": list(device.functions),
+        "group_members": list(device.group_members),
         "ready": device.ready,
         "blocker": device.blocker,
     }
